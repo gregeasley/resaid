@@ -577,6 +577,11 @@ class well_econ:
             l_wi = 1
             l_nri = 1-l_royalty
 
+        l_flow['fixed_expense'] = self._opc_t
+        l_flow['oil_variable_expense'] = self._opc_oil*l_flow[self.OIL_COL]
+        l_flow['gas_variable_expense'] = self._opc_gas*l_flow['gas_sold']
+        l_flow['water_variable_expense'] = self._opc_water*l_flow[self.WATER_COL]
+
         l_flow['expense'] = (
             self._opc_t
             + self._opc_gas*l_flow['gas_sold']
@@ -638,6 +643,10 @@ class well_econ:
             'ngl_revenue',
             'revenue',
             'royalty',
+            'fixed_expense',
+            'oil_variable_expense',
+            'gas_variable_expense',
+            'water_variable_expense',
             'expense',
             'severance_tax',
             'ad_val_tax',

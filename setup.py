@@ -16,7 +16,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="resaid",
-    version="0.1.7",
+    version="0.1.8",
     author="Greg Easley",
     author_email="greg@easley.dev",
     description="Reservoir engineering tools",
