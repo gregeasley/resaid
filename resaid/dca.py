@@ -169,7 +169,7 @@ class decline_curve:
 
         #Get only variables
         self._normalized_dataframe = pd.DataFrame()
-        self._params_dataframe = None
+        self._params_dataframe = pd.DataFrame([])
         self._flowstream_dataframe = None
         self._typecurve = None
         self._oneline = pd.DataFrame()
@@ -888,7 +888,6 @@ class decline_curve:
 
         online_df = self._flowstream_dataframe[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
 
-        #print(self._flowstream_dataframe)
 
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
 
@@ -951,7 +950,7 @@ class decline_curve:
     def generate_flowstream(self, num_months=1200, denormalize=False, actual_dates=False, _verbose=False):
         self.verbose = _verbose
 
-        if self._params_dataframe == None:
+        if self._params_dataframe.empty:
             self.run_DCA(_verbose=_verbose)
 
         t_range = np.array(range(1,num_months))
@@ -965,7 +964,6 @@ class decline_curve:
             'WATER':[]
         }
 
-        
 
         for index, row in self._params_dataframe.iterrows():
             if denormalize and row['h_length']>1:
@@ -994,7 +992,6 @@ class decline_curve:
                     flow_dict['WATER'].append(dca*0)
                 else:
                     flow_dict['WATER'].append(dca*row['water_ratio'])
-
 
         self._flowstream_dataframe = pd.DataFrame(flow_dict)
         #print(self._flowstream_dataframe.columns)

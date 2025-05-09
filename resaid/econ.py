@@ -34,7 +34,7 @@ class npv_calc():
             result = newton(self.get_npv, guess, maxiter=iterations)
 
         try:
-            result = np.power(1+result,12)-1
+            result = 12*result
         except Exception as e:
             print(result)
             raise e
