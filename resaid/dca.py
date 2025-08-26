@@ -870,23 +870,11 @@ class decline_curve:
         if self._params_dataframe.empty:
             self.run_DCA(_verbose=_verbose)
 
-        t_range = np.array(range(1,num_months))
+        # Of note, since you often forget this, the flowstream dataframe inherits the denormalize attribute
+        # So the oneline sums will always follow the denormalization settings
+        oneline_df = self._flowstream_dataframe[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
 
-        flow_dict = {
-            'UID':[],
-            'MAJOR':[],
-            "IPO":[],
-            'IPG':[],
-            'B':[],
-            'DE':[],
-            'T0':[],
-            'MINOR_RATIO':[],
-            'WATER_RATIO':[]
-        }
-
-        #param_df = self.vect_generate_params_tc(self._flowstream_dataframe)
-
-        online_df = self._flowstream_dataframe[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
+        # Calculate oneline_df denormalization_scalar
 
 
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
@@ -906,46 +894,51 @@ class decline_curve:
 
         #print(self._params_dataframe)
 
-        for index, row in self._params_dataframe.iterrows():
-            if denormalize and row['h_length']>1:
-                denormalization_scalar = row['h_length']/self.SET_LENGTH
-            else:
-                denormalization_scalar = 1
-            
-            dca = self._flowstream_dataframe[self._flowstream_dataframe['UID']==row['UID']]
+        flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','T0_DATE','minor_ratio','water_ratio']].copy()
 
-            
+        # Calculate flow_df denormalization_scalar
+        if denormalize:
+            flow_df['denormalization_scalar'] = np.where(
+                flow_df['h_length'] > 1,
+                flow_df['h_length'] / self.SET_LENGTH,
+                1.0
+            )
+        else:
+            flow_df['denormalization_scalar'] = 1.0
 
-            if np.sum(dca[row['major']]) > 0:
+        flow_df = flow_df.rename(columns={
+            'major':'MAJOR',
+            'b':'B',
+            'di':'DE',
+            'minor_ratio':'MINOR_RATIO',
+            'water_ratio':'WATER_RATIO'
+        })
+        # Fill na in MINOR_RATIO and WATER_RATIO with 0
+        flow_df['MINOR_RATIO'] = flow_df['MINOR_RATIO'].fillna(0)
+        flow_df['WATER_RATIO'] = flow_df['WATER_RATIO'].fillna(0)
 
-                flow_dict['UID'].append(row['UID'])
-                flow_dict['MAJOR'].append(row['major'])
-                
-                flow_dict['B'].append(row['b'])
-                flow_dict['DE'].append(row['di'])
-                flow_dict['T0'].append(row['T0_DATE'])
-                flow_dict['MINOR_RATIO'].append(row['minor_ratio'])
-                flow_dict['WATER_RATIO'].append(row['water_ratio'])
-                if row['major'] == "OIL":
-                    #flow_dict['IPO'].append(max(dca[row['major']]))
-                    flow_dict['IPO'].append(row['qi']*denormalization_scalar)
-                    if np.isnan(row['minor_ratio']):
-                        flow_dict['IPG'].append(max(dca[row['major']])*0)
-                    else:
-                        #flow_dict['IPG'].append(max(dca[row['major']])*row['minor_ratio'])
-                        flow_dict['IPG'].append(row['qi']*row['minor_ratio'])
-                else:
-                    #flow_dict['IPG'].append(max(dca[row['major']]))
-                    flow_dict['IPG'].append(row['qi']*denormalization_scalar)
-                    if np.isnan(row['minor_ratio']):
-                        flow_dict['IPO'].append(max(dca[row['major']])*0)
-                    else:
-                        #flow_dict['IPO'].append(max(dca[row['major']])*row['minor_ratio'])
-                        flow_dict['IPO'].append(row['qi']*row['minor_ratio'])
-        flow_dict = pd.DataFrame(flow_dict)
-        online_df = online_df.merge(flow_dict,left_on='UID',right_on='UID')
-        online_df['ARIES_DE'] = online_df.apply(lambda x: (1-np.power(((x.DE*12)*x.B+1),(-1/x.B)))*100, axis=1)
-        self._oneline = online_df
+        flow_df['IPO'] = np.where(
+            flow_df['MAJOR'] == "OIL",
+            flow_df['qi']*flow_df['denormalization_scalar'],
+            flow_df['qi']*flow_df['MINOR_RATIO']*flow_df['denormalization_scalar']
+        )
+
+        flow_df['IPG'] = np.where(  
+            flow_df['MAJOR'] == "GAS",
+            flow_df['qi']*flow_df['denormalization_scalar'],
+            flow_df['qi']*flow_df['MINOR_RATIO']*flow_df['denormalization_scalar']
+        )
+        
+        flow_df['WATER'] = flow_df['qi']*flow_df['WATER_RATIO']
+
+        flow_df['ARIES_DE'] = flow_df.apply(lambda row: (1-np.power(((row.DE*12)*row.B+1),(-1/row.B)))*100, axis=1)
+
+        self._oneline = oneline_df.merge(
+            flow_df[['UID','MAJOR','IPO','IPG','B','DE','T0_DATE','MINOR_RATIO','WATER_RATIO','ARIES_DE']],
+            left_on='UID',
+            right_on='UID'
+        )
+        
 
     def generate_flowstream(self, num_months=1200, denormalize=False, actual_dates=False, _verbose=False):
         self.verbose = _verbose
@@ -955,48 +948,47 @@ class decline_curve:
 
         t_range = np.array(range(1,num_months))
 
-        flow_dict = {
-            'UID':[],
-            'MAJOR':[],
-            'T_INDEX':[],
-            'OIL':[],
-            'GAS':[],
-            'WATER':[]
-        }
 
+        flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','t0','minor_ratio','water_ratio']].copy()
 
-        for index, row in self._params_dataframe.iterrows():
-            if denormalize and row['h_length']>1:
-                denormalization_scalar = row['h_length']/self.SET_LENGTH
-            else:
-                denormalization_scalar = 1
-            
-            dca = np.array(self.arps_decline(t_range,row.qi,row.di,row.b,row.t0))*denormalization_scalar
-            if np.sum(dca) > 0:
-                flow_dict['UID'].append(row['UID'])
-                flow_dict['MAJOR'].append(row['major'])
-                flow_dict['T_INDEX'].append(t_range)
-                if row['major'] == "OIL":
-                    flow_dict['OIL'].append(dca)
-                    if np.isnan(row['minor_ratio']):
-                        flow_dict['GAS'].append(dca*0)
-                    else:
-                        flow_dict['GAS'].append(dca*row['minor_ratio'])
-                else:
-                    flow_dict['GAS'].append(dca)
-                    if np.isnan(row['minor_ratio']):
-                        flow_dict['OIL'].append(dca*0)
-                    else:
-                        flow_dict['OIL'].append(dca*row['minor_ratio'])
-                if np.isnan(row['water_ratio']):
-                    flow_dict['WATER'].append(dca*0)
-                else:
-                    flow_dict['WATER'].append(dca*row['water_ratio'])
+        flow_df['T_INDEX'] = flow_df.apply(lambda row: t_range, axis=1)
+        if denormalize:
+            flow_df['denormalization_scalar'] = np.where(
+                flow_df['h_length'] > 1,
+                    flow_df['h_length'] / self.SET_LENGTH,
+                    1.0
+                )
+        else:
+            flow_df['denormalization_scalar'] = 1.0
+        
+        flow_df['dca_values'] = flow_df.apply(
+            lambda row: np.array(self.arps_decline(t_range, row.qi, row.di, row.b, row.t0)) * row['denormalization_scalar'],
+            axis=1
+        )
+        flow_df['OIL'] = np.where(
+            flow_df['major'] == "OIL",
+            flow_df['dca_values'],
+            flow_df['dca_values'] * flow_df['minor_ratio']
+        )
+        flow_df['GAS'] = np.where(
+            flow_df['major'] == "GAS",
+            flow_df['dca_values'],
+            flow_df['dca_values'] * flow_df['minor_ratio']
+        )
+        flow_df['WATER'] = flow_df['dca_values'] * flow_df['water_ratio']
+        
 
-        self._flowstream_dataframe = pd.DataFrame(flow_dict)
+        
+
+        self._flowstream_dataframe = flow_df[['UID','major','T_INDEX','OIL','GAS','WATER']].rename(columns={'major':'MAJOR'})
         #print(self._flowstream_dataframe.columns)
         self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID','MAJOR']).apply(pd.Series.explode).reset_index()
         self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
+
+        # Replace na in OIL, GAS, WATER with 0
+        self._flowstream_dataframe['OIL'] = self._flowstream_dataframe['OIL'].fillna(0)
+        self._flowstream_dataframe['GAS'] = self._flowstream_dataframe['GAS'].fillna(0)
+        self._flowstream_dataframe['WATER'] = self._flowstream_dataframe['WATER'].fillna(0)
 
         self._flowstream_dataframe['OIL'] = pd.to_numeric(
             self._flowstream_dataframe['OIL']
