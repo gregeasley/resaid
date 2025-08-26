@@ -135,7 +135,7 @@ class decline_curve:
 
     def __init__(self):
         #Constants
-        self.DAY_NORM = 30.4
+        self.DAY_NORM = 365/12
         self.GAS_CUTOFF = 3.2 #GOR for classifying well as gas or oil, MSCF/STB
         self.STAT_FILE = sys.stdout
         self.MINOR_TAIL = 6 #Number of months from tail to use for minor phase ratios
@@ -166,6 +166,9 @@ class decline_curve:
         self._input_monthly = True
 
         self._force_t0 = False
+
+        # Three-phase forecasting mode
+        self._three_phase_mode = False
 
         #Get only variables
         self._normalized_dataframe = pd.DataFrame()
@@ -296,6 +299,14 @@ class decline_curve:
     @max_h_b.setter
     def max_h_b(self,value):
         self._max_h_b= value
+
+    @property
+    def three_phase_mode(self):
+        return self._three_phase_mode
+
+    @three_phase_mode.setter
+    def three_phase_mode(self, value):
+        self._three_phase_mode = value
 
     @property
     def params_dataframe(self):
@@ -838,6 +849,112 @@ class decline_curve:
 
         self._params_dataframe = imploded_df
 
+    def vect_generate_params_three_phase(self):
+        """
+        Generate DCA parameters for each non-zero phase independently.
+        This method calculates decline parameters for OIL, GAS, and WATER phases
+        separately instead of using ratios from the major phase.
+        """
+        self.V_DCA_FAILURES = 0
+        l_start = time.time()
+
+        all_results = []
+
+        # Group by well to determine which phases have non-zero production for each well
+        well_phases = self._normalized_dataframe.groupby('UID').agg({
+            'NORMALIZED_OIL': 'sum',
+            'NORMALIZED_GAS': 'sum',
+            'NORMALIZED_WATER': 'sum'
+        }).reset_index()
+
+        # Determine which phases to analyze for each well
+        for _, well_row in well_phases.iterrows():
+            uid = well_row['UID']
+            phases_to_analyze = []
+            
+            if well_row['NORMALIZED_OIL'] > 0:
+                phases_to_analyze.append('OIL')
+            if well_row['NORMALIZED_GAS'] > 0:
+                phases_to_analyze.append('GAS')
+            if well_row['NORMALIZED_WATER'] > 0:
+                phases_to_analyze.append('WATER')
+
+            # Get well data for this UID
+            well_data = self._normalized_dataframe[self._normalized_dataframe['UID'] == uid]
+
+            for phase in phases_to_analyze:
+                # Create a temporary dataframe for this phase-well combination
+                temp_df = well_data[[
+                    'UID',
+                    'HOLE_DIRECTION',
+                    'LENGTH_NORM',
+                    'T_INDEX',
+                    f'NORMALIZED_{phase}'
+                ]].copy()
+                
+                # Add a MAJOR column for this phase
+                temp_df['MAJOR'] = phase
+                
+                # Add dummy columns for other phases (set to 0)
+                for other_phase in ['OIL', 'GAS', 'WATER']:
+                    if other_phase != phase:
+                        temp_df[f'NORMALIZED_{other_phase}'] = 0
+
+                # Group by well characteristics
+                imploded_df = temp_df.groupby([
+                    'UID',
+                    'MAJOR',
+                    'HOLE_DIRECTION',
+                    'LENGTH_NORM'
+                ]).agg({
+                    'T_INDEX': lambda x: x.tolist(),
+                    'NORMALIZED_OIL': lambda x: x.tolist(),
+                    'NORMALIZED_GAS': lambda x: x.tolist(),
+                    'NORMALIZED_WATER': lambda x: x.tolist()
+                }).reset_index()
+
+                # Apply DCA parameters calculation
+                imploded_df = imploded_df.apply(self.dca_params, axis=1)
+
+                # Filter out failed DCA calculations
+                imploded_df = imploded_df[imploded_df['qi'].notna()]
+
+                if len(imploded_df) > 0:
+                    # Select and rename columns
+                    phase_df = imploded_df[[
+                        'UID',
+                        'MAJOR',
+                        'LENGTH_NORM',
+                        'qi',
+                        'di',
+                        'b',
+                        't0'
+                    ]].rename(columns={
+                        'MAJOR': 'phase',
+                        'LENGTH_NORM': 'h_length'
+                    })
+                    
+                    # Add phase-specific columns
+                    phase_df['minor_ratio'] = 0.0  # No minor ratio in three-phase mode
+                    phase_df['water_ratio'] = 0.0  # No water ratio in three-phase mode
+                    
+                    all_results.append(phase_df)
+
+        # Combine all results
+        if all_results:
+            imploded_df = pd.concat(all_results, ignore_index=True)
+        else:
+            imploded_df = pd.DataFrame()
+
+        print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
+        print(f'Total phase-well combinations analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
+        if len(imploded_df) > 0:
+            print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
+        l_duration = time.time() - l_start
+        print("Three-phase DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
+
+        self._params_dataframe = imploded_df
+
 
     def run_DCA(self, _verbose=True):
         self.verbose = _verbose
@@ -856,7 +973,10 @@ class decline_curve:
             print('Generating decline parameters.', file=self.STAT_FILE, flush=True)
         #self.generate_params()
         
-        self.vect_generate_params()
+        if self.three_phase_mode:
+            self.vect_generate_params_three_phase()
+        else:
+            self.vect_generate_params()
 
     def add_months(self, start_date, delta_period):
         end_date = start_date + pd.DateOffset(months=delta_period)
@@ -870,17 +990,20 @@ class decline_curve:
         if self._params_dataframe.empty:
             self.run_DCA(_verbose=_verbose)
 
+        if self.three_phase_mode:
+            self._generate_oneline_three_phase(num_months, denormalize, _verbose)
+        else:
+            self._generate_oneline_original(num_months, denormalize, _verbose)
+
+    def _generate_oneline_original(self, num_months, denormalize, _verbose):
+        """Original oneline generation using major phase with ratios"""
         # Of note, since you often forget this, the flowstream dataframe inherits the denormalize attribute
         # So the oneline sums will always follow the denormalization settings
-        oneline_df = self._flowstream_dataframe[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
-
-        # Calculate oneline_df denormalization_scalar
-
+        oneline_df = self._flowstream_dataframe.reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
 
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
 
         min_df = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
-        #min_df = self._flowstream_dataframe.groupby(['UID']).min().reset_index()
         min_df = min_df.rename(columns={self._uid_col:"UID",self._date_col:"MIN_DATE"})
         min_df = min_df[min_df['MIN_DATE'].notnull()]
 
@@ -891,8 +1014,6 @@ class decline_curve:
         self._params_dataframe = self._params_dataframe.dropna(subset='t0')
 
         self._params_dataframe['T0_DATE'] =  self._params_dataframe.apply(lambda row: self.add_months(row["MIN_DATE"], round(row["t0"],0)), axis = 1)
-
-        #print(self._params_dataframe)
 
         flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','T0_DATE','minor_ratio','water_ratio']].copy()
 
@@ -938,7 +1059,70 @@ class decline_curve:
             left_on='UID',
             right_on='UID'
         )
+
+    def _generate_oneline_three_phase(self, num_months, denormalize, _verbose):
+        """Three-phase oneline generation with independent decline curves for each phase"""
+        # Get flowstream totals by well
+        oneline_df = self._flowstream_dataframe.reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
+
+        # Get minimum dates for each well
+        self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
+        min_df = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
+        min_df = min_df.rename(columns={self._uid_col:"UID",self._date_col:"MIN_DATE"})
+        min_df = min_df[min_df['MIN_DATE'].notnull()]
+
+        # Merge with params dataframe
+        params_with_dates = self._params_dataframe.merge(min_df, left_on='UID', right_on='UID')
+        params_with_dates = params_with_dates.replace([np.inf, -np.inf], np.nan)
+        params_with_dates = params_with_dates.dropna(subset='t0')
+        params_with_dates['T0_DATE'] = params_with_dates.apply(lambda row: self.add_months(row["MIN_DATE"], round(row["t0"],0)), axis = 1)
+
+        # Create oneline data for each well
+        well_summaries = []
         
+        for uid in oneline_df['UID'].unique():
+            well_params = params_with_dates[params_with_dates['UID'] == uid]
+            well_flow = oneline_df[oneline_df['UID'] == uid].iloc[0]
+            
+            # Initialize well summary
+            well_summary = {
+                'UID': uid,
+                'OIL': well_flow['OIL'],
+                'GAS': well_flow['GAS'],
+                'WATER': well_flow['WATER'],
+                'T0_DATE': well_params['T0_DATE'].iloc[0] if len(well_params) > 0 else None
+            }
+            
+            # Add phase-specific parameters
+            for phase in ['OIL', 'GAS', 'WATER']:
+                phase_params = well_params[well_params['phase'] == phase]
+                if len(phase_params) > 0:
+                    param = phase_params.iloc[0]
+                    h_length = param['h_length']
+                    
+                    # Calculate denormalization scalar
+                    if denormalize and h_length > 1:
+                        denormalization_scalar = h_length / self.SET_LENGTH
+                    else:
+                        denormalization_scalar = 1.0
+                    
+                    # Add phase-specific parameters
+                    well_summary[f'IP{phase[0]}'] = param['qi'] * denormalization_scalar  # IPO, IPG, IPW
+                    well_summary[f'D{phase[0]}'] = param['di']  # DO, DG, DW
+                    well_summary[f'B{phase[0]}'] = param['b']   # BO, BG, BW
+                    well_summary[f'ARIES_D{phase[0]}'] = (1-np.power(((param['di']*12)*param['b']+1),(-1/param['b'])))*100
+                else:
+                    # No parameters for this phase
+                    well_summary[f'IP{phase[0]}'] = 0.0
+                    well_summary[f'D{phase[0]}'] = 0.0
+                    well_summary[f'B{phase[0]}'] = 0.0
+                    well_summary[f'ARIES_D{phase[0]}'] = 0.0
+            
+            well_summaries.append(well_summary)
+        
+        # Create the oneline dataframe
+        self._oneline = pd.DataFrame(well_summaries)
+
 
     def generate_flowstream(self, num_months=1200, denormalize=False, actual_dates=False, _verbose=False):
         self.verbose = _verbose
@@ -948,7 +1132,15 @@ class decline_curve:
 
         t_range = np.array(range(1,num_months))
 
+        if self.three_phase_mode:
+            # Three-phase mode: each phase has its own decline curve
+            self._generate_flowstream_three_phase(t_range, num_months, denormalize, actual_dates)
+        else:
+            # Original mode: major phase with ratios
+            self._generate_flowstream_original(t_range, num_months, denormalize, actual_dates)
 
+    def _generate_flowstream_original(self, t_range, num_months, denormalize, actual_dates):
+        """Original flowstream generation using major phase with ratios"""
         flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','t0','minor_ratio','water_ratio']].copy()
 
         flow_df['T_INDEX'] = flow_df.apply(lambda row: t_range, axis=1)
@@ -977,11 +1169,7 @@ class decline_curve:
         )
         flow_df['WATER'] = flow_df['dca_values'] * flow_df['water_ratio']
         
-
-        
-
         self._flowstream_dataframe = flow_df[['UID','major','T_INDEX','OIL','GAS','WATER']].rename(columns={'major':'MAJOR'})
-        #print(self._flowstream_dataframe.columns)
         self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID','MAJOR']).apply(pd.Series.explode).reset_index()
         self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
 
@@ -990,17 +1178,9 @@ class decline_curve:
         self._flowstream_dataframe['GAS'] = self._flowstream_dataframe['GAS'].fillna(0)
         self._flowstream_dataframe['WATER'] = self._flowstream_dataframe['WATER'].fillna(0)
 
-        self._flowstream_dataframe['OIL'] = pd.to_numeric(
-            self._flowstream_dataframe['OIL']
-        )
-
-        self._flowstream_dataframe['GAS'] = pd.to_numeric(
-            self._flowstream_dataframe['GAS']
-        )
-
-        self._flowstream_dataframe['WATER'] = pd.to_numeric(
-            self._flowstream_dataframe['WATER']
-        )
+        self._flowstream_dataframe['OIL'] = pd.to_numeric(self._flowstream_dataframe['OIL'])
+        self._flowstream_dataframe['GAS'] = pd.to_numeric(self._flowstream_dataframe['GAS'])
+        self._flowstream_dataframe['WATER'] = pd.to_numeric(self._flowstream_dataframe['WATER'])
 
         self._flowstream_dataframe.replace([np.inf, -np.inf], 0, inplace=True)
 
@@ -1030,99 +1210,130 @@ class decline_curve:
             actual_df['P_DATE'] = self._dataframe[self._date_col]
             self._flowstream_dataframe['P_DATE'] = None
             
-        # Added to ensure UID and T_INDEX are unique
-    
         actual_df = actual_df.set_index(['UID', 'T_INDEX'])
 
-        #actual_df.to_csv('outputs/actual.csv')
-        #self._flowstream_dataframe.to_csv('outputs/flowstrems.csv')
+    def _generate_flowstream_three_phase(self, t_range, num_months, denormalize, actual_dates):
+        """Three-phase flowstream generation with independent decline curves for each phase"""
+        # Create a list to store all flow data
+        all_flows = []
+        
+        for _, row in self._params_dataframe.iterrows():
+            uid = row['UID']
+            phase = row['phase']
+            h_length = row['h_length']
+            qi = row['qi']
+            di = row['di']
+            b = row['b']
+            t0 = row['t0']
+            
+            # Calculate denormalization scalar
+            if denormalize and h_length > 1:
+                denormalization_scalar = h_length / self.SET_LENGTH
+            else:
+                denormalization_scalar = 1.0
+            
+            # Calculate DCA values for this phase
+            dca_values = np.array(self.arps_decline(t_range, qi, di, b, t0)) * denormalization_scalar
+            
+            # Create flow data for this phase-well combination
+            for t_idx, flow_rate in zip(t_range, dca_values):
+                flow_data = {
+                    'UID': uid,
+                    'T_INDEX': t_idx,
+                    'OIL': 0.0,
+                    'GAS': 0.0,
+                    'WATER': 0.0
+                }
+                
+                # Set the flow rate for the appropriate phase
+                if phase == 'OIL':
+                    flow_data['OIL'] = flow_rate
+                elif phase == 'GAS':
+                    flow_data['GAS'] = flow_rate
+                elif phase == 'WATER':
+                    flow_data['WATER'] = flow_rate
+                
+                all_flows.append(flow_data)
+        
+        # Create the flowstream dataframe
+        if all_flows:
+            self._flowstream_dataframe = pd.DataFrame(all_flows)
+            self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
+        else:
+            self._flowstream_dataframe = pd.DataFrame(columns=['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER'])
+            self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
 
-        #self._flowstream_dataframe.to_csv('outputs/flowstream_df.csv')
-        #actual_df.to_csv('outputs/actual.csv')
-        actual_df = actual_df[~actual_df.index.duplicated(keep='first')]
-        self._flowstream_dataframe = self._flowstream_dataframe[~self._flowstream_dataframe.index.duplicated(keep='first')]
-        self._flowstream_dataframe.update(actual_df)
-        self._flowstream_dataframe = self._flowstream_dataframe.reset_index()
+        # Replace na values with 0
+        self._flowstream_dataframe['OIL'] = self._flowstream_dataframe['OIL'].fillna(0)
+        self._flowstream_dataframe['GAS'] = self._flowstream_dataframe['GAS'].fillna(0)
+        self._flowstream_dataframe['WATER'] = self._flowstream_dataframe['WATER'].fillna(0)
 
+        # Convert to numeric
+        self._flowstream_dataframe['OIL'] = pd.to_numeric(self._flowstream_dataframe['OIL'])
+        self._flowstream_dataframe['GAS'] = pd.to_numeric(self._flowstream_dataframe['GAS'])
+        self._flowstream_dataframe['WATER'] = pd.to_numeric(self._flowstream_dataframe['WATER'])
+
+        # Replace infinite values
+        self._flowstream_dataframe.replace([np.inf, -np.inf], 0, inplace=True)
+
+        # Handle actual data comparison
+        if denormalize:
+            actual_df = self._dataframe[[self._uid_col,'T_INDEX',self._oil_col,self._gas_col,self._water_col]]
+            actual_df = actual_df.rename(columns={
+                self._uid_col:'UID',
+                self._oil_col:'OIL',
+                self._gas_col:"GAS",
+                self._water_col:"WATER"
+            })
+        else:
+            actual_df = self._normalized_dataframe[[
+                'UID',
+                'T_INDEX',
+                'NORMALIZED_OIL',
+                'NORMALIZED_GAS',
+                'NORMALIZED_WATER'
+            ]]
+            actual_df = actual_df.rename(columns={
+                'NORMALIZED_OIL':'OIL',
+                'NORMALIZED_GAS':"GAS",
+                'NORMALIZED_WATER':'WATER'
+            })
 
         if actual_dates:
+            actual_df['P_DATE'] = self._dataframe[self._date_col]
+            self._flowstream_dataframe['P_DATE'] = None
             
-            # Updated code using the fact that T_INDEX is always referenced to MIN_DATE
+        actual_df = actual_df.set_index(['UID', 'T_INDEX'])
 
-            self._flowstream_dataframe['P_DATE'] = pd.to_datetime(self._flowstream_dataframe['P_DATE'])
-
-            min_df = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
-            #min_df = self._flowstream_dataframe.groupby(['UID']).min().reset_index()
-            min_df = min_df.rename(columns={self._uid_col:"UID",self._date_col:"MIN_DATE"})
-            min_df = min_df[min_df['MIN_DATE'].notnull()]
-
-            self._flowstream_dataframe = self._flowstream_dataframe.merge(min_df, left_on='UID', right_on='UID')
-
-            self._flowstream_dataframe = self._flowstream_dataframe.replace([np.inf, -np.inf], np.nan)
-
-            self._flowstream_dataframe['P_DATE'] = np.where(
-                self._flowstream_dataframe['P_DATE'].isnull(),
-                self._flowstream_dataframe.apply(lambda row: self.add_months(row["MIN_DATE"], row["T_INDEX"]), axis = 1),
-                self._flowstream_dataframe['P_DATE']
-            )
-
-            self._flowstream_dataframe = self._flowstream_dataframe.drop(['MIN_DATE'],axis=1)
-
-            # Orginal code encountered issues when date skips in historical were present
-
-            #self._flowstream_dataframe['P_DATE'] = pd.to_datetime(self._flowstream_dataframe['P_DATE'])
-            
-            #cum_count = self._flowstream_dataframe[self._flowstream_dataframe['P_DATE'].isnull()].groupby(['UID']).cumcount().rename('OFFSET_INDEX')
-            #cum_count = cum_count+1
-            #self._flowstream_dataframe = self._flowstream_dataframe.merge(cum_count,how='left', left_index=True, right_index=True)
-            
-            #max_df = self._flowstream_dataframe.groupby(['UID']).max().reset_index()
-            #max_df = max_df[['UID','P_DATE']].rename(columns={'P_DATE':'MAX_DATE'})
-            #max_df = max_df[max_df['MAX_DATE'].notnull()]
-            
-            #self._flowstream_dataframe = self._flowstream_dataframe.merge(max_df, left_on='UID', right_on='UID')
-            
-            #self._flowstream_dataframe = self._flowstream_dataframe.replace([np.inf, -np.inf], np.nan)
-            
-            #self._flowstream_dataframe['OFFSET_INDEX'] = self._flowstream_dataframe['OFFSET_INDEX'].fillna(0)
-
-            #self._flowstream_dataframe['P_DATE'] = np.where(
-            #    self._flowstream_dataframe['P_DATE'].isnull(),
-            #    self._flowstream_dataframe.apply(lambda row: self.add_months(row["MAX_DATE"], row["OFFSET_INDEX"]), axis = 1),
-            #    self._flowstream_dataframe['P_DATE']
-            #)
-
-            #self._flowstream_dataframe = self._flowstream_dataframe.drop(['OFFSET_INDEX','MAX_DATE'],axis=1)
 
     def generate_typecurve(self, num_months=1200, denormalize=False, prob_levels=[.1,.5,.9], _verbose=False, return_params=False):
         if self._flowstream_dataframe == None:
             self.generate_flowstream(num_months=num_months,denormalize=denormalize, _verbose=_verbose)
 
+        if self.three_phase_mode:
+            self._generate_typecurve_three_phase(num_months, denormalize, prob_levels, _verbose, return_params)
+        else:
+            self._generate_typecurve_original(num_months, denormalize, prob_levels, _verbose, return_params)
+
+    def _generate_typecurve_original(self, num_months, denormalize, prob_levels, _verbose, return_params):
+        """Original typecurve generation using major phase with ratios"""
         return_df = self._flowstream_dataframe.reset_index()
         
-        #print(return_df.head())
-        #return_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']]
         if self.DEBUG_ON:
             return_df.to_csv('outputs/test_quantiles.csv')
         
-        #print(self._flowstream_dataframe)
-
         return_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).quantile(prob_levels).reset_index()
         avg_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).mean().reset_index()
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
-        #vect_df = self._flowstream_dataframe[['T_INDEX','MAJOR','OIL','GAS','WATER']].groupby(['T_INDEX','MAJOR']).quantile(prob_levels).reset_index()
-
         
         if return_params:
             r_df = pd.DataFrame([])
             for major in ['OIL','GAS']:
-            #return_df.to_csv('outputs/return_test.csv')
                 l_df = return_df.copy()
                 l_df['MAJOR'] = major
                 param_df = self.vect_generate_params_tc(l_df)
                 param_df['d0'] = param_df.apply(lambda x: x.di*np.power((1+x.b*x.di*(1-x.t0)),-1), axis=1)
-                #param_df['d0_a'] = param_df.apply(lambda x: np.power((1+x.d0),12)-1, axis=1)
                 param_df['d0_a'] = param_df.apply(lambda x: x.d0*12, axis=1)
                 param_df['aries_de'] = param_df.apply(lambda x: (1-np.power((x.d0_a*x.b+1),(-1/x.b)))*100, axis=1)
                 param_df = param_df.rename(columns={
@@ -1144,15 +1355,122 @@ class decline_curve:
                 else:
                     r_df = pd.concat([r_df,param_df])
             self.tc_params = r_df
+            
         return_df = return_df.pivot(
                 index=['T_INDEX'],
                 columns='level_1',
                 values=['OIL','GAS','WATER']
             )
-            #oil_df.columns = ['P10 Oil, bbl/(km-month)','P50 Oil, bbl/(km-month)','P90 Oil, bbl/(km-month)']
-        #oil_df = oil_df.rename(columns={'T_INDEX':'Months Online'})
 
         self._typecurve = return_df
+
+    def _generate_typecurve_three_phase(self, num_months, denormalize, prob_levels, _verbose, return_params):
+        """Three-phase typecurve generation with independent decline curves for each phase"""
+        return_df = self._flowstream_dataframe.reset_index()
+        
+        if self.DEBUG_ON:
+            return_df.to_csv('outputs/test_quantiles.csv')
+        
+        # Calculate quantiles and mean for each phase independently
+        return_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).quantile(prob_levels).reset_index()
+        avg_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).mean().reset_index()
+        avg_df['level_1'] = 'mean'
+        return_df = pd.concat([return_df,avg_df])
+        
+        if return_params:
+            r_df = pd.DataFrame([])
+            # In three-phase mode, we have independent parameters for each phase
+            for phase in ['OIL','GAS','WATER']:
+                l_df = return_df.copy()
+                l_df['PHASE'] = phase
+                param_df = self.vect_generate_params_tc_three_phase(l_df, phase)
+                if len(param_df) > 0:
+                    param_df['d0'] = param_df.apply(lambda x: x.di*np.power((1+x.b*x.di*(1-x.t0)),-1), axis=1)
+                    param_df['d0_a'] = param_df.apply(lambda x: x.d0*12, axis=1)
+                    param_df['aries_de'] = param_df.apply(lambda x: (1-np.power((x.d0_a*x.b+1),(-1/x.b)))*100, axis=1)
+                    param_df = param_df.rename(columns={
+                        'qi':f'Actual Initial Rate, {phase.lower()}/month',
+                        'q0':f'DCA Initial Rate, {phase.lower()}/month',
+                        'di':'Nominal Initial Decline at Match Point, fraction/months',
+                        'b':'B Factor, unitless',
+                        't0':'Match Point, months',
+                        'd0':'Nominal Initial Decline at Time Zero, fraction/months',
+                        'd0_a':'Nominal Initial Decline at Time Zero, fraction/years',
+                        'aries_de':'Effective Initial Decline at Time Zero, %/years (FOR ARIES)',
+                        'UID':'Probability',
+                        'phase':'Phase'
+                    })
+                    if r_df.empty:
+                        r_df = param_df
+                    else:
+                        r_df = pd.concat([r_df,param_df])
+            self.tc_params = r_df
+            
+        return_df = return_df.pivot(
+                index=['T_INDEX'],
+                columns='level_1',
+                values=['OIL','GAS','WATER']
+            )
+
+        self._typecurve = return_df
+
+    def vect_generate_params_tc_three_phase(self, param_df, phase):
+        """Generate parameters for typecurve in three-phase mode"""
+        self._force_t0 = True
+
+        param_df['HOLE_DIRECTION'] = "H"
+        param_df = param_df[param_df['T_INDEX']<60]
+        param_df = param_df.rename(columns={
+            'OIL':'NORMALIZED_OIL',
+            'GAS':"NORMALIZED_GAS",
+            'WATER':'NORMALIZED_WATER',
+            'level_1':'UID'
+        })
+
+        # Create a temporary dataframe for this phase
+        temp_df = param_df[[
+            'UID',
+            'HOLE_DIRECTION',
+            'T_INDEX',
+            f'NORMALIZED_{phase}'
+        ]].copy()
+        
+        # Add a MAJOR column for this phase
+        temp_df['MAJOR'] = phase
+        
+        # Add dummy columns for other phases (set to 0)
+        for other_phase in ['OIL', 'GAS', 'WATER']:
+            if other_phase != phase:
+                temp_df[f'NORMALIZED_{other_phase}'] = 0
+
+        imploded_df = temp_df.groupby([
+            'UID',
+            'MAJOR',
+            'HOLE_DIRECTION'
+        ]).agg({
+            'T_INDEX': lambda x: x.tolist(),
+            'NORMALIZED_OIL': lambda x: x.tolist(),
+            'NORMALIZED_GAS': lambda x: x.tolist(),
+            'NORMALIZED_WATER': lambda x: x.tolist()
+        }).reset_index()
+
+        imploded_df = imploded_df.apply(self.dca_params, axis=1)
+        
+        imploded_df = imploded_df[[
+            'UID',
+            'MAJOR',
+            'q0',
+            'qi',
+            'di',
+            'b',
+            't0'
+        ]].rename(columns={
+            'MAJOR':'phase'
+        })
+
+        self._force_t0 = False
+
+        return imploded_df
 
 
 if __name__ == '__main__':
