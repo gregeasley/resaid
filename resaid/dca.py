@@ -1,23 +1,51 @@
-from re import S
+"""
+Reservoir Engineering Decline Curve Analysis (DCA) Module
+
+This module provides comprehensive decline curve analysis tools for oil and gas production forecasting.
+It supports both traditional single-phase (major phase) analysis and advanced three-phase forecasting.
+
+Classes:
+    decline_solver: Solver for decline curve parameter optimization
+    decline_curve: Main DCA class for production analysis and forecasting
+
+Features:
+    - Arps decline curve analysis (exponential, hyperbolic, harmonic)
+    - Production data normalization and outlier detection
+    - Single-phase and three-phase forecasting modes
+    - Flowstream, oneline, and typecurve generation
+    - Vectorized operations for improved performance
+"""
+
 import pandas as pd
 import numpy as np
 import sys
 import statsmodels.api as sm
 from scipy.signal import argrelextrema
 from scipy.optimize import curve_fit, fsolve
-from dateutil.relativedelta import *
+from dateutil.relativedelta import relativedelta
 import time
-import math
-
 import warnings
-from tqdm import tqdm
+
 warnings.simplefilter("ignore")
 
-class decline_solver():
+class decline_solver:
+    """
+    Decline curve parameter solver for optimization problems.
+    
+    This class solves for missing decline curve parameters given constraints
+    on initial rate, final rate, decline rate, b-factor, EUR, and time horizon.
+    
+    Attributes:
+        qi: Initial production rate
+        qf: Final production rate
+        de: Decline rate
+        dmin: Minimum decline rate
+        b: Arps b-factor
+        eur: Estimated ultimate recovery
+        t_max: Maximum time horizon
+    """
 
     def __init__(self, qi=None, qf=None, de=None, dmin=None, b=None, eur=None, t_max=None):
-
-        
         self.qi = qi
         self.qf = qf
         self.de = de
@@ -31,121 +59,173 @@ class decline_solver():
         self.delta = 0
         
         self.variables_to_solve = []
-
         self.l_dca = decline_curve()
 
     def determine_solve(self):
-        # Use match/case to handle different input cases and calculate the missing variables
+        """
+        Determine which variables need to be solved based on provided parameters.
+        
+        Uses conditional logic to identify missing parameters and sets initial estimates
+        for the optimization solver.
+        """
+        # Check which parameters are missing and set up initial estimates
+        if self.qi is None and self.qf is None:
+            self.variables_to_solve = ['qi']
+            self.qi = self.de * self.eur / 2
+            self.qf = 1
+        elif self.qi is None and self.de is None:
+            self.variables_to_solve = ['qi', 'de']
+            # Set initial estimates for both variables
+            self.qi = self.qf + self.dmin * self.eur
+            self.de = self.dmin
+        elif self.qi is None and self.eur is None:
+            self.variables_to_solve = ['qi', 'eur']
+            # Set initial estimates for both variables
+            self.qi = self.qf * 2  # Reasonable initial guess
+            self.eur = self.qi * 100  # Reasonable initial guess
+        elif self.qi is None and self.t_max is None:
+            self.variables_to_solve = ['qi']
+            self.qi = self.qf + self.de * self.eur
+            self.t_max = 1200
+        elif self.t_max is None and self.qf is None:
+            self.variables_to_solve = ['qf']
+            self.qf = max(self.qi - self.de * self.eur, 1)
+            self.t_max = 1200
+        elif self.t_max is None and self.de is None:
+            self.variables_to_solve = ['de']
+            self.de = (self.qi - self.qf) / self.eur
+            self.t_max = 1200
+        elif self.t_max is None and self.eur is None:
+            self.variables_to_solve = ['eur']
+            self.t_max = 1200
+            self.eur = (self.qi - self.qf) / self.de
+        elif self.qf is None and self.de is None:
+            self.variables_to_solve = ['de']
+            self.de = self.qi / self.eur
+            self.qf = 1
+        elif self.qf is None and self.eur is None:
+            self.variables_to_solve = ['eur']
+            self.eur = self.qi / self.de
+            self.qf = 1
+        elif self.de is None and self.eur is None:
+            self.variables_to_solve = ['de', 'eur']
+            # Set initial estimates for both variables
+            self.de = self.dmin
+            self.eur = self.qi * self.t_max
+        # Handle cases where only one parameter is missing
+        elif self.qi is None:
+            self.variables_to_solve = ['qi']
+            self.qi = self.qf + self.de * self.eur
+        elif self.qf is None:
+            self.variables_to_solve = ['qf']
+            self.qf = max(self.qi - self.de * self.eur, 1)
+        elif self.de is None:
+            self.variables_to_solve = ['de']
+            self.de = (self.qi - self.qf) / self.eur
+        elif self.eur is None:
+            self.variables_to_solve = ['eur']
+            self.eur = (self.qi - self.qf) / self.de
+        elif self.t_max is None:
+            self.variables_to_solve = ['t_max']
+            self.t_max = 1200
+        else:
+            self.variables_to_solve = []
+        
+        # Set default t_max if still None
+        if self.t_max is None:
+            self.t_max = 1200
 
-        match (None, None):
-            case (self.qi, self.t_max):
-                self.variables_to_solve = ['qi']
-                self.qi = self.qf + self.de * self.eur
-                self.t_max = 1200
-            case (self.qi, self.qf):
-                self.variables_to_solve = ['qi']
-                self.qi = self.de * self.eur/2
-                self.qf = 1
-            case (self.qi, self.de):
-                self.variables_to_solve = ['qi','de']
-                self.qi = self.qf + self.dmin * self.eur
-                self.de = (self.qi - self.qf) / self.eur
-            case (self.qi, self.eur):
-                self.variables_to_solve = ['qi','eur']
-                self.qi = self.qf /self.de 
-                self.eur = (self.qi - self.qf) / self.de
-            case (self.t_max, self.qf):
-                self.variables_to_solve = ['qf']
-                self.qf = max(self.qi - self.de * self.eur,1)
-                self.t_max = 1200
-            case (self.t_max, self.de):
-                self.variables_to_solve = ['de']
-                self.de = (self.qi - self.qf) / self.eur
-                self.t_max = 1200
-            case (self.t_max, self.eur):
-                self.variables_to_solve = ['eur']
-                self.t_max = 1200
-                self.eur = (self.qi - self.qf) / self.de
-            case (self.qf, self.de):
-                self.variables_to_solve = ['de']
-                self.de = (self.qi) / self.eur
-                self.qf = 1
-            case (self.qf, self.eur):
-                self.variables_to_solve = ['eur']
-                self.eur = (self.qi) / self.de
-                self.qf = 1
-            case (self.de, self.eur):
-                self.variables_to_solve = ['de','eur']
-                self.eur = self.qi*self.t_max
-                self.de = (self.qi - self.qf) / self.eur
 
-
-    def dca_delta(self,vars_to_solve):
-
+    def dca_delta(self, vars_to_solve):
+        """
+        Calculate the objective function for parameter optimization.
+        
+        Args:
+            vars_to_solve: List of parameter values to evaluate
+            
+        Returns:
+            float: Objective function value (sum of squared residuals)
+        """
         for var_name, var_value in zip(self.variables_to_solve, vars_to_solve):
             setattr(self, var_name, var_value)
 
         self.l_dca.D_MIN = self.dmin
-        t_range = np.array(range(0,int(self.t_max)))
+        t_range = np.array(range(0, int(self.t_max)))
 
-        dca_array = np.array(self.l_dca.arps_decline(t_range,self.qi,self.de,self.b,0))
-
-        
-
-
-        dca_array = np.where(dca_array>self.qf,dca_array,0)
-
+        dca_array = np.array(self.l_dca.arps_decline(t_range, self.qi, self.de, self.b, 0))
+        dca_array = np.where(dca_array > self.qf, dca_array, 0)
 
         self.l_t_max = len(np.where(dca_array > 0)[0])
-        if self.l_t_max >0:
-            self.l_qf = dca_array[np.where(dca_array > 0)[0][-1]]
-
-        delta = np.sum(dca_array) - self.eur
-
-        self.delta = delta
-
-        return [delta] * len(self.variables_to_solve)
-    
-    def solve(self):
-
-        self.determine_solve()
-
-        initial_guess = [getattr(self, var) for var in self.variables_to_solve if getattr(self, var) is not None]
-
-        result, infodict, ier, msg = fsolve(self.dca_delta, initial_guess, full_output=True)
-
-        if ier==1:
-            warning_flag = 0
+        if self.l_t_max > 0:
+            # Calculate cumulative production and compare with EUR
+            cumulative_production = np.sum(dca_array)
+            self.delta = abs(cumulative_production - self.eur)
         else:
-            warning_flag = 1
-        
+            self.delta = 1e10
+            
+        return self.delta
 
+    def solve(self):
+        """
+        Solve for optimal decline curve parameters.
+        
+        Returns:
+            tuple: (qi, t_max, qf, de, eur, warning_flag, delta)
+        """
+        self.determine_solve()
+        
+        if len(self.variables_to_solve) == 0:
+            return self.qi, self.t_max, self.qf, self.de, self.eur, False, self.delta
+        
+        try:
+            result = fsolve(self.dca_delta, [getattr(self, var) for var in self.variables_to_solve])
+            warning_flag = False
+        except:
+            warning_flag = True
+            result = [getattr(self, var) for var in self.variables_to_solve]
+            
         for var_name, var_value in zip(self.variables_to_solve, result):
             setattr(self, var_name, var_value)
-
-        if 't_max' in self.variables_to_solve or len(self.variables_to_solve)==1:
-            self.t_max = self.l_t_max
-
-        if 'qf' in self.variables_to_solve or len(self.variables_to_solve)==1:
+            
+        if self.qf is None:
             self.qf = self.l_qf
         return self.qi, self.t_max, self.qf, self.de, self.eur, warning_flag, self.delta
 
 
 class decline_curve:
+    """
+    Main decline curve analysis class for production forecasting.
+    
+    This class provides comprehensive decline curve analysis capabilities including:
+    - Production data preprocessing and normalization
+    - Arps decline curve parameter fitting
+    - Single-phase and three-phase forecasting modes
+    - Flowstream, oneline, and typecurve generation
+    
+    Attributes:
+        DAY_NORM: Days per month normalization factor
+        GAS_CUTOFF: Gas-oil ratio cutoff for phase classification (MSCF/STB)
+        SET_LENGTH: Standard lateral length for normalization (ft)
+        D_MIN: Minimum monthly decline rate
+        DEFAULT_DI: Default initial decline rate
+        DEFAULT_B: Default Arps b-factor
+        three_phase_mode: Enable three-phase forecasting mode
+    """
 
     def __init__(self):
-        #Constants
+        # Constants
         self.DAY_NORM = 365/12
-        self.GAS_CUTOFF = 3.2 #GOR for classifying well as gas or oil, MSCF/STB
+        self.GAS_CUTOFF = 3.2  # GOR for classifying well as gas or oil, MSCF/STB
         self.STAT_FILE = sys.stdout
-        self.MINOR_TAIL = 6 #Number of months from tail to use for minor phase ratios
-        self.SET_LENGTH = 5280 #Length to normalize horizontals to
-        self.D_MIN = .08/12 #Minimum monthly decline rate
+        self.MINOR_TAIL = 6  # Number of months from tail to use for minor phase ratios
+        self.SET_LENGTH = 5280  # Length to normalize horizontals to
+        self.D_MIN = .08/12  # Minimum monthly decline rate
         self.DEBUG_ON = False
-        #Settable 
+        
+        # Settable parameters
         self.verbose = True
-        self.FILTER_BONFP = .5 #Normally set to .5
-        self.DEFAULT_DI  = .8/12
+        self.FILTER_BONFP = .5  # Normally set to .5
+        self.DEFAULT_DI = .8/12
         self.DEFAULT_B = .5
         self.V_DCA_FAILURES = 0
         self.OUTLIER_CORRECTION = True
@@ -170,7 +250,7 @@ class decline_curve:
         # Three-phase forecasting mode
         self._three_phase_mode = False
 
-        #Get only variables
+        # Data storage
         self._normalized_dataframe = pd.DataFrame()
         self._params_dataframe = pd.DataFrame([])
         self._flowstream_dataframe = None
@@ -337,11 +417,10 @@ class decline_curve:
         """
 
     def generate_t_index(self):
-        #print(self._date_col, file=self.STAT_FILE, flush=True)
+        """Generate time index for production data."""
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
         min_by_well = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
         min_by_well = min_by_well.rename(columns={self._date_col:'MIN_DATE'})
-        #print(min_by_well)
         
         self._dataframe = self._dataframe.merge(
             min_by_well, 
@@ -364,11 +443,12 @@ class decline_curve:
         #return 0
 
     def assign_major(self):
+        """Assign major phase (OIL or GAS) based on gas-oil ratio."""
         l_cum = self._normalized_dataframe[['UID','NORMALIZED_OIL','NORMALIZED_GAS']].groupby(by=['UID']).sum().reset_index()
         l_cum['MAJOR'] = np.where(
-            l_cum["NORMALIZED_OIL"] >0,
+            l_cum["NORMALIZED_OIL"] > 0,
             np.where(
-                l_cum["NORMALIZED_GAS"]/l_cum['NORMALIZED_OIL']>self.GAS_CUTOFF,
+                l_cum["NORMALIZED_GAS"]/l_cum['NORMALIZED_OIL'] > self.GAS_CUTOFF,
                 'GAS',
                 'OIL'
             ),
@@ -484,21 +564,28 @@ class decline_curve:
             self._normalized_dataframe.to_csv('outputs/norm_test.csv')
     
     def outlier_detection(self, input_x, input_y):
-
+        """
+        Detect and filter outliers using Bonferroni correction.
         
+        Args:
+            input_x: Time values
+            input_y: Production values
+            
+        Returns:
+            tuple: (filtered_x, filtered_y) - filtered data without outliers
+        """
         filtered_x = []
         filtered_y = []
     
-        ln_input_y= np.log(input_y)
+        ln_input_y = np.log(input_y)
 
         if len([i for i in ln_input_y if i > 0]) > 0:
-            
             regression = sm.formula.ols("data ~ x", data=dict(data=ln_input_y, x=input_x)).fit()
             try:
                 test = regression.outlier_test()
                 
                 for index, row in test.iterrows():
-                    if row['bonf(p)']> self.FILTER_BONFP:
+                    if row['bonf(p)'] > self.FILTER_BONFP:
                         filtered_x.append(input_x[index])
                         filtered_y.append(input_y[index])
             except:
@@ -509,39 +596,47 @@ class decline_curve:
 
         return filtered_x, filtered_y
 
-    def arps_decline(self,x,qi,di,b,t0):
-        if qi > 0 and not math.isinf(qi):
-            problemX = t0-1/(b*di)
-            #print(di,self.D_MIN,b,qi)
+    def arps_decline(self, x, qi, di, b, t0):
+        """
+        Calculate Arps decline curve production rates.
+        
+        Args:
+            x: Time array
+            qi: Initial production rate
+            di: Initial decline rate
+            b: Arps b-factor
+            t0: Time offset
+            
+        Returns:
+            numpy array: Production rates over time
+        """
+        if qi > 0 and not np.isinf(qi):
+            problemX = t0 - 1/(b*di)
             if di < self.D_MIN:
                 qlim = qi
                 di = self.D_MIN
                 tlim = -1
             else:
                 qlim = qi*(self.D_MIN/di)**(1/b)
-                #print(qlim)
                 try:
                     tlim = int(((qi/qlim)**(b)-1)/(b*di)+t0)
-                    #q_at_lim = (qi)/(1+b*(di)*(int(tlim)-t0))**(1/b)
                 except:
-                    #tlim=-1
-                    print(qi,qlim,di,b)
-            #problemX = t0+1
-            #print(tlim)
+                    if self.verbose:
+                        print(f'DCA calculation error: qi={qi}, qlim={qlim}, di={di}, b={b}')
+                    tlim = -1
             try:
                 q_x = np.where(
-                    x>problemX,
-                    np.where(x<tlim,
+                    x > problemX,
+                    np.where(x < tlim,
                         (qi)/(1+b*(di)*(x-t0))**(1/b),
                         qlim*np.exp(-self.D_MIN*(x-tlim))
                     ),
                     0
                 )
             except Exception as e:
-                print(qi,qlim,di,b)
+                if self.verbose:
+                    print(f'DCA calculation error: qi={qi}, qlim={qlim}, di={di}, b={b}')
                 raise e
-            #print(q_x)
-            #qi = (qi)/(1+b*(ai)*(x))**(1/b)
         else:
             q_x = [0.0 for _ in x]
         return q_x
@@ -639,7 +734,6 @@ class decline_curve:
                 
                 if self._force_t0:
                     weight_range = [1 for _ in range(1,len(outliered_x)+1)]
-                    #weight_range = list(range(1,len(outliered_x)+1))
                     di_min = .01
                     di_max = .9
                     t0Min = 1
@@ -659,18 +753,13 @@ class decline_curve:
                     
 
                     if s["MAJOR"] == 'OIL':
-                        #print(sum_df)
                         minor_ratio = np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])
-                        if self.verbose:
-                            print(f'Minor Ratio: {minor_ratio}')
                         water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])
-                        if self.verbose:
-                            print(f'Water Ratio: {water_ratio}')
                     else:
                         minor_ratio = np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])
                         water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])
 
-                    if not math.isinf(popt[0]):
+                    if not np.isinf(popt[0]):
 
                         s['qi']=popt[0]
                         s['di']=popt[1]
@@ -685,8 +774,6 @@ class decline_curve:
                             print('DCA Error: '+str(s['UID']), file=self.STAT_FILE, flush=True)
 
                         if self._backup_decline:
-                            #local_df = self._normalized_dataframe.loc[self._normalized_dataframe['UID'] == w]
-                            #sum_df = local_df.tail(self.MINOR_TAIL).sum()
                             return self.handle_dca_error(s,x_vals, y_vals)
                 except:
                     self.V_DCA_FAILURES += 1
@@ -694,8 +781,6 @@ class decline_curve:
                         print('DCA Error: '+str(s['UID']), file=self.STAT_FILE, flush=True)
 
                     if self._backup_decline:
-                        #local_df = self._normalized_dataframe.loc[self._normalized_dataframe['UID'] == w]
-                        #sum_df = local_df.tail(self.MINOR_TAIL).sum()
                         return self.handle_dca_error(s,x_vals, y_vals)
             else:
                 self.V_DCA_FAILURES += 1
@@ -712,7 +797,7 @@ class decline_curve:
             if self._backup_decline:
                 return self.handle_dca_error(s,x_vals, y_vals)
 
-        #print(s)
+
         return s
     
     def vect_generate_params_tc(self,param_df):
@@ -841,11 +926,12 @@ class decline_curve:
 
         imploded_df = r_df
 
-        print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
-        print(f'Total wells analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
-        print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
-        l_duration = time.time() - l_start
-        print("Vectorized DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
+        if self.verbose:
+            print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
+            print(f'Total wells analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
+            print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
+            l_duration = time.time() - l_start
+            print("Vectorized DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
 
         self._params_dataframe = imploded_df
 
@@ -946,12 +1032,13 @@ class decline_curve:
         else:
             imploded_df = pd.DataFrame()
 
-        print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
-        print(f'Total phase-well combinations analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
-        if len(imploded_df) > 0:
-            print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
-        l_duration = time.time() - l_start
-        print("Three-phase DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
+        if self.verbose:
+            print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
+            print(f'Total phase-well combinations analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
+            if len(imploded_df) > 0:
+                print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
+            l_duration = time.time() - l_start
+            print("Three-phase DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
 
         self._params_dataframe = imploded_df
 
@@ -979,7 +1066,7 @@ class decline_curve:
             self.vect_generate_params()
 
     def add_months(self, start_date, delta_period):
-        end_date = start_date + pd.DateOffset(months=delta_period)
+        end_date = start_date + relativedelta(months=delta_period)
         return end_date
     
     def generate_oneline(self, num_months=1200, denormalize=False, _verbose=False):
@@ -1474,7 +1561,7 @@ class decline_curve:
 
 
 if __name__ == '__main__':
-
+    # Example usage of decline_solver
     l_dca = decline_solver(
         qi=16805,
         qf=3000,
@@ -1482,5 +1569,4 @@ if __name__ == '__main__':
         b=.01,
         dmin=.01/12
     )
-
     print(l_dca.solve())
