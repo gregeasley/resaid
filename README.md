@@ -48,7 +48,7 @@ dca.length_col = 'LateralLength_FT'
 dca.min_h_b = 0.9
 dca.max_h_b = 1.3
 dca.backup_decline = True
-dca.OUTLIER_CORRECTION = False
+dca.outlier_correction = False
 
 # Run DCA analysis
 dca.run_DCA()
@@ -139,15 +139,15 @@ econ.gas_pri = 3.0       # Gas price $/MCF
 econ.discount_rate = 0.1 # 10% discount rate
 
 # Operating costs
-econ._opc_t = 1000       # Fixed operating cost $/month
-econ._opc_oil = 5.0      # Variable oil cost $/bbl
-econ._opc_gas = 0.5      # Variable gas cost $/MCF
-econ._opc_water = 2.0    # Variable water cost $/bbl
+econ.opc_t = 1000       # Fixed operating cost $/month
+econ.opc_oil = 5.0      # Variable oil cost $/bbl
+econ.opc_gas = 0.5      # Variable gas cost $/MCF
+econ.opc_water = 2.0    # Variable water cost $/bbl
 
 # Taxes
-econ._sev_oil = 0.05     # Oil severance tax rate
-econ._sev_gas = 0.05     # Gas severance tax rate
-econ._atx = 0.02         # Ad valorem tax rate
+econ.sev_oil = 0.05     # Oil severance tax rate
+econ.sev_gas = 0.05     # Gas severance tax rate
+econ.atx = 0.02         # Ad valorem tax rate
 
 # Generate cashflow for all wells
 cashflow = econ.generate_cashflow()
@@ -164,18 +164,18 @@ print(indicators[['UID', 'IRR', 'DCF', 'PAYOUT', 'BREAKEVEN']])
 
 ```python
 # Gas processing and NGL modeling
-econ._gas_shrink = 0.1        # 10% gas shrinkage
-econ._ngl_yield = 0.05        # 5 bbl NGL per MCF gas
-econ._ngl_price_fraction = 0.6 # NGL price as fraction of oil price
+econ.gas_shrink = 0.1        # 10% gas shrinkage
+econ.ngl_yield = 0.05        # 5 bbl NGL per MCF gas
+econ.ngl_price_fraction = 0.6 # NGL price as fraction of oil price
 
 # Price differentials
-econ._oil_diff = -2.0         # Oil price differential $/bbl
-econ._gas_diff = 0.5          # Gas price differential $/MCF
+econ.oil_diff = -2.0         # Oil price differential $/bbl
+econ.gas_diff = 0.5          # Gas price differential $/MCF
 
 # Scaling and timing
-econ._scale_forecast = True   # Scale forecast by well characteristics
-econ._scale_column = 'LateralLength_FT'
-econ._scale_base = 5280       # Base lateral length for scaling
+econ.scale_forecast = True   # Scale forecast by well characteristics
+econ.scale_column = 'LateralLength_FT'
+econ.scale_base = 5280       # Base lateral length for scaling
 
 # Generate well-specific cashflow
 well_cashflow = econ.well_flowstream('WELL001')
@@ -226,28 +226,28 @@ API_UWI,ProducingMonth,LiquidsProd_BBL,GasProd_MCF,WaterProd_BBL,LateralLength_F
 ### DCA Parameters
 
 - `min_h_b`, `max_h_b`: B-factor bounds for horizontal wells
-- `DEFAULT_DI`: Default initial decline rate
-- `DEFAULT_B`: Default Arps b-factor
-- `D_MIN`: Minimum decline rate
+- `default_initial_decline`: Default initial decline rate
+- `default_b_factor`: Default Arps b-factor
+- `MIN_DECLINE_RATE`: Minimum decline rate
 - `GAS_CUTOFF`: Gas-oil ratio threshold for phase classification
 
 ### Analysis Settings
 
 - `backup_decline`: Enable backup decline rate for failed fits
-- `OUTLIER_CORRECTION`: Enable outlier detection and filtering
-- `IQR_LIMIT`: Outlier detection threshold
-- `FILTER_BONFP`: Bonferroni correction threshold
+- `outlier_correction`: Enable outlier detection and filtering
+- `iqr_limit`: Outlier detection threshold
+- `filter_bonfp`: Bonferroni correction threshold
 - `three_phase_mode`: Enable three-phase forecasting
 
 ### Economic Parameters
 
 - `oil_pri`, `gas_pri`: Commodity prices ($/bbl, $/MCF)
 - `discount_rate`: Discount rate for NPV calculations
-- `_opc_t`, `_opc_oil`, `_opc_gas`, `_opc_water`: Operating costs
-- `_sev_oil`, `_sev_gas`: Severance tax rates
-- `_atx`: Ad valorem tax rate
-- `_gas_shrink`, `_ngl_yield`: Gas processing parameters
-- `_scale_forecast`: Enable production scaling by well characteristics
+- `opc_t`, `opc_oil`, `opc_gas`, `opc_water`: Operating costs
+- `sev_oil`, `sev_gas`: Severance tax rates
+- `atx`: Ad valorem tax rate
+- `gas_shrink`, `ngl_yield`: Gas processing parameters
+- `scale_forecast`: Enable production scaling by well characteristics
 
 ## Output Formats
 
@@ -313,8 +313,8 @@ qi, t_max, qf, de, eur, warning, delta = solver.solve()
 # Customize analysis parameters
 dca.min_h_b = 0.5
 dca.max_h_b = 2.0
-dca.DEFAULT_DI = 0.6/12
-dca.DEFAULT_B = 0.8
+dca.default_initial_decline = 0.6/12
+dca.default_b_factor = 0.8
 dca.GAS_CUTOFF = 2.5  # MSCF/STB
 
 # Run analysis with custom settings

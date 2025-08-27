@@ -18,9 +18,10 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="resaid",
-    version="0.2.0",
+    version="0.2.1",
     author="Greg Easley",
     author_email="greg@easley.dev",
+    license="MIT",
     description="Comprehensive reservoir engineering tools for decline curve analysis and production forecasting",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -51,4 +52,5 @@ setuptools.setup(
     ],
     packages=setuptools.find_packages(),
     python_requires=">=3.8",
+    include_package_data=False,
 )

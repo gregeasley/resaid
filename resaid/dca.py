@@ -203,37 +203,35 @@ class decline_curve:
     - Flowstream, oneline, and typecurve generation
     
     Attributes:
-        DAY_NORM: Days per month normalization factor
+        DAYS_PER_MONTH: Days per month normalization factor
         GAS_CUTOFF: Gas-oil ratio cutoff for phase classification (MSCF/STB)
-        SET_LENGTH: Standard lateral length for normalization (ft)
-        D_MIN: Minimum monthly decline rate
-        DEFAULT_DI: Default initial decline rate
-        DEFAULT_B: Default Arps b-factor
+        STANDARD_LENGTH: Standard lateral length for normalization (ft)
+        MIN_DECLINE_RATE: Minimum monthly decline rate
+        default_initial_decline: Default initial decline rate
+        default_b_factor: Default Arps b-factor
         three_phase_mode: Enable three-phase forecasting mode
     """
 
     def __init__(self):
         # Constants
-        self.DAY_NORM = 365/12
+        self.DAYS_PER_MONTH = 365/12
         self.GAS_CUTOFF = 3.2  # GOR for classifying well as gas or oil, MSCF/STB
-        self.STAT_FILE = sys.stdout
-        self.MINOR_TAIL = 6  # Number of months from tail to use for minor phase ratios
-        self.SET_LENGTH = 5280  # Length to normalize horizontals to
-        self.D_MIN = .08/12  # Minimum monthly decline rate
-        self.DEBUG_ON = False
+        self.MINOR_TAIL_MONTHS = 6  # Number of months from tail to use for minor phase ratios
+        self.STANDARD_LENGTH = 5280  # Length to normalize horizontals to
+        self.MIN_DECLINE_RATE = .08/12  # Minimum monthly decline rate
         
-        # Settable parameters
+        # User-configurable parameters
         self.verbose = True
-        self.FILTER_BONFP = .5  # Normally set to .5
-        self.DEFAULT_DI = .8/12
-        self.DEFAULT_B = .5
-        self.V_DCA_FAILURES = 0
-        self.OUTLIER_CORRECTION = True
-        self.IQR_LIMIT = 1.5
-        self._min_h_b = .99
-        self._max_h_b = 2
+        self.debug_on = False  # Enable debug output
+        self.filter_bonfp = .5  # Bonferroni correction threshold
+        self.default_initial_decline = .8/12
+        self.default_b_factor = .5
+        self.outlier_correction = True
+        self.iqr_limit = 1.5
+        self.min_h_b = .99
+        self.max_h_b = 2
         
-        self._backup_decline = False
+        self.backup_decline = False
         self._dataframe = None
         self._date_col = None
         self._phase_col = None
@@ -248,7 +246,7 @@ class decline_curve:
         self._force_t0 = False
 
         # Three-phase forecasting mode
-        self._three_phase_mode = False
+        self.three_phase_mode = False
 
         # Data storage
         self._normalized_dataframe = pd.DataFrame()
@@ -352,41 +350,11 @@ class decline_curve:
         self._water_col = value
 
 
-    @property
-    def backup_decline(self):
-        return self._backup_decline
 
 
-    @backup_decline.setter
-    def backup_decline(self,value):
-        self._backup_decline = value
-
-    @property
-    def min_h_b(self):
-        return self._min_h_b
 
 
-    @min_h_b.setter
-    def min_h_b(self,value):
-        self._min_h_b= value
 
-
-    @property
-    def max_h_b(self):
-        return self._max_h_b
-
-
-    @max_h_b.setter
-    def max_h_b(self,value):
-        self._max_h_b= value
-
-    @property
-    def three_phase_mode(self):
-        return self._three_phase_mode
-
-    @three_phase_mode.setter
-    def three_phase_mode(self, value):
-        self._three_phase_mode = value
 
     @property
     def params_dataframe(self):
@@ -489,7 +457,7 @@ class decline_curve:
         else:
             self._normalized_dataframe['LENGTH_SET'] = np.where(
                 self._dataframe[self._length_col] > 1,
-                self.SET_LENGTH,
+                self.STANDARD_LENGTH,
                 1.0
             )
 
@@ -519,21 +487,21 @@ class decline_curve:
 
         self._normalized_dataframe['NORMALIZED_OIL'] = (
             self._dataframe[self._oil_col]*
-            self.DAY_NORM*
+            self.DAYS_PER_MONTH*
             self._normalized_dataframe['LENGTH_SET'] /
             (self._normalized_dataframe['LENGTH_NORM'] * self._normalized_dataframe['DAYSON'])
         )
 
         self._normalized_dataframe['NORMALIZED_GAS'] = (
             self._dataframe[self._gas_col]*
-            self.DAY_NORM*
+            self.DAYS_PER_MONTH*
             self._normalized_dataframe['LENGTH_SET'] /
             (self._normalized_dataframe['LENGTH_NORM'] * self._normalized_dataframe['DAYSON'])
         )
 
         self._normalized_dataframe['NORMALIZED_WATER'] = (
             self._dataframe[self._water_col]*
-            self.DAY_NORM*
+            self.DAYS_PER_MONTH*
             self._normalized_dataframe['LENGTH_SET'] /
             (self._normalized_dataframe['LENGTH_NORM'] * self._normalized_dataframe['DAYSON'])
         )
@@ -560,7 +528,7 @@ class decline_curve:
         self._normalized_dataframe['NORMALIZED_GAS'] = self._normalized_dataframe['NORMALIZED_GAS'].fillna(0) 
         self._normalized_dataframe['NORMALIZED_WATER'] = self._normalized_dataframe['NORMALIZED_WATER'].fillna(0) 
     
-        if self.DEBUG_ON:
+        if self.debug_on:
             self._normalized_dataframe.to_csv('outputs/norm_test.csv')
     
     def outlier_detection(self, input_x, input_y):
@@ -585,7 +553,7 @@ class decline_curve:
                 test = regression.outlier_test()
                 
                 for index, row in test.iterrows():
-                    if row['bonf(p)'] > self.FILTER_BONFP:
+                    if row['bonf(p)'] > self.filter_bonfp:
                         filtered_x.append(input_x[index])
                         filtered_y.append(input_y[index])
             except:
@@ -612,12 +580,12 @@ class decline_curve:
         """
         if qi > 0 and not np.isinf(qi):
             problemX = t0 - 1/(b*di)
-            if di < self.D_MIN:
+            if di < self.MIN_DECLINE_RATE:
                 qlim = qi
-                di = self.D_MIN
+                di = self.MIN_DECLINE_RATE
                 tlim = -1
             else:
-                qlim = qi*(self.D_MIN/di)**(1/b)
+                qlim = qi*(self.MIN_DECLINE_RATE/di)**(1/b)
                 try:
                     tlim = int(((qi/qlim)**(b)-1)/(b*di)+t0)
                 except:
@@ -629,7 +597,7 @@ class decline_curve:
                     x > problemX,
                     np.where(x < tlim,
                         (qi)/(1+b*(di)*(x-t0))**(1/b),
-                        qlim*np.exp(-self.D_MIN*(x-tlim))
+                        qlim*np.exp(-self.MIN_DECLINE_RATE*(x-tlim))
                     ),
                     0
                 )
@@ -644,11 +612,11 @@ class decline_curve:
     def handle_dca_error(self,s,x_vals,y_vals):
         if s["MAJOR"] == 'OIL':
             #print(sum_df)
-            minor_ratio = np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])
-            water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])
+            minor_ratio = np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL_MONTHS:])
+            water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL_MONTHS:])
         else:
-            minor_ratio = np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])
-            water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])
+            minor_ratio = np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL_MONTHS:])
+            water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL_MONTHS:])
         i = -1
         while i > -len(x_vals):
             if y_vals[i]>0:
@@ -656,8 +624,8 @@ class decline_curve:
             else:
                 i -= 1
         s['qi']=y_vals[i]
-        s['di']=self.DEFAULT_DI
-        s['b']=self.DEFAULT_B
+        s['di']=self.default_initial_decline
+        s['b']=self.default_b_factor
         s['t0']=x_vals[i]
         s['q0']=y_vals[0] #Probably will need revision, high chance first value is zero
         s['minor_ratio']=minor_ratio
@@ -717,11 +685,11 @@ class decline_curve:
                 q_min = np.min(outliered_y)
 
                 if s['HOLE_DIRECTION'] == 'H':
-                    bMin = self._min_h_b
-                    bMax = self._max_h_b
+                    bMin = self.min_h_b
+                    bMax = self.max_h_b
                 else:
-                    bMin = self._min_h_b
-                    bMax = self._max_h_b
+                    bMin = self.min_h_b
+                    bMax = self.max_h_b
 
                 if di_int < 0:
                     di_int = np.log(q_max/q_min)/(outliered_x[outliered_y.index(q_min)]-outliered_x[outliered_y.index(q_max)])
@@ -753,11 +721,11 @@ class decline_curve:
                     
 
                     if s["MAJOR"] == 'OIL':
-                        minor_ratio = np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])
-                        water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])
+                        minor_ratio = np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL_MONTHS:])
+                        water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL_MONTHS:])
                     else:
-                        minor_ratio = np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])
-                        water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL:])
+                        minor_ratio = np.sum(s['NORMALIZED_OIL'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL_MONTHS:])
+                        water_ratio = np.sum(s['NORMALIZED_WATER'][-self.MINOR_TAIL_MONTHS:])/np.sum(s['NORMALIZED_GAS'][-self.MINOR_TAIL_MONTHS:])
 
                     if not np.isinf(popt[0]):
 
@@ -773,28 +741,28 @@ class decline_curve:
                         if self.verbose:
                             print('DCA Error: '+str(s['UID']), file=self.STAT_FILE, flush=True)
 
-                        if self._backup_decline:
+                        if self.backup_decline:
                             return self.handle_dca_error(s,x_vals, y_vals)
                 except:
                     self.V_DCA_FAILURES += 1
                     if self.verbose:
                         print('DCA Error: '+str(s['UID']), file=self.STAT_FILE, flush=True)
 
-                    if self._backup_decline:
+                    if self.backup_decline:
                         return self.handle_dca_error(s,x_vals, y_vals)
             else:
                 self.V_DCA_FAILURES += 1
                 if self.verbose:
                     print('Base x: {}  Filtered x: {}  Outliered x: {}'.format(len(x_vals),len(filtered_x),len(outliered_x)))
                     print('Insufficent data after filtering, well: '+str(s['UID']), file=self.STAT_FILE, flush=True)
-                if self._backup_decline:
+                if self.backup_decline:
                     return self.handle_dca_error(s,x_vals, y_vals)
 
         else :
             self.V_DCA_FAILURES += 1
             if self.verbose:
                 print('Insufficent data before filtering, well: '+str(s['UID']), file=self.STAT_FILE, flush=True)
-            if self._backup_decline:
+            if self.backup_decline:
                 return self.handle_dca_error(s,x_vals, y_vals)
 
 
@@ -902,9 +870,9 @@ class decline_curve:
             l_df = imploded_df[imploded_df['major']==major]
 
             if len(l_df)>0:
-                if self.OUTLIER_CORRECTION:
+                if self.outlier_correction:
                     q3, q2, q1 = np.percentile(l_df['minor_ratio'], [75,50 ,25])
-                    high_cutoff = self.IQR_LIMIT*(q3-q1)+q3
+                    high_cutoff = self.iqr_limit*(q3-q1)+q3
                     l_df['minor_ratio'] = np.where(
                         l_df['minor_ratio']>high_cutoff,
                         q2,
@@ -912,7 +880,7 @@ class decline_curve:
                     )
 
                     q3, q2, q1 = np.percentile(l_df['water_ratio'], [75,50 ,25])
-                    high_cutoff = self.IQR_LIMIT*(q3-q1)+q3
+                    high_cutoff = self.iqr_limit*(q3-q1)+q3
                     l_df['water_ratio'] = np.where(
                         l_df['water_ratio']>high_cutoff,
                         q2,
@@ -1189,7 +1157,7 @@ class decline_curve:
                     
                     # Calculate denormalization scalar
                     if denormalize and h_length > 1:
-                        denormalization_scalar = h_length / self.SET_LENGTH
+                        denormalization_scalar = h_length / self.STANDARD_LENGTH
                     else:
                         denormalization_scalar = 1.0
                     
@@ -1234,7 +1202,7 @@ class decline_curve:
         if denormalize:
             flow_df['denormalization_scalar'] = np.where(
                 flow_df['h_length'] > 1,
-                    flow_df['h_length'] / self.SET_LENGTH,
+                    flow_df['h_length'] / self.STANDARD_LENGTH,
                     1.0
                 )
         else:
@@ -1406,7 +1374,7 @@ class decline_curve:
         """Original typecurve generation using major phase with ratios"""
         return_df = self._flowstream_dataframe.reset_index()
         
-        if self.DEBUG_ON:
+        if self.debug_on:
             return_df.to_csv('outputs/test_quantiles.csv')
         
         return_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).quantile(prob_levels).reset_index()
@@ -1455,7 +1423,7 @@ class decline_curve:
         """Three-phase typecurve generation with independent decline curves for each phase"""
         return_df = self._flowstream_dataframe.reset_index()
         
-        if self.DEBUG_ON:
+        if self.debug_on:
             return_df.to_csv('outputs/test_quantiles.csv')
         
         # Calculate quantiles and mean for each phase independently

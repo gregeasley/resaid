@@ -108,7 +108,8 @@ class well_econ:
         self.GAS_COL = 'GAS'
         self.WATER_COL = 'WATER'
 
-        self._verbose = verbose
+        # User-configurable parameters
+        self.verbose = verbose
 
         # Data sources
         self._flowstreams = None
@@ -118,88 +119,47 @@ class well_econ:
         self._header_uwi_col = None
 
         # Economic parameters
-        self._royalty = None
-        self._opc_t = None
-        self._opc_oil = None
-        self._opc_gas = None
-        self._opc_water = None
-        self._atx = None
-        self._sev_gas = None
-        self._sev_oil = None
-        self._oil_pri = None
-        self._gas_pri = None
-        self._discount_rate = None
-        self._breakeven_phase = None
+        self.royalty = None
+        self.opc_t = None
+        self.opc_oil = None
+        self.opc_gas = None
+        self.opc_water = None
+        self.atx = None
+        self.sev_gas = None
+        self.sev_oil = None
+        self.oil_pri = None
+        self.gas_pri = None
+        self.discount_rate = None
+        self.breakeven_phase = None
 
         # CAPEX parameters
-        self._scale_capex = False
-        self._scale_column = None
-        self._capex_val = None
-        self._capex_col = None
+        self.scale_capex = False
+        self.scale_column = None
+        self.capex_val = None
+        self.capex_col = None
 
         # Interest and royalty columns
-        self._royalty_col = None
-        self._owned_royalty_col = None
-        self._wi_col = None
-        self._nri_col = None
+        self.royalty_col = None
+        self.owned_royalty_col = None
+        self.wi_col = None
+        self.nri_col = None
 
         # Gas processing parameters
-        self._gas_shrink = 0
-        self._ngl_yield = 0  # input as b/M post shrink
-        self._ngl_price_fraction = 0
+        self.gas_shrink = 0
+        self.ngl_yield = 0  # input as b/M post shrink
+        self.ngl_price_fraction = 0
 
         # Scaling parameters
-        self._scale_forecast = False
-        self._scale_base = 5280
-        self._oil_diff = 0
-        self._gas_diff = 0
+        self.scale_forecast = False
+        self.scale_base = 5280
+        self.oil_diff = 0
+        self.gas_diff = 0
 
-        self._spud_to_online = None
-        self._t_start_column = None
+        self.spud_to_online = None
+        self.t_start_column = None
 
-        # Timing parameters
-        self._spud_to_online = None
-        self._t_start_column = None
-
-        # Results
+                # Results
         self._indicators = None
-
-    # Essential properties for external access
-    @property
-    def oil_pri(self):
-        return self._oil_pri
-
-    @oil_pri.setter
-    def oil_pri(self, value):
-        self._oil_pri = value
-
-    @property
-    def gas_pri(self):
-        return self._gas_pri
-
-    @gas_pri.setter
-    def gas_pri(self, value):
-        self._gas_pri = value
-
-    @property
-    def discount_rate(self):
-        return self._discount_rate
-
-    @discount_rate.setter
-    def discount_rate(self, value):
-        self._discount_rate = value
-
-    @property
-    def indicators(self):
-        return self._indicators
-
-    @property
-    def breakeven_phase(self):
-        return self._breakeven_phase
-
-    @breakeven_phase.setter
-    def breakeven_phase(self, value):
-        self._breakeven_phase = value
 
     # Essential property setters for data access
     @property
@@ -258,6 +218,14 @@ class well_econ:
     def nri_col(self, value):
         self._nri_col = value
 
+    @property
+    def indicators(self):
+        return self._indicators
+
+    
+
+
+
    
 
     def generate_oil_price(self, times):
@@ -270,22 +238,22 @@ class well_econ:
         Returns:
             np.array: Oil prices for each time period
         """
-        if self._oil_pri is None:
+        if self.oil_pri is None:
             return np.zeros(len(times))
             
-        if isinstance(self._oil_pri, list):
-            if len(self._oil_pri) >= len(times):
-                oil_price = self._oil_pri[0:len(times)]
+        if isinstance(self.oil_pri, list):
+            if len(self.oil_pri) >= len(times):
+                oil_price = self.oil_pri[0:len(times)]
             else:
-                last_pri = self._oil_pri[-1]
-                num_to_add = len(times) - len(self._oil_pri)
+                last_pri = self.oil_pri[-1]
+                num_to_add = len(times) - len(self.oil_pri)
                 add_list = [last_pri for i in range(num_to_add)]
-                oil_price = self._oil_pri.copy()
+                oil_price = self.oil_pri.copy()
                 oil_price.extend(add_list)
         else:
-            oil_price = [self._oil_pri for i in range(len(times))]
+            oil_price = [self.oil_pri for i in range(len(times))]
 
-        return np.array(oil_price) + self._oil_diff
+        return np.array(oil_price) + self.oil_diff
 
     def generate_gas_price(self, times):
         """
@@ -297,22 +265,22 @@ class well_econ:
         Returns:
             np.array: Gas prices for each time period
         """
-        if self._gas_pri is None:
+        if self.gas_pri is None:
             return np.zeros(len(times))
             
-        if isinstance(self._gas_pri, list):
-            if len(self._gas_pri) >= len(times):
-                gas_price = self._gas_pri[0:len(times)]
+        if isinstance(self.gas_pri, list):
+            if len(self.gas_pri) >= len(times):
+                gas_price = self.gas_pri[0:len(times)]
             else:
-                last_pri = self._gas_pri[-1]
-                num_to_add = len(times) - len(self._gas_pri)
+                last_pri = self.gas_pri[-1]
+                num_to_add = len(times) - len(self.gas_pri)
                 add_list = [last_pri for i in range(num_to_add)]
-                gas_price = self._gas_pri.copy()
+                gas_price = self.gas_pri.copy()
                 gas_price.extend(add_list)
         else:
-            gas_price = [self._gas_pri for i in range(len(times))]
+            gas_price = [self.gas_pri for i in range(len(times))]
 
-        return np.array(gas_price) + self._gas_diff
+        return np.array(gas_price) + self.gas_diff
 
     def generate_capex(self, times, well):
         """
@@ -334,14 +302,14 @@ class well_econ:
 
         well_data = self._header_data[self._header_data[self._header_uwi_col] == well].iloc[0]
 
-        if self._capex_col and self._capex_col in well_data:
-            capex_val = well_data[self._capex_col]
+        if self.capex_col and self.capex_col in well_data:
+            capex_val = well_data[self.capex_col]
             l_capex[capex_point] = capex_val
-        elif self._scale_capex and self._scale_column and self._scale_column in well_data:
-            scale_val = well_data[self._scale_column]
-            l_capex[capex_point] = self._capex_val * scale_val
-        elif self._capex_val is not None:
-            l_capex[capex_point] = self._capex_val
+        elif self.scale_capex and self.scale_column and self.scale_column in well_data:
+            scale_val = well_data[self.scale_column]
+            l_capex[capex_point] = self.capex_val * scale_val
+        elif self.capex_val is not None:
+            l_capex[capex_point] = self.capex_val
 
         return l_capex
 
@@ -383,28 +351,28 @@ class well_econ:
             raise ValueError(f"No flowstream data found for well: {input_well}")
 
         # Set default values for None parameters
-        if self._opc_t is None:
-            self._opc_t = 0
-        if self._opc_oil is None:
-            self._opc_oil = 0
-        if self._opc_gas is None:
-            self._opc_gas = 0
-        if self._opc_water is None:
-            self._opc_water = 0
-        if self._sev_oil is None:
-            self._sev_oil = 0
-        if self._sev_gas is None:
-            self._sev_gas = 0
-        if self._atx is None:
-            self._atx = 0
-        if self._royalty is None:
-            self._royalty = 0
+        if self.opc_t is None:
+            self.opc_t = 0
+        if self.opc_oil is None:
+            self.opc_oil = 0
+        if self.opc_gas is None:
+            self.opc_gas = 0
+        if self.opc_water is None:
+            self.opc_water = 0
+        if self.sev_oil is None:
+            self.sev_oil = 0
+        if self.sev_gas is None:
+            self.sev_gas = 0
+        if self.atx is None:
+            self.atx = 0
+        if self.royalty is None:
+            self.royalty = 0
 
-        if self._scale_forecast and self._header_data is not None:
+        if self.scale_forecast and self._header_data is not None:
             try:
-                scale_val = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._scale_column]
-                l_flow[self.OIL_COL] = l_flow[self.OIL_COL] * scale_val / self._scale_base
-                l_flow[self.GAS_COL] = l_flow[self.GAS_COL] * scale_val / self._scale_base
+                scale_val = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.scale_column]
+                l_flow[self.OIL_COL] = l_flow[self.OIL_COL] * scale_val / self.scale_base
+                l_flow[self.GAS_COL] = l_flow[self.GAS_COL] * scale_val / self.scale_base
             except (KeyError, IndexError):
                 pass  # Skip scaling if data not available
 
@@ -412,9 +380,9 @@ class well_econ:
         start_df = pd.DataFrame([])
         n = 0
 
-        if self._t_start_column and self._header_data is not None:
+        if self.t_start_column and self._header_data is not None:
             try:
-                start_val = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._t_start_column]
+                start_val = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.t_start_column]
                 l_uid = l_flow[self._flowstream_uwi_col].iloc[0]
                 l_major = l_flow['MAJOR'].iloc[0]
                 l_t_index = pd.Series(range(1, start_val + 1, 1))
@@ -430,8 +398,8 @@ class well_econ:
             except (KeyError, IndexError):
                 pass  # Skip if data not available
         
-        if self._spud_to_online:
-            n = self._spud_to_online  # Number of rows to insert
+        if self.spud_to_online:
+            n = self.spud_to_online  # Number of rows to insert
 
             l_uid = l_flow[self._flowstream_uwi_col].iloc[0]
             l_major = l_flow['MAJOR'].iloc[0]
@@ -450,13 +418,13 @@ class well_econ:
             l_flow[self._flowstream_t_index] += n
             l_flow = pd.concat([zeros_df, l_flow]).reset_index(drop=True)
 
-        l_flow['gas_sold'] = l_flow[self.GAS_COL] * (1 - self._gas_shrink)
-        l_flow['ngl_volume'] = l_flow['gas_sold'] * self._ngl_yield
+        l_flow['gas_sold'] = l_flow[self.GAS_COL] * (1 - self.gas_shrink)
+        l_flow['ngl_volume'] = l_flow['gas_sold'] * self.ngl_yield
         t_series = np.array(range(len(l_flow)))
 
         l_flow['oil_price'] = self.generate_oil_price(t_series)
         l_flow['gas_price'] = self.generate_gas_price(t_series)
-        l_flow['ngl_price'] = l_flow['oil_price'] * self._ngl_price_fraction
+        l_flow['ngl_price'] = l_flow['oil_price'] * self.ngl_price_fraction
 
         l_flow['oil_revenue'] = l_flow[self.OIL_COL] * l_flow['oil_price']
         l_flow['gas_revenue'] = l_flow['gas_sold'] * l_flow['gas_price']
@@ -469,61 +437,61 @@ class well_econ:
         )
 
         # Royalty calculation
-        if (self._wi_col and self._nri_col and self._owned_royalty_col and self._royalty_col 
+        if (self.wi_col and self.nri_col and self.owned_royalty_col and self.royalty_col 
             and self._header_data is not None):
             try:
-                l_nri = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._nri_col]
-                l_wi = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._wi_col]
-                l_ori = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._owned_royalty_col]
-                l_royalty = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._royalty_col]
+                l_nri = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.nri_col]
+                l_wi = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.wi_col]
+                l_ori = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.owned_royalty_col]
+                l_royalty = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.royalty_col]
                 if l_nri + l_royalty > 1:
                     raise ValueError(f"Sum of royalty and NRI must be less than or equal to 1, currently {l_nri + l_royalty}")
                 l_flow['royalty'] = l_flow['revenue'] * l_royalty
             except (KeyError, IndexError):
-                l_royalty = self._royalty
-                l_flow['royalty'] = l_flow['revenue'] * self._royalty
+                l_royalty = self.royalty
+                l_flow['royalty'] = l_flow['revenue'] * self.royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
-        elif (self._wi_col and self._nri_col and self._header_data is not None):
+        elif (self.wi_col and self.nri_col and self._header_data is not None):
             try:
-                l_nri = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._nri_col]
-                l_wi = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._wi_col]
+                l_nri = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.nri_col]
+                l_wi = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.wi_col]
                 l_ori = 0
                 l_royalty = 1 - l_nri / l_wi
                 l_flow['royalty'] = l_flow['revenue'] * l_royalty
             except (KeyError, IndexError):
-                l_royalty = self._royalty
-                l_flow['royalty'] = l_flow['revenue'] * self._royalty
+                l_royalty = self.royalty
+                l_flow['royalty'] = l_flow['revenue'] * self.royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
-        elif self._royalty_col and self._header_data is not None:
+        elif self.royalty_col and self._header_data is not None:
             try:
-                l_royalty = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self._royalty_col]
+                l_royalty = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.royalty_col]
                 l_ori = 0
                 l_flow['royalty'] = l_flow['revenue'] * l_royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
             except (KeyError, IndexError):
-                l_royalty = self._royalty
-                l_flow['royalty'] = l_flow['revenue'] * self._royalty
+                l_royalty = self.royalty
+                l_flow['royalty'] = l_flow['revenue'] * self.royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
         else:
-            l_royalty = self._royalty
-            l_flow['royalty'] = l_flow['revenue'] * self._royalty
+            l_royalty = self.royalty
+            l_flow['royalty'] = l_flow['revenue'] * self.royalty
             l_wi = 1
             l_nri = 1 - l_royalty
 
-        l_flow['fixed_expense'] = self._opc_t
-        l_flow['oil_variable_expense'] = self._opc_oil * l_flow[self.OIL_COL]
-        l_flow['gas_variable_expense'] = self._opc_gas * l_flow['gas_sold']
-        l_flow['water_variable_expense'] = self._opc_water * l_flow[self.WATER_COL]
+        l_flow['fixed_expense'] = self.opc_t
+        l_flow['oil_variable_expense'] = self.opc_oil * l_flow[self.OIL_COL]
+        l_flow['gas_variable_expense'] = self.opc_gas * l_flow['gas_sold']
+        l_flow['water_variable_expense'] = self.opc_water * l_flow[self.WATER_COL]
 
         l_flow['expense'] = (
-            self._opc_t
-            + self._opc_gas * l_flow['gas_sold']
-            + self._opc_oil * l_flow[self.OIL_COL]
-            + self._opc_water * l_flow[self.WATER_COL]
+            self.opc_t
+            + self.opc_gas * l_flow['gas_sold']
+            + self.opc_oil * l_flow[self.OIL_COL]
+            + self.opc_water * l_flow[self.WATER_COL]
         )
 
         l_flow['expense'] = np.where(
@@ -533,16 +501,16 @@ class well_econ:
         )
 
         l_flow['severance_tax'] = (
-            self._sev_gas * l_flow[self.GAS_COL] * l_flow['gas_price']
-            + self._sev_oil * l_flow[self.OIL_COL] * l_flow['oil_price']
+            self.sev_gas * l_flow[self.GAS_COL] * l_flow['gas_price']
+            + self.sev_oil * l_flow[self.OIL_COL] * l_flow['oil_price']
         ) * (1 - l_royalty)
 
-        l_flow['ad_val_tax'] = self._atx * l_flow['revenue'] * (1 - l_royalty)
+        l_flow['ad_val_tax'] = self.atx * l_flow['revenue'] * (1 - l_royalty)
 
         l_flow['taxes'] = (
-            self._atx * l_flow['revenue']
-            + self._sev_gas * l_flow[self.GAS_COL] * l_flow['gas_price']
-            + self._sev_oil * l_flow[self.OIL_COL] * l_flow['oil_price']
+            self.atx * l_flow['revenue']
+            + self.sev_gas * l_flow[self.GAS_COL] * l_flow['gas_price']
+            + self.sev_oil * l_flow[self.OIL_COL] * l_flow['oil_price']
         ) * (1 - l_royalty)
 
         l_flow['capex'] = self.generate_capex(np.array(range(len(l_flow))), input_well)
@@ -555,7 +523,7 @@ class well_econ:
             - l_flow['capex']
         )
 
-        l_flow['dcf'] = (l_flow['cf'].to_numpy() / (1 + self._discount_rate) ** np.arange(0, len(l_flow['cf'].to_numpy())))
+        l_flow['dcf'] = (l_flow['cf'].to_numpy() / (1 + self.discount_rate) ** np.arange(0, len(l_flow['cf'].to_numpy())))
 
         try:
             cf_idx = np.argwhere(l_flow['dcf'].to_numpy() > 0)
@@ -638,7 +606,7 @@ class well_econ:
             - l_flow['net_taxes']
             - l_flow['net_capex']
         )
-        l_flow['net_dcf'] = (l_flow['net_cf'].to_numpy() / (1+self._discount_rate)**np.arange(0, len(l_flow['cf'].to_numpy())))
+        l_flow['net_dcf'] = (l_flow['net_cf'].to_numpy() / (1+self.discount_rate)**np.arange(0, len(l_flow['cf'].to_numpy())))
 
         l_flow['wi_net_oil'] = l_flow[self.OIL_COL]*(l_nri+l_royalty*l_ori)
         l_flow['wi_net_gas'] = l_flow['gas_sold']*(l_nri+l_royalty*l_ori)
@@ -678,16 +646,16 @@ class well_econ:
 
         unique_wells = self._flowstreams[self._flowstream_uwi_col].unique()
 
-        iterable = tqdm(unique_wells) if self._verbose else unique_wells
+        iterable = tqdm(unique_wells) if self.verbose else unique_wells
 
         for w in iterable:
             
             l_flow = self.well_flowstream(w)
             #l_flow.to_csv(f'tests/{w}.csv')
             
-            dc_rev = (l_flow['revenue'].to_numpy() / (1+self._discount_rate)**np.arange(0, len(l_flow['revenue'].to_numpy())))
+            dc_rev = (l_flow['revenue'].to_numpy() / (1+self.discount_rate)**np.arange(0, len(l_flow['revenue'].to_numpy())))
 
-            if self._breakeven_phase is None:
+            if self.breakeven_phase is None:
                 if np.sum(l_flow[self.OIL_COL]) > 0:
                     if np.sum(l_flow[self.GAS_COL])/np.sum(l_flow[self.OIL_COL])> 3.2:
                         be_major = 'GAS'
@@ -699,7 +667,7 @@ class well_econ:
                     be_major = 'GAS'
                     break_even =(np.sum(dc_rev)- np.sum(l_flow['dcf']))/np.sum(l_flow[self.GAS_COL])
             else:
-                if self._breakeven_phase == "GAS":
+                if self.breakeven_phase == "GAS":
                     be_major = 'GAS'
                     break_even =(np.sum(dc_rev)- np.sum(l_flow['dcf']))/np.sum(l_flow[self.GAS_COL])
                 else:
@@ -753,7 +721,7 @@ class well_econ:
         r_df = pd.DataFrame([])
         unique_wells = self._flowstreams[self._flowstream_uwi_col].unique()
 
-        iterable = tqdm(unique_wells) if self._verbose else unique_wells
+        iterable = tqdm(unique_wells) if self.verbose else unique_wells
 
         for w in iterable:
             l_flow = self.well_flowstream(w)
