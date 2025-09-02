@@ -23,6 +23,20 @@ pip install resaid
 
 ## Quick Start
 
+### Working Examples
+
+The `examples/` folder contains working examples that demonstrate RESAID functionality:
+
+- **`simple_example.py`**: Three-phase mode example generating ARIES, PhdWin, and Mosaic exports
+- **`ratio_mode_example.py`**: Ratio mode example showing how to use ratios for multi-phase forecasting
+
+Run these examples to see RESAID in action:
+```bash
+cd examples
+python simple_example.py      # Three-phase mode
+python ratio_mode_example.py  # Ratio mode
+```
+
 ### Basic Single-Phase DCA Analysis
 
 ```python
@@ -81,6 +95,24 @@ dca.generate_typecurve(num_months=1200, denormalize=True)
 # Three-phase results include phase-specific parameters
 oneline_3p = dca.oneline_dataframe
 print("Phase-specific columns:", [col for col in oneline_3p.columns if col.startswith(('IPO', 'IPG', 'IPW', 'DO', 'DG', 'DW', 'BO', 'BG', 'BW'))])
+```
+
+### Ratio Mode Forecasting
+
+```python
+# Enable ratio mode for multi-phase forecasting using ratios
+dca.three_phase_mode = False
+
+# Run analysis (same as before)
+dca.run_DCA()
+
+# Generate outputs with ratio-based phase calculations
+dca.generate_oneline(denormalize=True)
+
+# Ratio mode uses MINOR_RATIO and WATER_RATIO from oneline data
+# Gas production = MINOR_RATIO * OIL_QI
+# Water production = WATER_RATIO * OIL_QI
+# All phases use the same decline curve parameters
 ```
 
 ### Economic Analysis
@@ -214,12 +246,20 @@ Your production data should include the following columns:
 
 ### Example Data Structure
 
+The working examples in `examples/input_data/` show the expected format:
+
 ```csv
-API_UWI,ProducingMonth,LiquidsProd_BBL,GasProd_MCF,WaterProd_BBL,LateralLength_FT
-123456789,2020-01-01,1500,2500,500,8000
-123456789,2020-02-01,1400,2400,480,8000
+WELL_ID,DATE,OIL,GAS,WATER
+WELL_001,2020-01-01,1500,2500,500
+WELL_001,2020-02-01,1400,2400,480
 ...
 ```
+
+For custom data, use these column names:
+- **Date Column**: Production date (e.g., 'DATE')
+- **Well Identifier**: Unique well ID (e.g., 'WELL_ID')
+- **Production Data**: Oil, gas, and water production volumes
+- **Well Characteristics**: Lateral length, hole direction, etc.
 
 ## Configuration Options
 
@@ -351,6 +391,109 @@ top_wells = econ.indicators.nlargest(5, 'IRR')
 print(top_wells[['UID', 'IRR', 'DCF', 'PAYOUT']])
 ```
 
+## Export Functionality
+
+The `decline_curve` class includes integrated export capabilities for major economic software platforms.
+
+### ARIES Export
+
+Generate ARIES-compatible economic forecast files:
+
+```python
+from resaid.dca import decline_curve
+
+# Initialize and run DCA
+dca = decline_curve()
+dca.dataframe = production_df
+dca.date_col = 'DATE'
+dca.uid_col = 'WELL_ID'
+dca.oil_col = 'OIL'
+dca.gas_col = 'GAS'
+dca.water_col = 'WATER'
+dca.phase_col = 'PHASE'
+
+# Run DCA analysis first
+dca.run_DCA()
+dca.generate_oneline(denormalize=True)
+
+# Generate ARIES export with error handling
+try:
+    dca.generate_aries_export(
+        file_path="outputs/aries_forecast.txt",
+        scenario="RSC425",
+        dmin=6,
+        write_water=True
+    )
+    print("✓ ARIES export completed")
+except Exception as e:
+    print(f"✗ ARIES export failed: {e}")
+```
+
+### Mosaic Export
+
+Generate Mosaic-compatible Excel exports with all phases:
+
+```python
+# Generate Mosaic export with error handling
+try:
+    dca.generate_mosaic_export(
+        file_path="outputs/mosaic_forecast.xlsx",
+        reserve_category="USON ARO",
+        dmin=8
+    )
+    print("✓ Mosaic export completed")
+except Exception as e:
+    print(f"✗ Mosaic export failed: {e}")
+```
+
+### PhdWin Export
+
+Generate PhdWin-compatible CSV exports:
+
+```python
+# Generate PhdWin export with error handling
+try:
+    dca.generate_phdwin_export(
+        file_path="outputs/phdwin_forecast.csv",
+        dmin=6
+    )
+    print("✓ PhdWin export completed")
+except Exception as e:
+    print(f"✗ PhdWin export failed: {e}")
+```
+
+### Utility Functions
+
+#### 3-Month Average Production Calculation
+
+Calculate 3-month average production rates for initial rate estimation:
+
+```python
+# Calculate 3-month averages
+l3m_df = dca.qi_overwrite()
+print(l3m_df.head())
+```
+
+#### Ratio Analysis
+
+Create ratio dataframes for specialized analysis:
+
+```python
+# Generate ratio dataframes (GOR, yield, WOR, WGR)
+ratio_df = dca.make_ratio_dfs(l3m_df)
+print(ratio_df.head())
+```
+
+### Export Features
+
+- **Multi-Phase Support**: All exports include OIL, GAS, and WATER phases
+- **Three-Phase Mode Integration**: When `three_phase_mode=True`, exports use the existing three-phase analysis instead of creating separate DCA objects
+- **Ratio Mode Integration**: When `three_phase_mode=False`, exports use ratio-based calculations (MINOR_RATIO and WATER_RATIO) for gas and water phases
+- **Automatic DCA Integration**: Exports automatically run DCA analysis if not already performed
+- **Flexible Configuration**: Customizable parameters for each export format
+- **Error Handling**: Robust error handling with default values for missing data
+- **Directory Creation**: Automatically creates output directories as needed
+
 ## Performance Considerations
 
 - **Large Datasets**: The module uses vectorized operations for optimal performance
@@ -365,9 +508,14 @@ The package includes comprehensive validation tests:
 
 ```bash
 # Run validation tests
-python tests/validate_three_phase.py
 python tests/dca_test.py
 python tests/test_econ.py
+python tests/test_decline_solver.py
+python tests/test_export_functions.py
+python tests/test_export_consistency.py
+python tests/test_export_date_logic.py
+python tests/three_phase_test.py
+python tests/validate_three_phase.py
 ```
 
 ## Contributing

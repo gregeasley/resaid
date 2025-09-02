@@ -222,7 +222,8 @@ class decline_curve:
         
         # User-configurable parameters
         self.verbose = True
-        self.debug_on = False  # Enable debug output
+        self.debug_on = False
+        self.STAT_FILE = None  # Enable debug output
         self.filter_bonfp = .5  # Bonferroni correction threshold
         self.default_initial_decline = .8/12
         self.default_b_factor = .5
@@ -552,10 +553,16 @@ class decline_curve:
             try:
                 test = regression.outlier_test()
                 
+                outliers_removed = 0
                 for index, row in test.iterrows():
                     if row['bonf(p)'] > self.filter_bonfp:
                         filtered_x.append(input_x[index])
                         filtered_y.append(input_y[index])
+                    else:
+                        outliers_removed += 1
+                        
+                if self.verbose and outliers_removed > 0:
+                    print(f'    Outlier detection: Removed {outliers_removed} points with bonf(p) <= {self.filter_bonfp}')
             except:
                 if self.verbose:
                     print('Error in outlier detection.')
@@ -639,7 +646,12 @@ class decline_curve:
 
         if s['MAJOR'] == 'OIL':
             y_vals = s['NORMALIZED_OIL']
+        elif s['MAJOR'] == 'GAS':
+            y_vals = s['NORMALIZED_GAS']
+        elif s['MAJOR'] == 'WATER':
+            y_vals = s['NORMALIZED_WATER']
         else:
+            # Fallback to gas if phase is not recognized
             y_vals = s['NORMALIZED_GAS']
 
         if len(x_vals) > 3:
@@ -659,12 +671,23 @@ class decline_curve:
 
             filtered_x = np.array(x_vals[indexMin:])
             filtered_y = np.array(y_vals[indexMin:])
+            
+            if self.verbose:
+                print(f'Well {s["UID"]}: After peak detection - {len(filtered_x)} points (from index {indexMin})')
 
             zero_filter = np.array([y > 0 for y in filtered_y])
+            zero_filtered_count = len(filtered_y) - np.sum(zero_filter)
             filtered_x = filtered_x[zero_filter]
             filtered_y = filtered_y[zero_filter]
             
+            if self.verbose:
+                print(f'Well {s["UID"]}: After zero filtering - {len(filtered_x)} points (removed {zero_filtered_count} zero/negative values)')
+            
             outliered_x, outliered_y = self.outlier_detection(filtered_x,filtered_y)
+            
+            if self.verbose:
+                outlier_filtered_count = len(filtered_x) - len(outliered_x)
+                print(f'Well {s["UID"]}: After outlier detection - {len(outliered_x)} points (removed {outlier_filtered_count} outliers)')
 
             if self._force_t0:
                 outliered_x = x_vals
@@ -743,6 +766,15 @@ class decline_curve:
 
                         if self.backup_decline:
                             return self.handle_dca_error(s,x_vals, y_vals)
+                        else:
+                            # Return a Series with NaN values for failed DCA
+                            s['qi'] = np.nan
+                            s['di'] = np.nan
+                            s['b'] = np.nan
+                            s['t0'] = np.nan
+                            s['q0'] = np.nan
+                            s['minor_ratio'] = np.nan
+                            s['water_ratio'] = np.nan
                 except:
                     self.V_DCA_FAILURES += 1
                     if self.verbose:
@@ -750,13 +782,35 @@ class decline_curve:
 
                     if self.backup_decline:
                         return self.handle_dca_error(s,x_vals, y_vals)
+                    else:
+                        # Return a Series with NaN values for failed DCA
+                        s['qi'] = np.nan
+                        s['di'] = np.nan
+                        s['b'] = np.nan
+                        s['t0'] = np.nan
+                        s['q0'] = np.nan
+                        s['minor_ratio'] = np.nan
+                        s['water_ratio'] = np.nan
             else:
                 self.V_DCA_FAILURES += 1
                 if self.verbose:
-                    print('Base x: {}  Filtered x: {}  Outliered x: {}'.format(len(x_vals),len(filtered_x),len(outliered_x)))
+                    print(f'Well {s["UID"]}: INSUFFICIENT DATA AFTER FILTERING')
+                    print(f'  Original data: {len(x_vals)} points')
+                    print(f'  After peak detection: {len(filtered_x)} points')
+                    print(f'  After outlier detection: {len(outliered_x)} points')
+                    print(f'  Need > 3 points for DCA, but only have {len(outliered_x)}')
                     print('Insufficent data after filtering, well: '+str(s['UID']), file=self.STAT_FILE, flush=True)
                 if self.backup_decline:
                     return self.handle_dca_error(s,x_vals, y_vals)
+                else:
+                    # Return a Series with NaN values for failed DCA
+                    s['qi'] = np.nan
+                    s['di'] = np.nan
+                    s['b'] = np.nan
+                    s['t0'] = np.nan
+                    s['q0'] = np.nan
+                    s['minor_ratio'] = np.nan
+                    s['water_ratio'] = np.nan
 
         else :
             self.V_DCA_FAILURES += 1
@@ -764,7 +818,15 @@ class decline_curve:
                 print('Insufficent data before filtering, well: '+str(s['UID']), file=self.STAT_FILE, flush=True)
             if self.backup_decline:
                 return self.handle_dca_error(s,x_vals, y_vals)
-
+            else:
+                # Return a Series with NaN values for failed DCA
+                s['qi'] = np.nan
+                s['di'] = np.nan
+                s['b'] = np.nan
+                s['t0'] = np.nan
+                s['q0'] = np.nan
+                s['minor_ratio'] = np.nan
+                s['water_ratio'] = np.nan
 
         return s
     
@@ -1076,7 +1138,7 @@ class decline_curve:
         if denormalize:
             flow_df['denormalization_scalar'] = np.where(
                 flow_df['h_length'] > 1,
-                flow_df['h_length'] / self.SET_LENGTH,
+                flow_df['h_length'] / self.STANDARD_LENGTH,
                 1.0
             )
         else:
@@ -1283,7 +1345,7 @@ class decline_curve:
             
             # Calculate denormalization scalar
             if denormalize and h_length > 1:
-                denormalization_scalar = h_length / self.SET_LENGTH
+                denormalization_scalar = h_length / self.STANDARD_LENGTH
             else:
                 denormalization_scalar = 1.0
             
@@ -1526,6 +1588,852 @@ class decline_curve:
         self._force_t0 = False
 
         return imploded_df
+
+    def month_diff(self, a, b):
+        """Calculate month difference between two datetime series."""
+        return 12 * (a.dt.year - b.dt.year) + (a.dt.month - b.dt.month)
+
+    def qi_overwrite(self):
+        """
+        Calculate 3-month average production rates for initial rate estimation.
+        
+        This function calculates the average production rates over the last 3 months
+        for each well, which can be used to overwrite or validate initial rates.
+        Uses the production data already loaded into the decline_curve object.
+        
+        Returns:
+            DataFrame: Contains UID, L3M_OIL, L3M_GAS, L3M_WATER, L3M_START
+        """
+        if self._dataframe is None:
+            raise ValueError("No production data loaded. Set dataframe first.")
+            
+        # Sort by well and date (descending)
+        production_df = self._dataframe.sort_values(by=[self._uid_col, self._date_col], ascending=[True, False])
+        
+        # Group by well and take the first 3 rows for each group
+        top_three_dates = production_df.groupby(self._uid_col).head(3).reset_index()
+        
+        # Calculate the average value for each well
+        result = top_three_dates[[self._uid_col, self._oil_col, self._gas_col, self._water_col, self._date_col]].groupby(self._uid_col).agg({
+            self._oil_col: 'mean',
+            self._gas_col: 'mean',
+            self._water_col: 'mean',
+            self._date_col: 'max'
+        }).reset_index()
+        
+        result = result.rename(columns={
+            self._uid_col: 'UID',
+            self._oil_col: 'L3M_OIL',
+            self._gas_col: 'L3M_GAS',
+            self._water_col: 'L3M_WATER',
+            self._date_col: 'L3M_START'
+        })
+        
+        return result
+
+    def aries_eco_gen(self, oneline_df=None, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
+        """
+        Generate ARIES-compatible economic forecast file.
+        
+        This function creates a text file in ARIES format containing production forecasts
+        for economic analysis in the ARIES software.
+        
+        Args:
+            oneline_df: Oneline results dataframe (uses self._oneline if None)
+            file_path: Output file path
+            scenario: Scenario name for ARIES
+            dmin: Minimum decline rate
+            write_water: Whether to include water production
+        """
+        if oneline_df is None:
+            if self._oneline.empty:
+                raise ValueError("No oneline data available. Run generate_oneline() first.")
+            oneline_df = self._oneline.copy()
+        
+        oneline_df = oneline_df.fillna(0)
+        
+        # Ensure required columns exist and add defaults for missing ones
+        # Use T0_DATE if available, otherwise T0, otherwise default
+        if 'T0_DATE' in oneline_df.columns:
+            oneline_df['T0'] = oneline_df['T0_DATE']
+        elif 'T0' not in oneline_df.columns:
+            oneline_df['T0'] = pd.Timestamp('2020-01-01')
+        if 'DE' not in oneline_df.columns:
+            oneline_df['DE'] = 0.1
+        if 'B' not in oneline_df.columns:
+            oneline_df['B'] = 1.0
+        if 'MINOR_RATIO' not in oneline_df.columns:
+            oneline_df['MINOR_RATIO'] = 0.0
+        if 'WATER_RATIO' not in oneline_df.columns:
+            oneline_df['WATER_RATIO'] = 0.0
+        if 'L3M_START' not in oneline_df.columns:
+            oneline_df['L3M_START'] = pd.Timestamp('2023-12-01')
+        if 'L3M_OIL' not in oneline_df.columns:
+            oneline_df['L3M_OIL'] = 0.0
+        if 'L3M_GAS' not in oneline_df.columns:
+            oneline_df['L3M_GAS'] = 0.0
+        
+        # Calculate revised parameters
+        oneline_df['T0'] = pd.to_datetime(oneline_df['T0'])
+        oneline_df['revised_dt'] = self.month_diff(oneline_df['L3M_START'], oneline_df['T0'])
+        oneline_df['revised_ai'] = oneline_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
+        oneline_df['revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['revised_ai']*12)*x['B']+1),(-1/x['B'])))*100, axis=1)
+        
+        # Create output directory if it doesn't exist
+        import os
+        output_dir = os.path.dirname(file_path)
+        if output_dir:  # Only create directory if there is a path
+            os.makedirs(output_dir, exist_ok=True)
+        
+        with open(file_path, "w") as file:
+            for index, row in oneline_df.iterrows():
+                # Handle both standard mode (MAJOR column) and three-phase mode (phase column)
+                major_phase = row.get('MAJOR', row.get('phase', None))
+                if major_phase in ['OIL','GAS'] and row['L3M_START'].year > 2020:
+                    propnum = str(row['UID']).ljust(93)
+                    production = " PRODUCTION".ljust(93)
+                    start = "  START".ljust(13) + row['L3M_START'].strftime('%m/%Y')
+                    start_padding = " " * (93 - len(start) - len(scenario))
+                    start_line = start+start_padding+scenario
+                    
+                    if major_phase == 'OIL':
+                        major_val = round(row['L3M_OIL'],0)
+                        major_units = "B/M"
+                        minor = "  GAS/OIL".ljust(13) + f"{round(row['MINOR_RATIO'],3)} X M/B TO LIFE LIN TIME"
+                        water = "  WTR/OIL".ljust(13) + f"{round(row['WATER_RATIO'],3)} X B/B TO LIFE LIN TIME"
+                    else:
+                        major_val = round(row['L3M_GAS'],0)
+                        major_units = "M/M"
+                        minor = "  OIL/GAS".ljust(13) + f"{round(row['MINOR_RATIO'],3)} X B/M TO LIFE LIN TIME"
+                        water = "  WTR/GAS".ljust(13) + f"{round(row['WATER_RATIO'],3)} X B/M TO LIFE LIN TIME"
+                    
+                    # Determine major line based on conditions
+                    if row['B']>.01 and row['revised_aries_de'] > dmin and major_val>0:
+                        major = f"  {major_phase} ".ljust(13)+f"{major_val} X {major_units} {dmin} EXP B/{round(row['B'],2)} {round(row['revised_aries_de'],2)}"
+                        major_padding = " " * (93 - len(major) - len(scenario))
+                        major_line = major+major_padding+scenario
+                        major_cnt = f'  "'.ljust(13)+f"X X {major_units} 99 YRS EXP {dmin}"
+                        major_cnt_padding = " " * (93 - len(major_cnt) - len(scenario))
+                        major_cnt_line = major_cnt+major_cnt_padding+scenario
+                        
+                    elif major_val>0 and row['revised_aries_de'] > dmin:
+                        major = f"  {major_phase} ".ljust(13)+f"{major_val} X {major_units} 99 YRS EXP {round(row['revised_aries_de'],2)}"
+                        major_padding = " " * (93 - len(major) - len(scenario))
+                        major_line = major+major_padding+scenario
+                        major_cnt_line = None
+
+                    elif major_val > 0:
+                        major = f"  {major_phase} ".ljust(13)+f"{major_val} X {major_units} 99 YRS EXP {dmin}"
+                        major_padding = " " * (93 - len(major) - len(scenario))
+                        major_line = major+major_padding+scenario
+                        major_cnt_line = None
+
+                    else:
+                        major = f"  {major_phase} ".ljust(13)+f"{major_val} X {major_units} 1 YRS FLAT 0"
+                        major_padding = " " * (93 - len(major) - len(scenario))
+                        major_line = major+major_padding+scenario
+                        major_cnt_line = None
+
+                    minor_padding = " " * (93 - len(minor) - len(scenario))
+                    minor_line = minor+minor_padding+scenario
+
+                    water_padding = " " * (93 - len(water) - len(scenario))
+                    water_line = water+water_padding+scenario
+
+                    file.write(propnum + "\n")
+                    file.write(production + "\n")
+                    file.write(start_line + "\n")
+                    file.write(major_line + "\n")
+                    if major_cnt_line:
+                        file.write(major_cnt_line + "\n")
+                    if write_water:
+                        file.write(water_line + "\n")
+
+    def aries_eco_gen_three_phase(self, oneline_df=None, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
+        """
+        Generate ARIES-compatible economic forecast file for three-phase mode.
+        
+        This function creates a text file in ARIES format containing production forecasts
+        for all three phases (OIL, GAS, WATER) with independent decline curves.
+        
+        Args:
+            oneline_df: Oneline results dataframe with phase-specific columns
+            file_path: Output file path
+            scenario: Scenario name for ARIES
+            dmin: Minimum decline rate
+            write_water: Whether to include water production
+        """
+        if oneline_df is None:
+            if self._oneline.empty:
+                raise ValueError("No oneline data available. Run generate_oneline() first.")
+            oneline_df = self._oneline.copy()
+        
+        oneline_df = oneline_df.fillna(0)
+        
+        # Ensure required columns exist
+        if 'T0_DATE' in oneline_df.columns:
+            oneline_df['T0'] = oneline_df['T0_DATE']
+        elif 'T0' not in oneline_df.columns:
+            oneline_df['T0'] = pd.Timestamp('2020-01-01')
+        
+        # Create output directory if it doesn't exist
+        import os
+        output_dir = os.path.dirname(file_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
+        with open(file_path, "w") as file:
+            for index, row in oneline_df.iterrows():
+                # Write well header
+                propnum = str(row['UID']).ljust(93)
+                production = " PRODUCTION".ljust(93)
+                start = "  START".ljust(13) + row['T0'].strftime('%m/%Y')
+                start_padding = " " * (93 - len(start) - len(scenario))
+                start_line = start + start_padding + scenario
+                
+                file.write(propnum + "\n")
+                file.write(production + "\n")
+                file.write(start_line + "\n")
+                
+                # Write OIL phase if it exists
+                if row['OIL_QI'] > 0:
+                    oil_val = round(row['L3M_OIL'], 0)
+                    oil_decline = max(row['OIL_ARIES_DE'], dmin)
+                    oil_line = f"  OIL        {oil_val} X B/M {dmin} EXP B/{round(row['OIL_B'], 2)} {round(oil_decline, 2)}"
+                    oil_padding = " " * (93 - len(oil_line) - len(scenario))
+                    file.write(oil_line + oil_padding + scenario + "\n")
+                    
+                    # Write continuation line for oil
+                    oil_cnt = f'  "          X X B/M 99 YRS EXP {dmin}'
+                    oil_cnt_padding = " " * (93 - len(oil_cnt) - len(scenario))
+                    file.write(oil_cnt + oil_cnt_padding + scenario + "\n")
+                
+                # Write GAS phase if it exists
+                if row['GAS_QI'] > 0:
+                    gas_val = round(row['L3M_GAS'], 0)
+                    gas_decline = max(row['GAS_ARIES_DE'], dmin)
+                    gas_line = f"  GAS        {gas_val} X M/M {dmin} EXP B/{round(row['GAS_B'], 2)} {round(gas_decline, 2)}"
+                    gas_padding = " " * (93 - len(gas_line) - len(scenario))
+                    file.write(gas_line + gas_padding + scenario + "\n")
+                    
+                    # Write continuation line for gas
+                    gas_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
+                    gas_cnt_padding = " " * (93 - len(gas_cnt) - len(scenario))
+                    file.write(gas_cnt + gas_cnt_padding + scenario + "\n")
+                
+                # Write WATER phase if it exists and write_water is True
+                if write_water and row['WATER_QI'] > 0:
+                    water_val = round(row['L3M_WATER'], 0)
+                    water_decline = max(row['WATER_ARIES_DE'], dmin)
+                    water_line = f"  WATER      {water_val} X M/M {dmin} EXP B/{round(row['WATER_B'], 2)} {round(water_decline, 2)}"
+                    water_padding = " " * (93 - len(water_line) - len(scenario))
+                    file.write(water_line + water_padding + scenario + "\n")
+                    
+                    # Write continuation line for water
+                    water_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
+                    water_cnt_padding = " " * (93 - len(water_cnt) - len(scenario))
+                    file.write(water_cnt + water_cnt_padding + scenario + "\n")
+
+    def generate_aries_export(self, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
+        """
+        Generate ARIES export with integrated DCA analysis.
+        
+        This method combines DCA analysis with ARIES export generation.
+        When three_phase_mode is enabled, it uses the existing three-phase analysis.
+        Otherwise, it creates separate analyses for each phase.
+        
+        Args:
+            file_path: Output file path
+            scenario: Scenario name for ARIES
+            dmin: Minimum decline rate
+            write_water: Whether to include water production
+        """
+        # Run DCA if not already done
+        if self._params_dataframe.empty:
+            self.run_DCA()
+        
+        # Generate oneline if not already done
+        if self._oneline.empty:
+            self.generate_oneline(denormalize=True)
+        
+        # Calculate 3-month averages
+        l3m_df = self.qi_overwrite()
+        
+        if self.three_phase_mode:
+            # Use existing three-phase analysis
+            # The oneline data has separate columns for each phase: IPO/DO/BO, IPG/DG/BG, IPW/DW/BW
+            # For ARIES, we need to create a single row per well with all phase data
+            # and use the independent decline curves instead of ratios
+            
+            oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
+            
+            # Create one row per well with all phase information
+            well_rows = []
+            for _, row in oneline_with_l3m.iterrows():
+                well_row = row.copy()
+                
+                # Add phase-specific decline parameters
+                well_row['OIL_QI'] = row['IPO'] if row['IPO'] > 0 else 0
+                well_row['OIL_DI'] = row['DO'] if row['IPO'] > 0 else 0
+                well_row['OIL_B'] = row['BO'] if row['IPO'] > 0 else 0
+                well_row['OIL_ARIES_DE'] = row['ARIES_DO'] if row['IPO'] > 0 else 0
+                
+                well_row['GAS_QI'] = row['IPG'] if row['IPG'] > 0 else 0
+                well_row['GAS_DI'] = row['DG'] if row['IPG'] > 0 else 0
+                well_row['GAS_B'] = row['BG'] if row['IPG'] > 0 else 0
+                well_row['GAS_ARIES_DE'] = row['ARIES_DG'] if row['IPG'] > 0 else 0
+                
+                well_row['WATER_QI'] = row['IPW'] if row['IPW'] > 0 else 0
+                well_row['WATER_DI'] = row['DW'] if row['IPW'] > 0 else 0
+                well_row['WATER_B'] = row['BW'] if row['IPW'] > 0 else 0
+                well_row['WATER_ARIES_DE'] = row['ARIES_DW'] if row['IPW'] > 0 else 0
+                
+                # Set MAJOR to OIL for compatibility (will be overridden in aries_eco_gen)
+                well_row['MAJOR'] = 'OIL'
+                
+                well_rows.append(well_row)
+            
+            if well_rows:
+                well_df = pd.DataFrame(well_rows)
+                # Call aries_eco_gen with three_phase_mode flag
+                self.aries_eco_gen_three_phase(well_df, file_path, scenario, dmin, write_water)
+            else:
+                # Fallback if no valid rows
+                print("Warning: No valid phase data found for ARIES export")
+                self.aries_eco_gen(oneline_with_l3m, file_path, scenario, dmin, write_water)
+        else:
+            # Use existing oneline data with ratios (ratio mode)
+            # The oneline data already has MINOR_RATIO and WATER_RATIO calculated
+            # We just need to use these ratios to calculate gas and water production
+            
+            oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
+            
+            # Create one row per well with all phase information using ratios
+            well_rows = []
+            for _, row in oneline_with_l3m.iterrows():
+                well_row = row.copy()
+                
+                # Primary phase (OIL) - use existing data
+                well_row['OIL_QI'] = row['IPO'] if row['IPO'] > 0 else 0
+                well_row['OIL_DI'] = row['DE'] if row['IPO'] > 0 else 0  # Use DE for ratio mode
+                well_row['OIL_B'] = row['B'] if row['IPO'] > 0 else 0    # Use B for ratio mode
+                well_row['OIL_ARIES_DE'] = row['ARIES_DE'] if row['IPO'] > 0 else 0  # Use ARIES_DE for ratio mode
+                
+                # Gas phase - calculate using MINOR_RATIO
+                if row['MINOR_RATIO'] > 0 and row['IPO'] > 0:
+                    well_row['GAS_QI'] = row['IPO'] * row['MINOR_RATIO']
+                    well_row['GAS_DI'] = row['DE']  # Use same decline as oil
+                    well_row['GAS_B'] = row['B']   # Use same b-factor as oil
+                    well_row['GAS_ARIES_DE'] = row['ARIES_DE']  # Use same ARIES decline as oil
+                else:
+                    well_row['GAS_QI'] = 0
+                    well_row['GAS_DI'] = 0
+                    well_row['GAS_B'] = 0
+                    well_row['GAS_ARIES_DE'] = 0
+                
+                # Water phase - calculate using WATER_RATIO
+                if row['WATER_RATIO'] > 0 and row['IPO'] > 0:
+                    well_row['WATER_QI'] = row['IPO'] * row['WATER_RATIO']
+                    well_row['WATER_DI'] = row['DE']  # Use same decline as oil
+                    well_row['WATER_B'] = row['B']   # Use same b-factor as oil
+                    well_row['WATER_ARIES_DE'] = row['ARIES_DE']  # Use same ARIES decline as oil
+                else:
+                    well_row['WATER_QI'] = 0
+                    well_row['WATER_DI'] = 0
+                    well_row['WATER_B'] = 0
+                    well_row['WATER_ARIES_DE'] = 0
+                
+                # Set MAJOR to OIL for compatibility
+                well_row['MAJOR'] = 'OIL'
+                
+                well_rows.append(well_row)
+            
+            if well_rows:
+                well_df = pd.DataFrame(well_rows)
+                # Call aries_eco_gen_three_phase to format with independent decline curves
+                self.aries_eco_gen_three_phase(well_df, file_path, scenario, dmin, write_water)
+            else:
+                # Fallback if no valid rows
+                print("Warning: No valid phase data found for ARIES export")
+                self.aries_eco_gen(oneline_with_l3m, file_path, scenario, dmin, write_water)
+        
+        # Note: This function writes to file and does not return a DataFrame
+
+    def generate_mosaic_export(self, file_path="outputs/mosaic_export.xlsx", reserve_category="USON ARO", dmin=8):
+        """
+        Generate Mosaic-compatible export with integrated DCA analysis.
+        
+        This method creates a comprehensive export for Mosaic software including
+        all phases (OIL, GAS, WATER) with proper formatting and calculations.
+        When three_phase_mode is enabled, it uses the existing three-phase analysis.
+        Otherwise, it creates separate analyses for each phase.
+        
+        Args:
+            file_path: Output file path (Excel format)
+            reserve_category: Reserve category for Mosaic
+            dmin: Minimum decline rate
+        """
+        # Run DCA if not already done
+        if self._params_dataframe.empty:
+            self.run_DCA()
+        
+        # Generate oneline if not already done
+        if self._oneline.empty:
+            self.generate_oneline(denormalize=True)
+        
+        # Calculate 3-month averages
+        l3m_df = self.qi_overwrite()
+        
+        if self.three_phase_mode:
+            # Use existing three-phase analysis
+            # The oneline data has separate columns for each phase: IPO/DO/BO, IPG/DG/BG, IPW/DW/BW
+            # We need to create separate rows for each phase to match the expected format
+            
+            # Start with the base oneline data
+            base_df = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
+            
+            # Create separate rows for each phase
+            combined_rows = []
+            for _, row in base_df.iterrows():
+                # OIL phase
+                if row['IPO'] > 0:
+                    oil_row = row.copy()
+                    oil_row['MAJOR'] = 'OIL'
+                    oil_row['DE'] = row['DO']
+                    oil_row['B'] = row['BO']
+                    oil_row['T0'] = row['T0_DATE']
+                    combined_rows.append(oil_row)
+                
+                # GAS phase
+                if row['IPG'] > 0:
+                    gas_row = row.copy()
+                    gas_row['MAJOR'] = 'GAS'
+                    gas_row['DE'] = row['DG']
+                    gas_row['B'] = row['BG']
+                    gas_row['T0'] = row['T0_DATE']
+                    combined_rows.append(gas_row)
+                
+                # WATER phase
+                if row['IPW'] > 0:
+                    water_row = row.copy()
+                    water_row['MAJOR'] = 'WATER'
+                    water_row['DE'] = row['DW']
+                    water_row['B'] = row['BW']
+                    water_row['T0'] = row['T0_DATE']
+                    combined_rows.append(water_row)
+            
+            if combined_rows:
+                combined_df = pd.DataFrame(combined_rows)
+            else:
+                # Fallback if no valid rows
+                combined_df = base_df.copy()
+                combined_df['MAJOR'] = 'OIL'  # Default
+                combined_df['DE'] = 0.1
+                combined_df['B'] = 1.0
+                combined_df['T0'] = combined_df['T0_DATE']
+        else:
+            # Use existing oneline data with ratios (ratio mode)
+            # The oneline data already has MINOR_RATIO and WATER_RATIO calculated
+            # We just need to use these ratios to calculate gas and water production
+            
+            oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
+            
+            # Create separate rows for each phase using ratios
+            combined_rows = []
+            for _, row in oneline_with_l3m.iterrows():
+                # OIL phase - use existing data
+                if row['IPO'] > 0:
+                    oil_row = row.copy()
+                    oil_row['MAJOR'] = 'OIL'
+                    oil_row['DE'] = row['DE']  # Use DE for ratio mode
+                    oil_row['B'] = row['B']    # Use B for ratio mode
+                    oil_row['T0'] = row['T0_DATE']
+                    oil_row['L3M_OIL'] = row['L3M_OIL']
+                    combined_rows.append(oil_row)
+                
+                # GAS phase - calculate using MINOR_RATIO
+                if row['MINOR_RATIO'] > 0 and row['IPO'] > 0:
+                    gas_row = row.copy()
+                    gas_row['MAJOR'] = 'GAS'
+                    gas_row['DE'] = row['DE']  # Use same decline as oil
+                    gas_row['B'] = row['B']   # Use same b-factor as oil
+                    gas_row['T0'] = row['T0_DATE']
+                    gas_row['L3M_GAS'] = row['L3M_OIL'] * row['MINOR_RATIO']  # Calculate gas rate using ratio
+                    combined_rows.append(gas_row)
+                
+                # WATER phase - calculate using WATER_RATIO
+                if row['WATER_RATIO'] > 0 and row['IPO'] > 0:
+                    water_row = row.copy()
+                    water_row['MAJOR'] = 'WATER'
+                    water_row['DE'] = row['DE']  # Use same decline as oil
+                    water_row['B'] = row['B']   # Use same b-factor as oil
+                    water_row['T0'] = row['T0_DATE']
+                    water_row['L3M_WATER'] = row['L3M_OIL'] * row['WATER_RATIO']  # Calculate water rate using ratio
+                    combined_rows.append(water_row)
+            
+            if combined_rows:
+                combined_df = pd.DataFrame(combined_rows)
+            else:
+                # Fallback if no valid rows
+                print("Warning: No valid phase data found for Mosaic export")
+                combined_df = oneline_with_l3m.copy()
+                combined_df['MAJOR'] = 'OIL'  # Default
+                combined_df['DE'] = 0.1
+                combined_df['B'] = 1.0
+                combined_df['T0'] = combined_df['T0_DATE']
+        
+        # Calculate revised parameters
+        combined_df = combined_df.fillna(0)
+        
+        # Ensure T0 column exists and use T0_DATE if available
+        if 'T0_DATE' in combined_df.columns:
+            combined_df['T0'] = combined_df['T0_DATE']
+        elif 'T0' not in combined_df.columns:
+            combined_df['T0'] = pd.Timestamp('2020-01-01')
+        
+        combined_df['T0'] = pd.to_datetime(combined_df['T0'])
+        combined_df['revised_dt'] = self.month_diff(combined_df['L3M_START'], combined_df['T0'])
+        combined_df['revised_ai'] = combined_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
+        combined_df['revised_aries_de'] = combined_df.apply(lambda x: (1-np.power(((x['revised_ai']*12)*x['B']+1),(-1/x['B'])))*100, axis=1)
+        
+        # Calculate used IP based on major phase
+        combined_df['used_ip'] = combined_df.apply(lambda row: row[f"L3M_{row['MAJOR']}"], axis=1)
+        
+        # Format for Mosaic
+        output_df = combined_df.rename(columns={
+            'UID': 'Entity Name',
+            'used_ip': 'Initial Rate qi (rate/d)',
+            'B': 'Exponent N, b',
+            'revised_aries_de': 'Secant Effective Decline Desi (%)',
+            'L3M_START': 'Start Date T0  (y-m-d)',
+            'MAJOR': 'Product Type'
+        })
+        
+        # Add required columns
+        add_list = [
+            'UUID', 'Reserve Category', 'Use Type', 'Segment #', 'Final Rate qf (rate/d)',
+            'D Cum', 'Final Cum', 'Length DT (years)', 'Final Date Tf  (y-m-d)',
+            'Nominal Decline Di (%)', 'Tangential Effective Decline   Dei (%)',
+            'Service Factor (fraction)', 'Minimum Effective Decline Dmin (%)'
+        ]
+        
+        for col in add_list:
+            output_df[col] = None
+        
+        # Set default values
+        output_df['Reserve Category'] = reserve_category
+        output_df['Use Type'] = 'Produced'
+        output_df['Segment #'] = 1
+        output_df['Length DT (years)'] = 100
+        output_df['Minimum Effective Decline Dmin (%)'] = dmin
+        output_df['Product Type'] = output_df['Product Type'].str.capitalize()
+        output_df['Initial Rate qi (rate/d)'] = output_df['Initial Rate qi (rate/d)'] * 12 / 365
+        
+        # Ensure minimum decline rate
+        output_df['Secant Effective Decline Desi (%)'] = np.where(
+            output_df['Secant Effective Decline Desi (%)'] < dmin,
+            dmin,
+            output_df['Secant Effective Decline Desi (%)']
+        )
+        
+        # Select final columns
+        final_columns = [
+            'Entity Name', 'UUID', 'Reserve Category', 'Product Type', 'Use Type', 'Segment #',
+            'Start Date T0  (y-m-d)', 'Initial Rate qi (rate/d)', 'Final Rate qf (rate/d)',
+            'D Cum', 'Final Cum', 'Length DT (years)', 'Final Date Tf  (y-m-d)',
+            'Exponent N, b', 'Nominal Decline Di (%)', 'Tangential Effective Decline   Dei (%)',
+            'Secant Effective Decline Desi (%)', 'Service Factor (fraction)',
+            'Minimum Effective Decline Dmin (%)'
+        ]
+        
+        output_df = output_df[final_columns]
+        
+        # Create output directory if it doesn't exist
+        import os
+        output_dir = os.path.dirname(file_path)
+        if output_dir:  # Only create directory if there is a path
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Save to Excel
+        output_df.to_excel(file_path, index=False)
+        
+        # Note: This function writes to file and does not return a DataFrame
+
+    def generate_phdwin_export(self, file_path="outputs/phdwin_export.csv", dmin=6):
+        """
+        Generate PhdWin-compatible export with integrated DCA analysis.
+        
+        This method creates a comprehensive export for PhdWin software including
+        all phases (OIL, GAS, WATER) with proper formatting and calculations.
+        When three_phase_mode is enabled, it uses the existing three-phase analysis.
+        Otherwise, it creates separate analyses for each phase.
+        
+        Args:
+            file_path: Output file path (CSV format)
+            dmin: Minimum decline rate
+        """
+        # Run DCA if not already done
+        if self._params_dataframe.empty:
+            # Set parameters to match reference script
+            self.D_MIN = 0.06/12
+            self.backup_decline = False
+            self.OUTLIER_CORRECTION = False
+            self.min_h_b = 0.01
+            self.max_h_b = 1.3
+            self.run_DCA()
+        
+        # Generate oneline if not already done
+        if self._oneline.empty:
+            self.generate_oneline(denormalize=True)
+        
+        # Calculate 3-month averages
+        l3m_df = self.qi_overwrite()
+        
+        if self.three_phase_mode:
+            # Use existing three-phase analysis
+            # The oneline data has separate columns for each phase: IPO/DO/BO, IPG/DG/BG, IPW/DW/BW
+            
+            # Start with the base oneline data
+            base_df = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
+            
+            # Create separate rows for each phase
+            combined_rows = []
+            for _, row in base_df.iterrows():
+                # OIL phase - use existing data
+                if row['IPO'] > 0:
+                    oil_row = row.copy()
+                    oil_row['MAJOR'] = 'OIL'
+                    oil_row['revised_qi'] = row['L3M_OIL']
+                    oil_row['DE'] = row['DO']  # Use DO (Decline Oil)
+                    oil_row['B'] = row['BO']   # Use BO (B-factor Oil)
+                    oil_row['T0'] = row['T0_DATE']
+                    combined_rows.append(oil_row)
+                
+                # GAS phase - use gas production data and gas-specific decline parameters
+                if row['IPG'] > 0:
+                    gas_row = row.copy()
+                    gas_row['MAJOR'] = 'GAS'
+                    gas_row['revised_qi'] = row['L3M_GAS']
+                    gas_row['DE'] = row['DG']  # Use DG (Decline Gas)
+                    gas_row['B'] = row['BG']   # Use BG (B-factor Gas)
+                    gas_row['T0'] = row['T0_DATE']
+                    combined_rows.append(gas_row)
+                
+                # WATER phase - use water production data and water-specific decline parameters
+                if row['IPW'] > 0:  # Check if water production exists
+                    water_row = row.copy()
+                    water_row['MAJOR'] = 'WATER'
+                    water_row['revised_qi'] = row['L3M_WATER']
+                    water_row['DE'] = row['DW']  # Use DW (Decline Water)
+                    water_row['B'] = row['BW']   # Use BW (B-factor Water)
+                    water_row['T0'] = row['T0_DATE']
+                    combined_rows.append(water_row)
+            
+            if combined_rows:
+                tc_df = pd.DataFrame(combined_rows)
+            else:
+                # Fallback if no valid rows
+                tc_df = base_df.copy()
+                tc_df['MAJOR'] = 'OIL'  # Default
+                tc_df['revised_qi'] = tc_df['L3M_OIL']
+                tc_df['DE'] = 0.1
+                tc_df['B'] = 1.0
+                tc_df['T0'] = tc_df['T0_DATE']
+        else:
+            # Use existing oneline data with ratios (ratio mode)
+            # The oneline data already has MINOR_RATIO and WATER_RATIO calculated
+            # We just need to use these ratios to calculate gas and water production
+            
+            oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
+            
+            # Create separate rows for each phase using ratios
+            combined_rows = []
+            for _, row in oneline_with_l3m.iterrows():
+                # OIL phase - use existing data
+                if row['IPO'] > 0:
+                    oil_row = row.copy()
+                    oil_row['MAJOR'] = 'OIL'
+                    oil_row['DE'] = row['DE']  # Use DE for ratio mode
+                    oil_row['B'] = row['B']    # Use B for ratio mode
+                    oil_row['T0'] = row['T0_DATE']
+                    oil_row['L3M_OIL'] = row['L3M_OIL']
+                    combined_rows.append(oil_row)
+                
+                # GAS phase - calculate using MINOR_RATIO
+                if row['MINOR_RATIO'] > 0 and row['IPO'] > 0:
+                    gas_row = row.copy()
+                    gas_row['MAJOR'] = 'GAS'
+                    gas_row['DE'] = row['DE']  # Use same decline as oil
+                    gas_row['B'] = row['B']   # Use same b-factor as oil
+                    gas_row['T0'] = row['T0_DATE']
+                    gas_row['L3M_GAS'] = row['L3M_OIL'] * row['MINOR_RATIO']  # Calculate gas rate using ratio
+                    combined_rows.append(gas_row)
+                
+                # WATER phase - calculate using WATER_RATIO
+                if row['WATER_RATIO'] > 0 and row['IPO'] > 0:
+                    water_row = row.copy()
+                    water_row['MAJOR'] = 'WATER'
+                    water_row['DE'] = row['DE']  # Use same decline as oil
+                    water_row['B'] = row['B']   # Use same b-factor as oil
+                    water_row['T0'] = row['T0_DATE']
+                    water_row['L3M_WATER'] = row['L3M_OIL'] * row['WATER_RATIO']  # Calculate water rate using ratio
+                    combined_rows.append(water_row)
+            
+            if combined_rows:
+                tc_df = pd.DataFrame(combined_rows)
+            else:
+                # Fallback if no valid rows
+                print("Warning: No valid phase data found for PhdWin export")
+                tc_df = oneline_with_l3m.copy()
+                tc_df['MAJOR'] = 'OIL'  # Default
+                tc_df['DE'] = 0.1
+                tc_df['B'] = 1.0
+                tc_df['T0'] = tc_df['T0_DATE']
+        
+        # Calculate revised parameters
+        # Use T0 from oneline data (matching reference script approach)
+        tc_df['T0'] = tc_df['T0_DATE']
+        
+        tc_df['revised_dt'] = self.month_diff(tc_df['L3M_START'], tc_df['T0'])
+        
+        # QI Revisions
+        tc_df['revised_qi'] = np.where(
+            tc_df['MAJOR'] == 'OIL',
+            tc_df['L3M_OIL'] * np.power((1 + tc_df['B'] * tc_df['DE'] * tc_df['revised_dt']), 1 / tc_df['B']),
+            np.where(
+                tc_df['MAJOR'] == 'GAS',
+                tc_df['L3M_GAS'] * np.power((1 + tc_df['B'] * tc_df['DE'] * tc_df['revised_dt']), 1 / tc_df['B']),
+                np.where(
+                    tc_df['MAJOR'] == 'WATER',
+                    tc_df['L3M_WATER'] * np.power((1 + tc_df['B'] * tc_df['DE'] * tc_df['revised_dt']), 1 / tc_df['B']),
+                    0
+                )
+            )
+        )
+        
+        # Adjust the ARIES_DE column to actually be the PhdWin De
+        tc_df['ARIES_DE'] = tc_df.apply(lambda x: 100*(1-np.exp(-x['DE']*12)), axis=1)
+        
+        # Format for PhdWin
+        output_columns = [
+            'UniqueId', 'Product', 'Units', 'ProjType', 'StartDate', 'BegCum',
+            'Qi', 'NFactor', 'Decl', 'DeclMin', 'EndDate', 'Qf', 'Volume',
+            'EndCum', 'SolveFor'
+        ]
+        
+        output_df = tc_df.copy()
+        
+        # Set end date (50 years forward) - match reference script
+        fifty_years_forward = pd.Timestamp('2075-01-01')
+        
+        output_df['UniqueId'] = output_df['UID']
+        output_df['Product'] = output_df['MAJOR'].str.title()
+        output_df['Units'] = np.where(output_df['Product'] == 'Gas', 'Mcf', 'bbl')
+        output_df['ProjType'] = 'Arps'
+        output_df['StartDate'] = output_df['T0']
+        output_df['BegCum'] = 0
+        output_df['Qi'] = output_df['revised_qi']
+        output_df['NFactor'] = np.where(output_df['B'] > 0.01, output_df['B'], 0)
+        output_df['Decl'] = np.where(
+            output_df['ARIES_DE'] > 2,
+            output_df['ARIES_DE'],
+            np.where(output_df['ARIES_DE'] > 0, 2, 0)
+        )
+        output_df['DeclMin'] = np.where(
+            (output_df['NFactor'] > 0.01) & (output_df['ARIES_DE'] > 6),
+            6,
+            np.where((output_df['NFactor'] > 0.01), 2, 0)
+        )
+        output_df['Qf'] = None
+        output_df['Volume'] = None
+        output_df['EndCum'] = None
+        output_df['SolveFor'] = np.where(
+            output_df['Product'].isin(["Oil", 'Gas', 'Water']),
+            'Qf;Vol',
+            'Qf'
+        )
+        output_df['EndDate'] = fifty_years_forward
+        
+        output_df = output_df[output_columns]
+        
+        # Create output directory if it doesn't exist
+        import os
+        output_dir = os.path.dirname(file_path)
+        if output_dir:  # Only create directory if there is a path
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Save to CSV
+        output_df.to_csv(file_path, index=False)
+        
+        # Note: This function writes to file and does not return a DataFrame
+
+    def make_ratio_dfs(self, input_df=None):
+        """
+        Create ratio dataframes for PhdWin-style analysis.
+        
+        This function creates separate dataframes for different production ratios
+        (GOR, yield, WOR, WGR) that can be used for specialized analysis.
+        
+        Args:
+            input_df: Input dataframe with L3M data (uses qi_overwrite result if None)
+            
+        Returns:
+            DataFrame: Combined ratio dataframes
+        """
+        if input_df is None:
+            input_df = self.qi_overwrite()
+        
+        # Function to calculate T0 (3 months before L3M_START)
+        def calculate_t0(l3m_start):
+            if pd.notnull(l3m_start):
+                return (l3m_start - pd.DateOffset(months=3)).replace(day=1)
+            return pd.NaT
+
+        # Create and populate the new DataFrames
+        ratios = {
+            "gor_df": lambda row: (row["L3M_GAS"] / row["L3M_OIL"])*1000 if row["L3M_OIL"] else 0,
+            "yield_df": lambda row: (row["L3M_OIL"] / row["L3M_GAS"])*1000 if row["L3M_GAS"] else 0,
+            "wor_df": lambda row: row["L3M_WATER"] / row["L3M_OIL"] if row["L3M_OIL"] else 0,
+            "wgr_df": lambda row: (row["L3M_WATER"] / row["L3M_GAS"])*1000 if row["L3M_GAS"] else 0,
+        }
+
+        final_df = pd.DataFrame([])
+
+        for key, func in ratios.items():
+            new_df = input_df[["UID", "L3M_OIL", "L3M_GAS", "L3M_WATER", "L3M_START"]].copy()
+            new_df["T0"] = new_df["L3M_START"].apply(calculate_t0)
+            new_df["revised_qi"] = input_df.apply(func, axis=1).fillna(0)
+            new_df["MAJOR"] = key.split("_")[0].upper()
+            # Add remaining blank columns
+            for col in ["OIL", "GAS", "WATER", "IPO", "IPG", "B", "DE", "MINOR_RATIO", "WATER_RATIO", "ARIES_DE", "revised_dt"]:
+                new_df[col] = None
+            if final_df.empty:
+                final_df = new_df
+            else:
+                final_df = pd.concat([final_df,new_df])
+
+        final_df = final_df[[
+            'UID',
+            'OIL',
+            'GAS',
+            'WATER',
+            'MAJOR',
+            'IPO',
+            'IPG',
+            'B',
+            'DE',
+            'T0',
+            'MINOR_RATIO',
+            'WATER_RATIO',
+            'ARIES_DE',
+            'L3M_OIL',
+            'L3M_GAS',
+            'L3M_START',
+            'revised_dt',
+            'revised_qi'
+        ]]
+        
+        return final_df
 
 
 if __name__ == '__main__':

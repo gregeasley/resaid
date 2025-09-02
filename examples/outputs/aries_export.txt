@@ -1,0 +1,27 @@
+WELL_001                                                                                     
+ PRODUCTION                                                                                  
+  START      01/2020                                                                   RSC425
+  OIL        92.0 X B/M 6 EXP B/0.99 38.9                                              RSC425
+  "          X X B/M 99 YRS EXP 6                                                      RSC425
+  GAS        240.0 X M/M 6 EXP B/0.99 53.07                                            RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425
+  WATER      185.0 X M/M 6 EXP B/0.99 26.3                                             RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425
+WELL_002                                                                                     
+ PRODUCTION                                                                                  
+  START      01/2020                                                                   RSC425
+  OIL        135.0 X B/M 6 EXP B/0.99 33.23                                            RSC425
+  "          X X B/M 99 YRS EXP 6                                                      RSC425
+  GAS        540.0 X M/M 6 EXP B/0.99 33.23                                            RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425
+  WATER      235.0 X M/M 6 EXP B/0.99 22.16                                            RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425
+WELL_003                                                                                     
+ PRODUCTION                                                                                  
+  START      02/2020                                                                   RSC425
+  OIL        68.0 X B/M 6 EXP B/0.99 44.53                                             RSC425
+  "          X X B/M 99 YRS EXP 6                                                      RSC425
+  GAS        140.0 X M/M 6 EXP B/0.99 64.56                                            RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425
+  WATER      135.0 X M/M 6 EXP B/0.99 33.23                                            RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425
