@@ -2379,8 +2379,8 @@ class decline_curve:
         
         # Calculate revised parameters
         # Set StartDate to middle of last three months (L3M_START represents the most recent date)
-        # Calculate middle date by going back 1.5 months from L3M_START
-        tc_df['middle_date'] = tc_df['L3M_START'] - pd.DateOffset(months=1.5)
+        # Calculate middle date by going back 1 month from L3M_START (approximating middle of 3 months)
+        tc_df['middle_date'] = tc_df['L3M_START'] - pd.DateOffset(months=1)
         
         # Calculate time difference from T0 to middle of last three months
         tc_df['revised_dt'] = self.month_diff(tc_df['middle_date'], tc_df['T0'])

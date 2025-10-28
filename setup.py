@@ -18,7 +18,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="resaid",
-    version="0.2.10",
+    version="0.2.11",
     author="Greg Easley",
     author_email="greg@easley.dev",
     license="MIT",
