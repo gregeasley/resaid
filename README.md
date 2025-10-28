@@ -14,6 +14,7 @@ A comprehensive collection of reservoir engineering tools for production forecas
 - **Royalty & Interest Modeling**: Working interest, net revenue interest, and royalty calculations
 - **Tax & Cost Modeling**: Severance taxes, ad valorem taxes, and operating costs
 - **Vectorized Operations**: High-performance calculations for large datasets
+- **Database Interface**: Direct reading from ARIES and PhdWin databases (.mdb/.accdb files)
 
 ## Installation
 
@@ -29,12 +30,14 @@ The `examples/` folder contains working examples that demonstrate RESAID functio
 
 - **`simple_example.py`**: Three-phase mode example generating ARIES, PhdWin, and Mosaic exports
 - **`ratio_mode_example.py`**: Ratio mode example showing how to use ratios for multi-phase forecasting
+- **`database_example.py`**: Database interface example reading from ARIES/PhdWin databases
 
 Run these examples to see RESAID in action:
 ```bash
 cd examples
 python simple_example.py      # Three-phase mode
 python ratio_mode_example.py  # Ratio mode
+python database_example.py    # Database interface
 ```
 
 ### Basic Single-Phase DCA Analysis
@@ -394,6 +397,40 @@ print(top_wells[['UID', 'IRR', 'DCF', 'PAYOUT']])
 ## Export Functionality
 
 The `decline_curve` class includes integrated export capabilities for major economic software platforms.
+
+### Database Interface
+
+RESAID now includes a database interface for reading industry standard databases and generating DCA forecasts:
+
+```python
+from resaid.database import ARIESDatabase, PhdWinDatabase
+
+# Connect to ARIES database
+aries_db = ARIESDatabase("path/to/database.mdb")
+aries_db.connect()
+
+# Read production and header data
+dca_data = aries_db.prepare_data_for_dca()
+
+# Run DCA analysis on multiple wells
+results = aries_db.run_dca_analysis(dca_data, three_phase_mode=True)
+
+# Export results in multiple formats
+aries_db.export_results(results, export_format='aries', output_dir='outputs')
+aries_db.export_results(results, export_format='phdwin', output_dir='outputs')
+aries_db.export_results(results, export_format='mosaic', output_dir='outputs')
+```
+
+**Supported Database Formats:**
+- **ARIES**: `.mdb` and `.accdb` files with `AC_PRODUCT` and `AC_PROPERTY` tables
+- **PhdWin**: `.mdb` and `.accdb` files with `AC_PRODUCT` and `AC_PROPERTY` tables
+- **Future**: Additional database formats planned
+
+**Features:**
+- Automatic data preparation for DCA analysis
+- Batch processing of multiple wells
+- Integrated export generation
+- Context manager support for automatic connection handling
 
 ### ARIES Export
 

@@ -25,6 +25,7 @@ from scipy.optimize import curve_fit, fsolve
 from dateutil.relativedelta import relativedelta
 import time
 import warnings
+from tqdm import tqdm
 
 warnings.simplefilter("ignore")
 
@@ -221,7 +222,7 @@ class decline_curve:
         self.MIN_DECLINE_RATE = .08/12  # Minimum monthly decline rate
         
         # User-configurable parameters
-        self.verbose = True
+        self.verbose = False
         self.debug_on = False
         self.STAT_FILE = None  # Enable debug output
         self.filter_bonfp = .5  # Bonferroni correction threshold
@@ -908,7 +909,9 @@ class decline_curve:
             'NORMALIZED_WATER': lambda x: x.tolist()
         }).reset_index()
 
-        imploded_df = imploded_df.apply(self.dca_params, axis=1)
+        # Apply DCA parameters calculation with progress tracking
+        tqdm.pandas(desc="Processing wells (vectorized mode)")
+        imploded_df = imploded_df.progress_apply(self.dca_params, axis=1)
 
         imploded_df = imploded_df[[
             'UID',
@@ -956,12 +959,12 @@ class decline_curve:
 
         imploded_df = r_df
 
-        if self.verbose:
-            print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
-            print(f'Total wells analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
-            print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
-            l_duration = time.time() - l_start
-            print("Vectorized DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
+        # Always show summary statistics
+        print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
+        print(f'Total wells analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
+        print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
+        l_duration = time.time() - l_start
+        print("Vectorized DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
 
         self._params_dataframe = imploded_df
 
@@ -982,6 +985,19 @@ class decline_curve:
             'NORMALIZED_GAS': 'sum',
             'NORMALIZED_WATER': 'sum'
         }).reset_index()
+
+        # Calculate total number of operations for progress tracking
+        total_operations = 0
+        for _, well_row in well_phases.iterrows():
+            if well_row['NORMALIZED_OIL'] > 0:
+                total_operations += 1
+            if well_row['NORMALIZED_GAS'] > 0:
+                total_operations += 1
+            if well_row['NORMALIZED_WATER'] > 0:
+                total_operations += 1
+
+        # Initialize progress bar
+        progress_bar = tqdm(total=total_operations, desc="Processing wells (three-phase mode)", unit="well-phase")
 
         # Determine which phases to analyze for each well
         for _, well_row in well_phases.iterrows():
@@ -1031,6 +1047,9 @@ class decline_curve:
 
                 # Apply DCA parameters calculation
                 imploded_df = imploded_df.apply(self.dca_params, axis=1)
+                
+                # Update progress bar
+                progress_bar.update(1)
 
                 # Filter out failed DCA calculations
                 imploded_df = imploded_df[imploded_df['qi'].notna()]
@@ -1062,18 +1081,21 @@ class decline_curve:
         else:
             imploded_df = pd.DataFrame()
 
-        if self.verbose:
-            print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
-            print(f'Total phase-well combinations analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
-            if len(imploded_df) > 0:
-                print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
-            l_duration = time.time() - l_start
-            print("Three-phase DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
+        # Close progress bar
+        progress_bar.close()
+
+        # Always show summary statistics
+        print('Total DCA Failures: '+str(self.V_DCA_FAILURES), file=self.STAT_FILE, flush=True)
+        print(f'Total phase-well combinations analyzed: {len(imploded_df)}', file=self.STAT_FILE, flush=True)
+        if len(imploded_df) > 0:
+            print('Failure rate: {:.2%}'.format(self.V_DCA_FAILURES/len(imploded_df)), file=self.STAT_FILE, flush=True)
+        l_duration = time.time() - l_start
+        print("Three-phase DCA generation: {:.2f} seconds".format(l_duration), file=self.STAT_FILE, flush=True)
 
         self._params_dataframe = imploded_df
 
 
-    def run_DCA(self, _verbose=True):
+    def run_DCA(self, _verbose=False):
         self.verbose = _verbose
         if self.verbose:
             print('Generating time index.', file=self.STAT_FILE, flush=True)
@@ -1776,6 +1798,20 @@ class decline_curve:
         elif 'T0' not in oneline_df.columns:
             oneline_df['T0'] = pd.Timestamp('2020-01-01')
         
+        # Calculate revised parameters for each phase
+        oneline_df['T0'] = pd.to_datetime(oneline_df['T0'])
+        oneline_df['revised_dt'] = self.month_diff(oneline_df['L3M_START'], oneline_df['T0'])
+        
+        # Calculate revised decline rates for each phase
+        oneline_df['OIL_revised_ai'] = oneline_df.apply(lambda x: x['OIL_DI']/(1+x['OIL_B']*x['OIL_DI']*x['revised_dt']) if x['OIL_QI'] > 0 else 0, axis=1)
+        oneline_df['OIL_revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['OIL_revised_ai']*12)*x['OIL_B']+1),(-1/x['OIL_B'])))*100 if x['OIL_QI'] > 0 else 0, axis=1)
+        
+        oneline_df['GAS_revised_ai'] = oneline_df.apply(lambda x: x['GAS_DI']/(1+x['GAS_B']*x['GAS_DI']*x['revised_dt']) if x['GAS_QI'] > 0 else 0, axis=1)
+        oneline_df['GAS_revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['GAS_revised_ai']*12)*x['GAS_B']+1),(-1/x['GAS_B'])))*100 if x['GAS_QI'] > 0 else 0, axis=1)
+        
+        oneline_df['WATER_revised_ai'] = oneline_df.apply(lambda x: x['WATER_DI']/(1+x['WATER_B']*x['WATER_DI']*x['revised_dt']) if x['WATER_QI'] > 0 else 0, axis=1)
+        oneline_df['WATER_revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['WATER_revised_ai']*12)*x['WATER_B']+1),(-1/x['WATER_B'])))*100 if x['WATER_QI'] > 0 else 0, axis=1)
+        
         # Create output directory if it doesn't exist
         import os
         output_dir = os.path.dirname(file_path)
@@ -1787,7 +1823,7 @@ class decline_curve:
                 # Write well header
                 propnum = str(row['UID']).ljust(93)
                 production = " PRODUCTION".ljust(93)
-                start = "  START".ljust(13) + row['T0'].strftime('%m/%Y')
+                start = "  START".ljust(13) + row['L3M_START'].strftime('%m/%Y')
                 start_padding = " " * (93 - len(start) - len(scenario))
                 start_line = start + start_padding + scenario
                 
@@ -1798,41 +1834,92 @@ class decline_curve:
                 # Write OIL phase if it exists
                 if row['OIL_QI'] > 0:
                     oil_val = round(row['L3M_OIL'], 0)
-                    oil_decline = max(row['OIL_ARIES_DE'], dmin)
-                    oil_line = f"  OIL        {oil_val} X B/M {dmin} EXP B/{round(row['OIL_B'], 2)} {round(oil_decline, 2)}"
-                    oil_padding = " " * (93 - len(oil_line) - len(scenario))
-                    file.write(oil_line + oil_padding + scenario + "\n")
                     
-                    # Write continuation line for oil
-                    oil_cnt = f'  "          X X B/M 99 YRS EXP {dmin}'
-                    oil_cnt_padding = " " * (93 - len(oil_cnt) - len(scenario))
-                    file.write(oil_cnt + oil_cnt_padding + scenario + "\n")
+                    # Determine oil line based on conditions (matching ratio forecast logic)
+                    if row['OIL_B'] > 0.05 and round(row['OIL_revised_aries_de'], 2) > dmin and oil_val > 0:
+                        oil_line = f"  OIL        {oil_val} X B/M {dmin} EXP B/{round(row['OIL_B'], 2)} {round(row['OIL_revised_aries_de'], 2)}"
+                        oil_padding = " " * (93 - len(oil_line) - len(scenario))
+                        file.write(oil_line + oil_padding + scenario + "\n")
+                        
+                        # Write continuation line for oil
+                        oil_cnt = f'  "          X X B/M 99 YRS EXP {dmin}'
+                        oil_cnt_padding = " " * (93 - len(oil_cnt) - len(scenario))
+                        file.write(oil_cnt + oil_cnt_padding + scenario + "\n")
+                        
+                    elif oil_val > 0 and round(row['OIL_revised_aries_de'], 2) > dmin:
+                        oil_line = f"  OIL        {oil_val} X B/M 99 YRS EXP {round(row['OIL_revised_aries_de'], 2)}"
+                        oil_padding = " " * (93 - len(oil_line) - len(scenario))
+                        file.write(oil_line + oil_padding + scenario + "\n")
+                        
+                    elif oil_val > 0:
+                        oil_line = f"  OIL        {oil_val} X B/M 99 YRS EXP {dmin}"
+                        oil_padding = " " * (93 - len(oil_line) - len(scenario))
+                        file.write(oil_line + oil_padding + scenario + "\n")
+                        
+                    else:
+                        oil_line = f"  OIL        {oil_val} X B/M 1 YRS FLAT 0"
+                        oil_padding = " " * (93 - len(oil_line) - len(scenario))
+                        file.write(oil_line + oil_padding + scenario + "\n")
                 
                 # Write GAS phase if it exists
                 if row['GAS_QI'] > 0:
                     gas_val = round(row['L3M_GAS'], 0)
-                    gas_decline = max(row['GAS_ARIES_DE'], dmin)
-                    gas_line = f"  GAS        {gas_val} X M/M {dmin} EXP B/{round(row['GAS_B'], 2)} {round(gas_decline, 2)}"
-                    gas_padding = " " * (93 - len(gas_line) - len(scenario))
-                    file.write(gas_line + gas_padding + scenario + "\n")
                     
-                    # Write continuation line for gas
-                    gas_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
-                    gas_cnt_padding = " " * (93 - len(gas_cnt) - len(scenario))
-                    file.write(gas_cnt + gas_cnt_padding + scenario + "\n")
+                    # Determine gas line based on conditions (matching ratio forecast logic)
+                    if row['GAS_B'] > 0.05 and round(row['GAS_revised_aries_de'], 2) > dmin and gas_val > 0:
+                        gas_line = f"  GAS        {gas_val} X M/M {dmin} EXP B/{round(row['GAS_B'], 2)} {round(row['GAS_revised_aries_de'], 2)}"
+                        gas_padding = " " * (93 - len(gas_line) - len(scenario))
+                        file.write(gas_line + gas_padding + scenario + "\n")
+                        
+                        # Write continuation line for gas
+                        gas_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
+                        gas_cnt_padding = " " * (93 - len(gas_cnt) - len(scenario))
+                        file.write(gas_cnt + gas_cnt_padding + scenario + "\n")
+                        
+                    elif gas_val > 0 and round(row['GAS_revised_aries_de'], 2) > dmin:
+                        gas_line = f"  GAS        {gas_val} X M/M 99 YRS EXP {round(row['GAS_revised_aries_de'], 2)}"
+                        gas_padding = " " * (93 - len(gas_line) - len(scenario))
+                        file.write(gas_line + gas_padding + scenario + "\n")
+                        
+                    elif gas_val > 0:
+                        gas_line = f"  GAS        {gas_val} X M/M 99 YRS EXP {dmin}"
+                        gas_padding = " " * (93 - len(gas_line) - len(scenario))
+                        file.write(gas_line + gas_padding + scenario + "\n")
+                        
+                    else:
+                        gas_line = f"  GAS        {gas_val} X M/M 1 YRS FLAT 0"
+                        gas_padding = " " * (93 - len(gas_line) - len(scenario))
+                        file.write(gas_line + gas_padding + scenario + "\n")
                 
                 # Write WATER phase if it exists and write_water is True
                 if write_water and row['WATER_QI'] > 0:
                     water_val = round(row['L3M_WATER'], 0)
-                    water_decline = max(row['WATER_ARIES_DE'], dmin)
-                    water_line = f"  WATER      {water_val} X M/M {dmin} EXP B/{round(row['WATER_B'], 2)} {round(water_decline, 2)}"
-                    water_padding = " " * (93 - len(water_line) - len(scenario))
-                    file.write(water_line + water_padding + scenario + "\n")
                     
-                    # Write continuation line for water
-                    water_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
-                    water_cnt_padding = " " * (93 - len(water_cnt) - len(scenario))
-                    file.write(water_cnt + water_cnt_padding + scenario + "\n")
+                    # Determine water line based on conditions (matching ratio forecast logic)
+                    if row['WATER_B'] > 0.05 and round(row['WATER_revised_aries_de'], 2) > dmin and water_val > 0:
+                        water_line = f"  WTR        {water_val} X M/M {dmin} EXP B/{round(row['WATER_B'], 2)} {round(row['WATER_revised_aries_de'], 2)}"
+                        water_padding = " " * (93 - len(water_line) - len(scenario))
+                        file.write(water_line + water_padding + scenario + "\n")
+                        
+                        # Write continuation line for water
+                        water_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
+                        water_cnt_padding = " " * (93 - len(water_cnt) - len(scenario))
+                        file.write(water_cnt + water_cnt_padding + scenario + "\n")
+                        
+                    elif water_val > 0 and round(row['WATER_revised_aries_de'], 2) > dmin:
+                        water_line = f"  WTR        {water_val} X M/M 99 YRS EXP {round(row['WATER_revised_aries_de'], 2)}"
+                        water_padding = " " * (93 - len(water_line) - len(scenario))
+                        file.write(water_line + water_padding + scenario + "\n")
+                        
+                    elif water_val > 0:
+                        water_line = f"  WTR        {water_val} X M/M 99 YRS EXP {dmin}"
+                        water_padding = " " * (93 - len(water_line) - len(scenario))
+                        file.write(water_line + water_padding + scenario + "\n")
+                        
+                    else:
+                        water_line = f"  WTR        {water_val} X M/M 1 YRS FLAT 0"
+                        water_padding = " " * (93 - len(water_line) - len(scenario))
+                        file.write(water_line + water_padding + scenario + "\n")
 
     def generate_aries_export(self, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
         """
@@ -2175,11 +2262,11 @@ class decline_curve:
         # Run DCA if not already done
         if self._params_dataframe.empty:
             # Set parameters to match reference script
-            self.D_MIN = 0.06/12
-            self.backup_decline = False
-            self.OUTLIER_CORRECTION = False
-            self.min_h_b = 0.01
-            self.max_h_b = 1.3
+            #self.D_MIN = 0.06/12
+            #self.backup_decline = False
+            #self.OUTLIER_CORRECTION = False
+            #self.min_h_b = 0.01
+            #self.max_h_b = 1.3
             self.run_DCA()
         
         # Generate oneline if not already done
@@ -2291,28 +2378,34 @@ class decline_curve:
                 tc_df['T0'] = tc_df['T0_DATE']
         
         # Calculate revised parameters
-        # Use T0 from oneline data (matching reference script approach)
-        tc_df['T0'] = tc_df['T0_DATE']
+        # Set StartDate to middle of last three months (L3M_START represents the most recent date)
+        # Calculate middle date by going back 1.5 months from L3M_START
+        tc_df['middle_date'] = tc_df['L3M_START'] - pd.DateOffset(months=1.5)
         
-        tc_df['revised_dt'] = self.month_diff(tc_df['L3M_START'], tc_df['T0'])
+        # Calculate time difference from T0 to middle of last three months
+        tc_df['revised_dt'] = self.month_diff(tc_df['middle_date'], tc_df['T0'])
         
-        # QI Revisions
+        # Adjust decline rate to current point in time (similar to ARIES_DE calculation)
+        # This calculates the effective decline rate at the current time point
+        tc_df['revised_de'] = tc_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
+        
+        # Convert to PhdWin decline rate format (percentage per year)
+        tc_df['ARIES_DE'] = tc_df.apply(lambda x: 100*(1-np.exp(-x['revised_de']*12)), axis=1)
+        
+        # Use direct L3M average as QI (no complex revisions)
         tc_df['revised_qi'] = np.where(
             tc_df['MAJOR'] == 'OIL',
-            tc_df['L3M_OIL'] * np.power((1 + tc_df['B'] * tc_df['DE'] * tc_df['revised_dt']), 1 / tc_df['B']),
+            tc_df['L3M_OIL'],
             np.where(
                 tc_df['MAJOR'] == 'GAS',
-                tc_df['L3M_GAS'] * np.power((1 + tc_df['B'] * tc_df['DE'] * tc_df['revised_dt']), 1 / tc_df['B']),
+                tc_df['L3M_GAS'],
                 np.where(
                     tc_df['MAJOR'] == 'WATER',
-                    tc_df['L3M_WATER'] * np.power((1 + tc_df['B'] * tc_df['DE'] * tc_df['revised_dt']), 1 / tc_df['B']),
+                    tc_df['L3M_WATER'],
                     0
                 )
             )
         )
-        
-        # Adjust the ARIES_DE column to actually be the PhdWin De
-        tc_df['ARIES_DE'] = tc_df.apply(lambda x: 100*(1-np.exp(-x['DE']*12)), axis=1)
         
         # Format for PhdWin
         output_columns = [
@@ -2330,19 +2423,23 @@ class decline_curve:
         output_df['Product'] = output_df['MAJOR'].str.title()
         output_df['Units'] = np.where(output_df['Product'] == 'Gas', 'Mcf', 'bbl')
         output_df['ProjType'] = 'Arps'
-        output_df['StartDate'] = output_df['T0']
+        output_df['StartDate'] = output_df['middle_date']
         output_df['BegCum'] = 0
         output_df['Qi'] = output_df['revised_qi']
-        output_df['NFactor'] = np.where(output_df['B'] > 0.01, output_df['B'], 0)
+        output_df['NFactor'] = np.where(
+            (output_df['B'] > 0.01) & (output_df['ARIES_DE'] >= dmin), 
+            output_df['B'], 
+            0
+        )
         output_df['Decl'] = np.where(
-            output_df['ARIES_DE'] > 2,
+            output_df['ARIES_DE'] > dmin,
             output_df['ARIES_DE'],
-            np.where(output_df['ARIES_DE'] > 0, 2, 0)
+            np.where(output_df['ARIES_DE'] > 0, dmin, 0)
         )
         output_df['DeclMin'] = np.where(
-            (output_df['NFactor'] > 0.01) & (output_df['ARIES_DE'] > 6),
-            6,
-            np.where((output_df['NFactor'] > 0.01), 2, 0)
+            (output_df['NFactor'] > 0.01) & (output_df['ARIES_DE'] > dmin),
+            dmin,
+            np.where((output_df['NFactor'] > 0.01), dmin, 0)
         )
         output_df['Qf'] = None
         output_df['Volume'] = None
