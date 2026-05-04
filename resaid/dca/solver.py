@@ -5,11 +5,32 @@ This module is part of the ``resaid.dca`` package; import from ``resaid.dca`` or
 """
 
 import numpy as np
-from scipy.optimize import fsolve
+from scipy.optimize import minimize, minimize_scalar
 
 from ..dca_constants import DEFAULT_SOLVER_T_MAX_MONTHS
 
 from .decline_curve import decline_curve
+
+# One shared engine for Arps integration — avoids constructing ``decline_curve``
+# (file handles, etc.) on every ``decline_solver()`` in tight loops.
+_SHARED_L_DCA = None
+
+
+def _shared_l_dca():
+    global _SHARED_L_DCA
+    if _SHARED_L_DCA is None:
+        _SHARED_L_DCA = decline_curve()
+    return _SHARED_L_DCA
+
+# Per-variable box constraints for ``minimize`` (physically plausible DCA ranges).
+_SOLVER_VAR_BOUNDS = {
+    "qi": (1e-30, 1e25),
+    "de": (1e-12, 50.0),
+    "eur": (1e-6, 1e20),
+    "qf": (1e-12, 1e25),
+    "t_max": (1.0, 1e6),
+}
+
 
 class decline_solver:
     """
@@ -29,7 +50,7 @@ class decline_solver:
             ``DEFAULT_SOLVER_T_MAX_MONTHS`` from ``resaid.dca_constants``.
     """
 
-    def __init__(self, qi=None, qf=None, de=None, dmin=None, b=None, eur=None, t_max=None):
+    def __init__(self, qi=None, qf=None, de=None, dmin=None, b=None, eur=None, t_max=None, l_dca=None):
         self.qi = qi
         self.qf = qf
         self.de = de
@@ -43,7 +64,9 @@ class decline_solver:
         self.delta = 0
         
         self.variables_to_solve = []
-        self.l_dca = decline_curve()
+        self.l_dca = l_dca if l_dca is not None else _shared_l_dca()
+        self._t_range = None
+        self._t_range_n = None
 
     def determine_solve(self):
         """
@@ -125,18 +148,24 @@ class decline_solver:
         Calculate the objective function for parameter optimization.
         
         Args:
-            vars_to_solve: List of parameter values to evaluate
+            vars_to_solve: Sequence of parameter values to evaluate (same order as
+                ``variables_to_solve``).
             
         Returns:
-            float: Objective function value (sum of squared residuals)
+            float: Absolute difference between cumulative Arps production and target EUR.
         """
-        for var_name, var_value in zip(self.variables_to_solve, vars_to_solve):
-            setattr(self, var_name, var_value)
+        vec = np.atleast_1d(np.asarray(vars_to_solve, dtype=float)).ravel()
+        for var_name, var_value in zip(self.variables_to_solve, vec):
+            setattr(self, var_name, float(var_value))
 
         self.l_dca.D_MIN = self.dmin
-        t_range = np.array(range(0, int(self.t_max)))
+        tn = int(self.t_max)
+        if self._t_range_n != tn or self._t_range is None:
+            self._t_range = np.arange(tn, dtype=float)
+            self._t_range_n = tn
+        t_range = self._t_range
 
-        dca_array = np.array(self.l_dca.arps_decline(t_range, self.qi, self.de, self.b, 0))
+        dca_array = np.asarray(self.l_dca.arps_decline(t_range, self.qi, self.de, self.b, 0), dtype=float)
         dca_array = np.where(dca_array > self.qf, dca_array, 0)
 
         self.l_t_max = len(np.where(dca_array > 0)[0])
@@ -160,17 +189,63 @@ class decline_solver:
         
         if len(self.variables_to_solve) == 0:
             return self.qi, self.t_max, self.qf, self.de, self.eur, False, self.delta
-        
+
+        x0 = np.array([float(getattr(self, var)) for var in self.variables_to_solve], dtype=float)
+        bounds = [_SOLVER_VAR_BOUNDS[v] for v in self.variables_to_solve]
+        lb = np.array([b[0] for b in bounds], dtype=float)
+        ub = np.array([b[1] for b in bounds], dtype=float)
+        x0 = np.clip(x0, lb, ub)
+
+        def objective(vec):
+            return float(self.dca_delta(vec))
+
+        res = None
+        opt_success = True
         try:
-            result = fsolve(self.dca_delta, [getattr(self, var) for var in self.variables_to_solve])
-            warning_flag = False
+            if len(self.variables_to_solve) == 1:
+                lo, hi = bounds[0]
+                if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+                    result = x0.copy()
+                    opt_success = False
+                else:
+                    def objective_scalar(xx):
+                        return float(self.dca_delta(np.array([float(xx)])))
+
+                    res_sc = minimize_scalar(
+                        objective_scalar,
+                        bounds=(lo, hi),
+                        method="bounded",
+                        options={"maxiter": 120, "xatol": 1e-9},
+                    )
+                    result = np.array(
+                        [float(np.clip(res_sc.x, lo, hi))], dtype=float
+                    )
+                    opt_success = bool(getattr(res_sc, "success", True))
+            else:
+                res = minimize(
+                    objective,
+                    x0,
+                    method="L-BFGS-B",
+                    bounds=bounds,
+                    options={"ftol": 1e-9, "maxiter": 400},
+                )
+                result = np.atleast_1d(res.x).astype(float, copy=False).ravel()
+                result = np.clip(result, lb, ub)
+                opt_success = bool(res.success)
         except Exception:
+            opt_success = False
+            result = x0.copy()
+
+        self.dca_delta(result)
+
+        if len(self.variables_to_solve) == 1:
+            warning_flag = bool(not opt_success and self.delta > 1e-5)
+        elif res is not None:
+            # L-BFGS-B may set success=False on tight ftol while the residual is negligible.
+            warning_flag = bool(not res.success and self.delta > 1e-5)
+        else:
             warning_flag = True
-            result = [getattr(self, var) for var in self.variables_to_solve]
-            
-        for var_name, var_value in zip(self.variables_to_solve, result):
-            setattr(self, var_name, var_value)
-            
+
         if self.qf is None:
             self.qf = self.l_qf
         return self.qi, self.t_max, self.qf, self.de, self.eur, warning_flag, self.delta
