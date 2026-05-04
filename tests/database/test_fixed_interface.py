@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from resaid.database import ARIESDatabase
+from resaid.database import ARIESDatabase, DatabaseInterface
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REF_ACCDB = REPO_ROOT / "reference" / "EIV Fund II_24EY_2025-01-22.accdb"
@@ -23,7 +23,7 @@ def run_simple_dca_check(db_path: Path) -> bool:
     print("Testing simple DCA analysis...")
 
     if not db_path.exists():
-        print(f"✗ Database not found: {db_path}")
+        print(f"[FAIL] Database not found: {db_path}")
         return False
 
     aries_db = None
@@ -31,23 +31,32 @@ def run_simple_dca_check(db_path: Path) -> bool:
         aries_db = ARIESDatabase(db_path)
 
         if not aries_db.connect():
-            print("✗ Failed to connect to database")
+            print("[FAIL] Failed to connect to database")
             return False
 
-        print("✓ Successfully connected to database")
+        print("[OK] Successfully connected to database")
 
-        dca_data = aries_db.prepare_data_for_dca(
+        dca_data = DatabaseInterface.prepare_data_for_dca(
+            aries_db,
             production_table="AC_PRODUCT",
-            header_table="AC_PROPERTY",
+            production_columns={
+                "well_id": "PROPNUM",
+                "date": "P_DATE",
+                "oil": "OIL",
+                "gas": "GAS",
+                "water": "WATER",
+            },
+            header_table=None,
+            header_columns=None,
         )
 
-        print(f"✓ Data prepared: {dca_data.shape}")
+        print(f"[OK] Data prepared: {dca_data.shape}")
 
         well_counts = dca_data.groupby("WELL_ID").size()
         good_wells = well_counts[well_counts >= 12].index
 
         if len(good_wells) == 0:
-            print("✗ No wells with sufficient data found")
+            print("[FAIL] No wells with sufficient data found")
             return False
 
         test_well = good_wells[0]
@@ -60,10 +69,10 @@ def run_simple_dca_check(db_path: Path) -> bool:
         dca_results = aries_db.run_dca_analysis(test_data, three_phase_mode=True)
 
         if test_well not in dca_results:
-            print(f"✗ DCA analysis failed for {test_well}")
+            print(f"[FAIL] DCA analysis failed for {test_well}")
             return False
 
-        print(f"✓ DCA analysis completed for {test_well}")
+        print(f"[OK] DCA analysis completed for {test_well}")
 
         print("Testing export...")
         output_dir = REPO_ROOT / "test_outputs_simple"
@@ -76,14 +85,14 @@ def run_simple_dca_check(db_path: Path) -> bool:
         )
 
         if test_well in aries_files:
-            print(f"✓ Export completed: {aries_files[test_well]}")
+            print(f"[OK] Export completed: {aries_files[test_well]}")
             return True
 
-        print("✗ Export failed")
+        print("[FAIL] Export failed")
         return False
 
     except Exception as e:
-        print(f"✗ Error: {e}")
+        print(f"[FAIL] Error: {e}")
         traceback.print_exc()
         return False
     finally:
@@ -102,13 +111,13 @@ def main() -> None:
     print("Fixed Database Interface Test")
     print("=" * 50)
     if not REF_ACCDB.is_file():
-        print(f"✗ Database not found: {REF_ACCDB}")
+        print(f"[FAIL] Database not found: {REF_ACCDB}")
         return
     success = run_simple_dca_check(REF_ACCDB)
     if success:
-        print("\n🎉 Test passed! Database interface is working correctly.")
+        print("\n[OK] Test passed. Database interface is working correctly.")
     else:
-        print("\n❌ Test failed. Check the output above for details.")
+        print("\n[FAIL] Test failed. Check the output above for details.")
 
 
 if __name__ == "__main__":

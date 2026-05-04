@@ -18,11 +18,19 @@ Features:
     - Cashflow and discounted cashflow generation
 """
 
-import pandas as pd
+import logging
+from typing import Union
+
 import numpy as np
-import sys
+import pandas as pd
 from scipy.optimize import newton
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+# GOR (Mscf/bbl) above which a well is treated as gas-major for default breakeven phase logic.
+GOR_GAS_MAJOR_MSCF_PER_BBL = 3.2
+
 
 class npv_calc:
     """
@@ -31,15 +39,15 @@ class npv_calc:
     This class provides methods to calculate NPV and IRR for cashflow streams.
     
     Attributes:
-        _cashflow (np.array): Array of cashflow values
+        _cashflow (np.ndarray): Array of cashflow values
     """
     
-    def __init__(self, cashflow: np.array):
+    def __init__(self, cashflow: Union[np.ndarray, list]):
         """
         Initialize NPV calculator with cashflow array.
         
         Args:
-            cashflow (np.array): Array of cashflow values (negative for outflows, positive for inflows)
+            cashflow: Array of cashflow values (negative for outflows, positive for inflows)
         """
         self._cashflow = cashflow
 
@@ -76,7 +84,7 @@ class npv_calc:
         try:
             result = 12 * result  # Convert monthly to annual rate
         except Exception as e:
-            print(f"IRR calculation failed: {result}")
+            logger.warning("IRR calculation failed after Newton solve; result=%r", result)
             raise e
 
         return result
@@ -531,7 +539,7 @@ class well_econ:
 
         try:
             cf_idx = np.argwhere(l_flow['dcf'].to_numpy() > 0)
-        except:
+        except Exception:
             cf_idx = []
 
         if len(cf_idx) > 0:
@@ -565,7 +573,7 @@ class well_econ:
 
         l_flow = self.zero_below(l_flow,last_cf,zero_cols)
 
-        # calculate WI vales
+        # calculate WI values
         l_flow[['wi_oil',
             'wi_gas',
             'wi_ngl',
@@ -655,13 +663,12 @@ class well_econ:
         for w in iterable:
             
             l_flow = self.well_flowstream(w)
-            #l_flow.to_csv(f'tests/{w}.csv')
             
             dc_rev = (l_flow['revenue'].to_numpy() / (1+self.discount_rate)**np.arange(0, len(l_flow['revenue'].to_numpy())))
 
             if self.breakeven_phase is None:
                 if np.sum(l_flow[self.OIL_COL]) > 0:
-                    if np.sum(l_flow[self.GAS_COL])/np.sum(l_flow[self.OIL_COL])> 3.2:
+                    if np.sum(l_flow[self.GAS_COL]) / np.sum(l_flow[self.OIL_COL]) > GOR_GAS_MAJOR_MSCF_PER_BBL:
                         be_major = 'GAS'
                         break_even =(np.sum(dc_rev)- np.sum(l_flow['dcf']))/np.sum(l_flow[self.GAS_COL])
                     else:    
@@ -700,14 +707,11 @@ class well_econ:
             #if np.sum(cf_array) > 0:
             try:
                 l_npv = npv_calc(l_flow['cf'].to_numpy())
-                #print(l_npv.get_npv(0))
                 ind_dict['IRR'].append(l_npv.get_irr())
-            except:
+            except Exception:
                 ind_dict['IRR'].append(0)
 
             ind_dict['ROI'].append(np.sum(l_flow['cf'])/np.sum(l_flow['capex'])+1)
-            #else:
-            #    ind_dict['IRR'].append(0)
 
 
         self._indicators = pd.DataFrame(ind_dict)

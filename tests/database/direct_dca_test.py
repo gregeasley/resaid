@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from resaid.database import ARIESDatabase
+from resaid.database import ARIESDatabase, DatabaseInterface
 from resaid.dca import decline_curve
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -24,7 +24,7 @@ def run_direct_dca_check(db_path: Path) -> bool:
     print("Testing DCA directly...")
 
     if not db_path.exists():
-        print(f"✗ Database not found: {db_path}")
+        print(f"[FAIL] Database not found: {db_path}")
         return False
 
     aries_db = None
@@ -32,23 +32,33 @@ def run_direct_dca_check(db_path: Path) -> bool:
         aries_db = ARIESDatabase(db_path)
 
         if not aries_db.connect():
-            print("✗ Failed to connect to database")
+            print("[FAIL] Failed to connect to database")
             return False
 
-        print("✓ Successfully connected to database")
+        print("[OK] Successfully connected to database")
 
-        dca_data = aries_db.prepare_data_for_dca(
+        # Production-only (bypass ARIES defaults that always attach AC_PROPERTY).
+        dca_data = DatabaseInterface.prepare_data_for_dca(
+            aries_db,
             production_table="AC_PRODUCT",
-            header_table="AC_PROPERTY",
+            production_columns={
+                "well_id": "PROPNUM",
+                "date": "P_DATE",
+                "oil": "OIL",
+                "gas": "GAS",
+                "water": "WATER",
+            },
+            header_table=None,
+            header_columns=None,
         )
 
-        print(f"✓ Data prepared: {dca_data.shape}")
+        print(f"[OK] Data prepared: {dca_data.shape}")
 
         well_counts = dca_data.groupby("WELL_ID").size()
         good_wells = well_counts[well_counts >= 12].index
 
         if len(good_wells) == 0:
-            print("✗ No wells with sufficient data found")
+            print("[FAIL] No wells with sufficient data found")
             return False
 
         test_well = good_wells[0]
@@ -68,24 +78,24 @@ def run_direct_dca_check(db_path: Path) -> bool:
         dca.oil_col = "OIL"
         dca.gas_col = "GAS"
         dca.water_col = "WATER"
-        print("✓ Decline curve object created")
+        print("[OK] Decline curve object created")
 
         print("\n2. Three-phase mode set")
-        print(f"✓ three_phase_mode: {dca.three_phase_mode}")
+        print(f"[OK] three_phase_mode: {dca.three_phase_mode}")
 
         print("\n3. Running DCA...")
         dca.run_DCA()
-        print("✓ DCA completed successfully")
+        print("[OK] DCA completed successfully")
 
         print("\n4. Generating oneline...")
         dca.generate_oneline()
-        print("✓ Oneline generated successfully")
+        print("[OK] Oneline generated successfully")
 
-        print("\n🎉 All DCA steps completed successfully!")
+        print("\n[OK] All DCA steps completed successfully.")
         return True
 
     except Exception as e:
-        print(f"✗ Error: {e}")
+        print(f"[FAIL] Error: {e}")
         traceback.print_exc()
         return False
     finally:
@@ -104,13 +114,13 @@ def main() -> None:
     print("Direct DCA Test")
     print("=" * 50)
     if not REF_ACCDB.is_file():
-        print(f"✗ Database not found: {REF_ACCDB}")
+        print(f"[FAIL] Database not found: {REF_ACCDB}")
         return
     success = run_direct_dca_check(REF_ACCDB)
     if success:
-        print("\n🎉 Test passed! DCA is working correctly.")
+        print("\n[OK] Test passed. DCA is working correctly.")
     else:
-        print("\n❌ Test failed. Check the output above for details.")
+        print("\n[FAIL] Test failed. Check the output above for details.")
 
 
 if __name__ == "__main__":

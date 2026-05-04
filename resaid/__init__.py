@@ -14,7 +14,8 @@ Classes:
     PhdWinDatabase: Specialized interface for PhdWin databases
 """
 
-__version__ = "0.2.12"
+from ._version import __version__
+
 __author__ = "Greg Easley"
 __email__ = "greg@easley.dev"
 

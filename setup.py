@@ -10,15 +10,21 @@ References:
 - https://towardsdatascience.com/how-to-package-your-python-code-df5a7739ab2e
 """
 
+from pathlib import Path
+
 import setuptools
 
+_VERSION_FILE = Path(__file__).resolve().parent / "resaid" / "_version.py"
+_ns: dict = {}
+exec(_VERSION_FILE.read_text(encoding="utf-8"), _ns)
+__version__ = _ns["__version__"]
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
     name="resaid",
-    version="0.2.12",
+    version=__version__,
     author="Greg Easley",
     author_email="greg@easley.dev",
     license="MIT",
