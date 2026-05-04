@@ -23,7 +23,7 @@ def create_test_data():
     
     # Create test data for 3 wells with 12 months of production each
     wells = [f'PROGRESS_TEST_WELL_{i:03d}' for i in range(1, 4)]
-    dates = pd.date_range('2023-01-01', periods=12, freq='M')
+    dates = pd.date_range('2023-01-01', periods=12, freq='ME')
     
     data = []
     for well in wells:

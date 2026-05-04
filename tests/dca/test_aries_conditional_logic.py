@@ -23,7 +23,7 @@ def create_test_data_with_different_conditions():
     
     # Create test data for wells with different characteristics
     wells = [f'CONDITIONAL_TEST_WELL_{i:03d}' for i in range(1, 4)]
-    dates = pd.date_range('2023-01-01', periods=12, freq='M')
+    dates = pd.date_range('2023-01-01', periods=12, freq='ME')
     
     data = []
     for i, well in enumerate(wells):

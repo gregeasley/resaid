@@ -24,7 +24,7 @@ def create_test_data():
     
     # Create test data for 5 wells with 12 months of production each
     wells = [f'TEST_WELL_{i:03d}' for i in range(1, 6)]
-    dates = pd.date_range('2023-01-01', periods=12, freq='M')
+    dates = pd.date_range('2023-01-01', periods=12, freq='ME')
     
     data = []
     for well in wells:
@@ -138,7 +138,7 @@ def test_performance_improvement():
     # Create larger test dataset for performance testing
     np.random.seed(42)
     wells = [f'PERF_WELL_{i:03d}' for i in range(1, 21)]  # 20 wells
-    dates = pd.date_range('2023-01-01', periods=24, freq='M')  # 24 months
+    dates = pd.date_range('2023-01-01', periods=24, freq='ME')  # 24 months
     
     data = []
     for well in wells:

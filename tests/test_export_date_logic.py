@@ -21,7 +21,7 @@ from resaid.dca import decline_curve
 def create_test_data():
     """Create test data for export function testing."""
     # Create test production data
-    dates = pd.date_range('2020-01-01', periods=24, freq='M')
+    dates = pd.date_range('2020-01-01', periods=24, freq='ME')
     wells = ['WELL001', 'WELL002', 'WELL003']
     
     data = []
