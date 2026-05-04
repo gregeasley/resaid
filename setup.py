@@ -18,7 +18,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="resaid",
-    version="0.2.11",
+    version="0.2.12",
     author="Greg Easley",
     author_email="greg@easley.dev",
     license="MIT",
@@ -56,4 +56,10 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     python_requires=">=3.8",
     include_package_data=False,
+    extras_require={
+        "test": [
+            "pytest>=7.0",
+            "openpyxl>=3.0.0",
+        ],
+    },
 )

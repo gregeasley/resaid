@@ -1397,6 +1397,13 @@ class decline_curve:
         # Create the flowstream dataframe
         if all_flows:
             self._flowstream_dataframe = pd.DataFrame(all_flows)
+            # Group by UID and T_INDEX to combine the three phase entries (OIL, GAS, WATER) into single rows
+            # This ensures each (UID, T_INDEX) combination appears only once with all phases populated
+            self._flowstream_dataframe = self._flowstream_dataframe.groupby(['UID', 'T_INDEX']).agg({
+                'OIL': 'sum',
+                'GAS': 'sum',
+                'WATER': 'sum'
+            }).reset_index()
             self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
         else:
             self._flowstream_dataframe = pd.DataFrame(columns=['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER'])
@@ -1461,8 +1468,21 @@ class decline_curve:
         if self.debug_on:
             return_df.to_csv('outputs/test_quantiles.csv')
         
-        return_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).quantile(prob_levels).reset_index()
-        avg_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).mean().reset_index()
+        # Ensure T_INDEX is a column before grouping (it may be an index)
+        return_df = (
+            self._flowstream_dataframe
+                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+                .groupby('T_INDEX')
+                .quantile(prob_levels)
+                .reset_index()
+        )
+        avg_df = (
+            self._flowstream_dataframe
+                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+                .groupby('T_INDEX')
+                .mean()
+                .reset_index()
+        )
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
         
@@ -1472,6 +1492,53 @@ class decline_curve:
                 l_df = return_df.copy()
                 l_df['MAJOR'] = major
                 param_df = self.vect_generate_params_tc(l_df)
+                # Adjust qi only to ensure the modeled curve sum matches the empirical sum per probability
+                try:
+                    # Extract available probability levels present in return_df
+                    prob_levels_available = sorted([p for p in l_df['level_1'].unique() if isinstance(p, (int, float))])
+                    # Build target sums per probability for this major phase
+                    target_sums = {
+                        p: l_df[l_df['level_1'] == p][major].sum() for p in prob_levels_available
+                    }
+                    # T_INDEX used for matching
+                    t_index_map = {
+                        p: l_df[l_df['level_1'] == p]['T_INDEX'].values for p in prob_levels_available
+                    }
+                    def model_sum(qi, di, b, t0, t_arr):
+                        if len(t_arr) == 0:
+                            return 0.0
+                        t = t_arr.astype(float)
+                        dt = t - float(t0)
+                        # For dt < 0, use value at match point (dt=0)
+                        dt = np.where(dt < 0, 0.0, dt)
+                        if b is None:
+                            b = 0.0
+                        if abs(b) < 1e-6:
+                            # Exponential
+                            q = qi * np.exp(-di * dt)
+                        else:
+                            q = qi * np.power(1.0 + b * di * dt, -1.0 / b)
+                        return float(np.nansum(q))
+                    # param_df has columns: qi, di, b, t0, UID (probability)
+                    if 'qi' in param_df.columns and 'di' in param_df.columns and 'b' in param_df.columns and 't0' in param_df.columns and 'UID' in param_df.columns:
+                        adjusted_qi = []
+                        for _, prow in param_df.iterrows():
+                            prob = prow['UID']
+                            qi = float(prow['qi'])
+                            di = float(prow['di'])
+                            b = float(prow['b'])
+                            t0 = float(prow['t0'])
+                            if prob in target_sums and prob in t_index_map:
+                                target = target_sums[prob]
+                                denom = model_sum(qi, di, b, t0, t_index_map[prob])
+                                if denom > 0 and target >= 0:
+                                    scale = target / denom
+                                    qi = qi * scale
+                            adjusted_qi.append(qi)
+                        param_df['qi'] = adjusted_qi
+                except Exception:
+                    # Non-fatal; proceed without adjustment if anything unexpected occurs
+                    pass
                 param_df['d0'] = param_df.apply(lambda x: x.di*np.power((1+x.b*x.di*(1-x.t0)),-1), axis=1)
                 param_df['d0_a'] = param_df.apply(lambda x: x.d0*12, axis=1)
                 param_df['aries_de'] = param_df.apply(lambda x: (1-np.power((x.d0_a*x.b+1),(-1/x.b)))*100, axis=1)
@@ -1511,8 +1578,21 @@ class decline_curve:
             return_df.to_csv('outputs/test_quantiles.csv')
         
         # Calculate quantiles and mean for each phase independently
-        return_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).quantile(prob_levels).reset_index()
-        avg_df = self._flowstream_dataframe[['T_INDEX','OIL','GAS','WATER']].groupby(['T_INDEX']).mean().reset_index()
+        # Ensure T_INDEX is a column before grouping (it may be an index)
+        return_df = (
+            self._flowstream_dataframe
+                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+                .groupby('T_INDEX')
+                .quantile(prob_levels)
+                .reset_index()
+        )
+        avg_df = (
+            self._flowstream_dataframe
+                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+                .groupby('T_INDEX')
+                .mean()
+                .reset_index()
+        )
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
         
@@ -1524,12 +1604,48 @@ class decline_curve:
                 l_df['PHASE'] = phase
                 param_df = self.vect_generate_params_tc_three_phase(l_df, phase)
                 if len(param_df) > 0:
+                    # Adjust qi only to ensure the modeled curve sum matches the empirical sum per probability for this phase
+                    try:
+                        prob_levels_available = sorted([p for p in l_df['level_1'].unique() if isinstance(p, (int, float))])
+                        target_sums = { p: l_df[l_df['level_1'] == p][phase].sum() for p in prob_levels_available }
+                        t_index_map = { p: l_df[l_df['level_1'] == p]['T_INDEX'].values for p in prob_levels_available }
+                        def model_sum(qi, di, b, t0, t_arr):
+                            if len(t_arr) == 0:
+                                return 0.0
+                            t = t_arr.astype(float)
+                            dt = t - float(t0)
+                            dt = np.where(dt < 0, 0.0, dt)
+                            if b is None:
+                                b = 0.0
+                            if abs(b) < 1e-6:
+                                q = qi * np.exp(-di * dt)
+                            else:
+                                q = qi * np.power(1.0 + b * di * dt, -1.0 / b)
+                            return float(np.nansum(q))
+                        if {'qi','di','b','t0','UID'}.issubset(param_df.columns):
+                            adjusted_qi = []
+                            for _, prow in param_df.iterrows():
+                                prob = prow['UID']
+                                qi = float(prow['qi'])
+                                di = float(prow['di'])
+                                b = float(prow['b'])
+                                t0 = float(prow['t0'])
+                                if prob in target_sums and prob in t_index_map:
+                                    target = target_sums[prob]
+                                    denom = model_sum(qi, di, b, t0, t_index_map[prob])
+                                    if denom > 0 and target >= 0:
+                                        scale = target / denom
+                                        qi = qi * scale
+                                adjusted_qi.append(qi)
+                            param_df['qi'] = adjusted_qi
+                    except Exception:
+                        pass
                     param_df['d0'] = param_df.apply(lambda x: x.di*np.power((1+x.b*x.di*(1-x.t0)),-1), axis=1)
                     param_df['d0_a'] = param_df.apply(lambda x: x.d0*12, axis=1)
                     param_df['aries_de'] = param_df.apply(lambda x: (1-np.power((x.d0_a*x.b+1),(-1/x.b)))*100, axis=1)
                     param_df = param_df.rename(columns={
-                        'qi':f'Actual Initial Rate, {phase.lower()}/month',
-                        'q0':f'DCA Initial Rate, {phase.lower()}/month',
+                        'qi':f'Actual Initial Rate, volume/month',
+                        'q0':f'DCA Initial Rate, volume/month',
                         'di':'Nominal Initial Decline at Match Point, fraction/months',
                         'b':'B Factor, unitless',
                         't0':'Match Point, months',

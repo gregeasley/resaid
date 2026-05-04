@@ -1,0 +1,7 @@
+BIG3CDG6SH                                                                                   
+ PRODUCTION                                                                                  
+  START      07/2012                                                                   RSC425
+  OIL        1496.0 X B/M 6 EXP B/1.57 14.14                                           RSC425
+  "          X X B/M 99 YRS EXP 6                                                      RSC425
+  GAS        2445.0 X M/M 6 EXP B/1.46 8.5                                             RSC425
+  "          X X M/M 99 YRS EXP 6                                                      RSC425

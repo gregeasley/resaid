@@ -452,6 +452,7 @@ class well_econ:
                 l_flow['royalty'] = l_flow['revenue'] * self.royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
+                l_ori = 0
         elif (self.wi_col and self.nri_col and self._header_data is not None):
             try:
                 l_nri = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.nri_col]
@@ -464,6 +465,7 @@ class well_econ:
                 l_flow['royalty'] = l_flow['revenue'] * self.royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
+                l_ori = 0
         elif self.royalty_col and self._header_data is not None:
             try:
                 l_royalty = self._header_data[self._header_data[self._header_uwi_col] == input_well].iloc[0][self.royalty_col]
@@ -476,11 +478,13 @@ class well_econ:
                 l_flow['royalty'] = l_flow['revenue'] * self.royalty
                 l_wi = 1
                 l_nri = 1 - l_royalty
+                l_ori = 0
         else:
             l_royalty = self.royalty
             l_flow['royalty'] = l_flow['revenue'] * self.royalty
             l_wi = 1
             l_nri = 1 - l_royalty
+            l_ori = 0
 
         l_flow['fixed_expense'] = self.opc_t
         l_flow['oil_variable_expense'] = self.opc_oil * l_flow[self.OIL_COL]
