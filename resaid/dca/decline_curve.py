@@ -7,6 +7,7 @@ This module is part of the ``resaid.dca`` package; import from ``resaid.dca`` or
 import logging
 import time
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -58,7 +59,13 @@ class decline_curve:
         # User-configurable parameters
         self.verbose = False
         self.debug_on = False
-        self.STAT_FILE = None  # Enable debug output
+        self.stat_file_path = Path.cwd() / "DCA_LOG.txt"
+        try:
+            # Default run log in the current working directory.
+            self.STAT_FILE = open(self.stat_file_path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            # Fallback keeps prior behavior if the cwd is not writable.
+            self.STAT_FILE = None
         self.filter_bonfp = .5  # Bonferroni correction threshold
         self.default_initial_decline = .8/12
         self.default_b_factor = .5
