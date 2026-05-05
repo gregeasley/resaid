@@ -2004,11 +2004,86 @@ class decline_curve:
     def generate_typecurve(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, prob_levels=[.1,.5,.9], _verbose=False, return_params=False):
         if self._flowstream_dataframe == None:
             self.generate_flowstream(num_months=num_months,denormalize=denormalize, _verbose=_verbose)
+        if self._oneline.empty:
+            if self._params_dataframe.empty:
+                self.run_DCA(_verbose=_verbose)
+            if self.three_phase_mode:
+                self._generate_oneline_three_phase(num_months, denormalize, _verbose)
+            else:
+                self._generate_oneline_original(num_months, denormalize, _verbose)
 
         if self.three_phase_mode:
             self._generate_typecurve_three_phase(num_months, denormalize, prob_levels, _verbose, return_params)
         else:
             self._generate_typecurve_original(num_months, denormalize, prob_levels, _verbose, return_params)
+
+    @staticmethod
+    def _tc_model_sum(qi, di, b, t0, t_arr):
+        """Type-curve modeled cumulative over provided t-index points."""
+        if len(t_arr) == 0:
+            return 0.0
+        t = np.asarray(t_arr, dtype=float)
+        dt = t - float(t0)
+        dt = np.where(dt < 0, 0.0, dt)
+        b = float(b)
+        qi = float(qi)
+        di = float(di)
+        if abs(b) < 1e-6:
+            q = qi * np.exp(-di * dt)
+        else:
+            den = 1.0 + b * di * dt
+            den = np.where(den > 0.0, den, np.nan)
+            q = qi * np.power(den, -1.0 / b)
+        return float(np.nansum(q))
+
+    def _tc_match_di_with_solver(self, qi, di_guess, b, t0, t_arr, target_sum):
+        """
+        Keep ``qi,b,t0`` fixed and use ``decline_solver`` to match EUR-like target by
+        solving decline rate (``de``). Falls back to ``di_guess`` when solve is invalid.
+        """
+        qi = float(qi)
+        di_guess = float(di_guess)
+        b = float(b)
+        target = float(target_sum)
+        if not (np.isfinite(qi) and np.isfinite(di_guess) and np.isfinite(b) and np.isfinite(target)):
+            return di_guess
+        if qi <= 0 or di_guess <= 0 or b <= 0 or target <= 0:
+            return di_guess
+
+        t_arr = np.asarray(t_arr, dtype=float).reshape(-1)
+        if len(t_arr) == 0:
+            return di_guess
+        # Solver integrates from t=0 to t_max with t0=0 semantics.
+        t_max = max(int(np.nanmax(t_arr) - float(t0)) + 1, 12)
+        Solver = _decline_solver_cls()
+        s = Solver(
+            qi=qi,
+            qf=None,
+            de=None,
+            dmin=self.MIN_DECLINE_RATE,
+            b=b,
+            eur=target,
+            t_max=t_max,
+        )
+        _, _, _, de_new, _, _, _ = s.solve()
+        de_new = float(de_new)
+        if np.isfinite(de_new) and de_new > 0:
+            return de_new
+        return di_guess
+
+    @staticmethod
+    def _tc_decline_metrics(di, b):
+        """Return nominal/tangent/secant decline metrics from monthly nominal di."""
+        di = float(di)
+        b = float(b)
+        nom_month = di
+        nom_annual = di * 12.0
+        tan_eff = 100.0 * (1.0 - np.exp(-nom_annual))
+        if abs(b) < 1e-6:
+            sec_eff = tan_eff
+        else:
+            sec_eff = (1.0 - np.power((nom_annual * b + 1.0), (-1.0 / b))) * 100.0
+        return nom_month, nom_annual, tan_eff, sec_eff
 
     def _generate_typecurve_original(self, num_months, denormalize, prob_levels, _verbose, return_params):
         """Original typecurve generation using major phase with ratios"""
@@ -2041,7 +2116,17 @@ class decline_curve:
                 l_df = return_df.copy()
                 l_df['MAJOR'] = major
                 param_df = self.vect_generate_params_tc(l_df)
-                # Adjust qi only to ensure the modeled curve sum matches the empirical sum per probability
+                param_df['rate_t0'] = np.nan
+                param_df['peak_rate'] = np.nan
+                param_df['time_to_peak_months'] = np.nan
+                nom = param_df.apply(lambda x: self._tc_decline_metrics(x.di, x.b), axis=1)
+                param_df['nominal_initial_monthly_decline'] = [x[0] for x in nom]
+                param_df['nominal_annual_decline'] = [x[1] for x in nom]
+                param_df['tangent_effective_decline_pct'] = [x[2] for x in nom]
+                param_df['secant_effective_decline_pct'] = [x[3] for x in nom]
+                param_df['phase'] = major
+                param_df['probability'] = param_df['UID']
+                # Match EUR-like target by adjusting decline rate via solver (keep qi fixed).
                 try:
                     # Extract available probability levels present in return_df
                     prob_levels_available = sorted([p for p in l_df['level_1'].unique() if isinstance(p, (int, float))])
@@ -2053,57 +2138,66 @@ class decline_curve:
                     t_index_map = {
                         p: l_df[l_df['level_1'] == p]['T_INDEX'].values for p in prob_levels_available
                     }
-                    def model_sum(qi, di, b, t0, t_arr):
-                        if len(t_arr) == 0:
-                            return 0.0
-                        t = t_arr.astype(float)
-                        dt = t - float(t0)
-                        # For dt < 0, use value at match point (dt=0)
-                        dt = np.where(dt < 0, 0.0, dt)
-                        if b is None:
-                            b = 0.0
-                        if abs(b) < 1e-6:
-                            # Exponential
-                            q = qi * np.exp(-di * dt)
-                        else:
-                            q = qi * np.power(1.0 + b * di * dt, -1.0 / b)
-                        return float(np.nansum(q))
                     # param_df has columns: qi, di, b, t0, UID (probability)
                     if 'qi' in param_df.columns and 'di' in param_df.columns and 'b' in param_df.columns and 't0' in param_df.columns and 'UID' in param_df.columns:
-                        adjusted_qi = []
+                        adjusted_di = []
+                        q_time0 = []
+                        q_peak = []
+                        t_peak = []
+                        p_list = []
                         for _, prow in param_df.iterrows():
                             prob = prow['UID']
                             qi = float(prow['qi'])
                             di = float(prow['di'])
                             b = float(prow['b'])
                             t0 = float(prow['t0'])
+                            di_new = di
                             if prob in target_sums and prob in t_index_map:
                                 target = target_sums[prob]
-                                denom = model_sum(qi, di, b, t0, t_index_map[prob])
-                                if denom > 0 and target >= 0:
-                                    scale = target / denom
-                                    qi = qi * scale
-                            adjusted_qi.append(qi)
-                        param_df['qi'] = adjusted_qi
+                                di_new = self._tc_match_di_with_solver(
+                                    qi, di, b, t0, t_index_map[prob], target
+                                )
+                            adjusted_di.append(di_new)
+                            q_time0.append(self._arps_rate_from_tau(qi, di_new, b, 0.0))
+                            p_arr = np.asarray(l_df[l_df['level_1'] == prob][major].values, dtype=float)
+                            t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
+                            if len(p_arr) > 0:
+                                i_peak = int(np.nanargmax(p_arr))
+                                q_peak.append(float(p_arr[i_peak]))
+                                t_peak.append(float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan)
+                            else:
+                                q_peak.append(np.nan)
+                                t_peak.append(np.nan)
+                            p_list.append(prob)
+                        param_df['di'] = adjusted_di
+                        param_df['rate_t0'] = q_time0
+                        param_df['peak_rate'] = q_peak
+                        param_df['time_to_peak_months'] = t_peak
+                        nom = param_df.apply(lambda x: self._tc_decline_metrics(x.di, x.b), axis=1)
+                        param_df['nominal_initial_monthly_decline'] = [x[0] for x in nom]
+                        param_df['nominal_annual_decline'] = [x[1] for x in nom]
+                        param_df['tangent_effective_decline_pct'] = [x[2] for x in nom]
+                        param_df['secant_effective_decline_pct'] = [x[3] for x in nom]
+                        param_df['phase'] = major
+                        param_df['probability'] = p_list
                 except Exception:
                     # Non-fatal; proceed without adjustment if anything unexpected occurs
                     pass
-                param_df['d0'] = param_df.apply(lambda x: x.di*np.power((1+x.b*x.di*(1-x.t0)),-1), axis=1)
-                param_df['d0_a'] = param_df.apply(lambda x: x.d0*12, axis=1)
-                param_df['aries_de'] = param_df.apply(lambda x: (1-np.power((x.d0_a*x.b+1),(-1/x.b)))*100, axis=1)
-                param_df = param_df.rename(columns={
-                    'qi':'Actual Initial Rate, bbl/month',
-                    'q0':'DCA Initial Rate, bbl/month',
-                    'di':'Nominal Initial Decline at Match Point, fraction/months',
-                    'b':'B Factor, unitless',
-                    't0':'Match Point, months',
-                    'minor_ratio':'Minor Phase Ratio, (M/B or B/M)',
-                    'water_ratio':'Water Phase Ratio (B/B or B/M)',
-                    'd0':'Nominal Initial Decline at Time Zero, fraction/months',
-                    'd0_a':'Nominal Initial Decline at Time Zero, fraction/years',
-                    'aries_de':'Effective Initial Decline at Time Zero, %/years (FOR ARIES)',
-                    'UID':'Probability',
-                    'major':'Major Phase'
+                param_df = param_df[[
+                    'rate_t0',
+                    'peak_rate',
+                    'time_to_peak_months',
+                    'b',
+                    'nominal_initial_monthly_decline',
+                    'nominal_annual_decline',
+                    'tangent_effective_decline_pct',
+                    'secant_effective_decline_pct',
+                    'phase',
+                    'probability',
+                    'minor_ratio',
+                    'water_ratio',
+                ]].rename(columns={
+                    'b': 'matched_b_factor',
                 })
                 if r_df.empty:
                     r_df = param_df
@@ -2153,56 +2247,77 @@ class decline_curve:
                 l_df['PHASE'] = phase
                 param_df = self.vect_generate_params_tc_three_phase(l_df, phase)
                 if len(param_df) > 0:
-                    # Adjust qi only to ensure the modeled curve sum matches the empirical sum per probability for this phase
+                    param_df['rate_t0'] = np.nan
+                    param_df['peak_rate'] = np.nan
+                    param_df['time_to_peak_months'] = np.nan
+                    nom = param_df.apply(lambda x: self._tc_decline_metrics(x.di, x.b), axis=1)
+                    param_df['nominal_initial_monthly_decline'] = [x[0] for x in nom]
+                    param_df['nominal_annual_decline'] = [x[1] for x in nom]
+                    param_df['tangent_effective_decline_pct'] = [x[2] for x in nom]
+                    param_df['secant_effective_decline_pct'] = [x[3] for x in nom]
+                    param_df['phase'] = phase
+                    param_df['probability'] = param_df['UID']
+                    # Match EUR-like target by adjusting decline rate via solver (keep qi fixed).
                     try:
                         prob_levels_available = sorted([p for p in l_df['level_1'].unique() if isinstance(p, (int, float))])
                         target_sums = { p: l_df[l_df['level_1'] == p][phase].sum() for p in prob_levels_available }
                         t_index_map = { p: l_df[l_df['level_1'] == p]['T_INDEX'].values for p in prob_levels_available }
-                        def model_sum(qi, di, b, t0, t_arr):
-                            if len(t_arr) == 0:
-                                return 0.0
-                            t = t_arr.astype(float)
-                            dt = t - float(t0)
-                            dt = np.where(dt < 0, 0.0, dt)
-                            if b is None:
-                                b = 0.0
-                            if abs(b) < 1e-6:
-                                q = qi * np.exp(-di * dt)
-                            else:
-                                q = qi * np.power(1.0 + b * di * dt, -1.0 / b)
-                            return float(np.nansum(q))
                         if {'qi','di','b','t0','UID'}.issubset(param_df.columns):
-                            adjusted_qi = []
+                            adjusted_di = []
+                            q_time0 = []
+                            q_peak = []
+                            t_peak = []
+                            p_list = []
                             for _, prow in param_df.iterrows():
                                 prob = prow['UID']
                                 qi = float(prow['qi'])
                                 di = float(prow['di'])
                                 b = float(prow['b'])
                                 t0 = float(prow['t0'])
+                                di_new = di
                                 if prob in target_sums and prob in t_index_map:
                                     target = target_sums[prob]
-                                    denom = model_sum(qi, di, b, t0, t_index_map[prob])
-                                    if denom > 0 and target >= 0:
-                                        scale = target / denom
-                                        qi = qi * scale
-                                adjusted_qi.append(qi)
-                            param_df['qi'] = adjusted_qi
+                                    di_new = self._tc_match_di_with_solver(
+                                        qi, di, b, t0, t_index_map[prob], target
+                                    )
+                                adjusted_di.append(di_new)
+                                q_time0.append(self._arps_rate_from_tau(qi, di_new, b, 0.0))
+                                p_arr = np.asarray(l_df[l_df['level_1'] == prob][phase].values, dtype=float)
+                                t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
+                                if len(p_arr) > 0:
+                                    i_peak = int(np.nanargmax(p_arr))
+                                    q_peak.append(float(p_arr[i_peak]))
+                                    t_peak.append(float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan)
+                                else:
+                                    q_peak.append(np.nan)
+                                    t_peak.append(np.nan)
+                                p_list.append(prob)
+                            param_df['di'] = adjusted_di
+                            param_df['rate_t0'] = q_time0
+                            param_df['peak_rate'] = q_peak
+                            param_df['time_to_peak_months'] = t_peak
+                            nom = param_df.apply(lambda x: self._tc_decline_metrics(x.di, x.b), axis=1)
+                            param_df['nominal_initial_monthly_decline'] = [x[0] for x in nom]
+                            param_df['nominal_annual_decline'] = [x[1] for x in nom]
+                            param_df['tangent_effective_decline_pct'] = [x[2] for x in nom]
+                            param_df['secant_effective_decline_pct'] = [x[3] for x in nom]
+                            param_df['phase'] = phase
+                            param_df['probability'] = p_list
                     except Exception:
                         pass
-                    param_df['d0'] = param_df.apply(lambda x: x.di*np.power((1+x.b*x.di*(1-x.t0)),-1), axis=1)
-                    param_df['d0_a'] = param_df.apply(lambda x: x.d0*12, axis=1)
-                    param_df['aries_de'] = param_df.apply(lambda x: (1-np.power((x.d0_a*x.b+1),(-1/x.b)))*100, axis=1)
-                    param_df = param_df.rename(columns={
-                        'qi':f'Actual Initial Rate, volume/month',
-                        'q0':f'DCA Initial Rate, volume/month',
-                        'di':'Nominal Initial Decline at Match Point, fraction/months',
-                        'b':'B Factor, unitless',
-                        't0':'Match Point, months',
-                        'd0':'Nominal Initial Decline at Time Zero, fraction/months',
-                        'd0_a':'Nominal Initial Decline at Time Zero, fraction/years',
-                        'aries_de':'Effective Initial Decline at Time Zero, %/years (FOR ARIES)',
-                        'UID':'Probability',
-                        'phase':'Phase'
+                    param_df = param_df[[
+                        'rate_t0',
+                        'peak_rate',
+                        'time_to_peak_months',
+                        'b',
+                        'nominal_initial_monthly_decline',
+                        'nominal_annual_decline',
+                        'tangent_effective_decline_pct',
+                        'secant_effective_decline_pct',
+                        'phase',
+                        'probability',
+                    ]].rename(columns={
+                        'b': 'matched_b_factor',
                     })
                     if r_df.empty:
                         r_df = param_df
