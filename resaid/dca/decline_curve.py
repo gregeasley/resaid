@@ -22,7 +22,9 @@ from ..dca_constants import DEFAULT_FORECAST_HORIZON_MONTHS, DEFAULT_SOLVER_T_MA
 logger = logging.getLogger(__name__)
 
 # ``decline_curve.fit_method`` / ``dca_params(..., fit_method=...)`` — how each row is fit for qi, di, b, t0.
-DCA_FIT_METHOD_LEGACY = "legacy"
+DCA_FIT_METHOD_DEFAULT = "default"
+# Backward-compatible alias.
+DCA_FIT_METHOD_LEGACY = DCA_FIT_METHOD_DEFAULT
 DCA_FIT_METHOD_MONOTONE_TWO_STEP = "monotone_two_step"
 
 # Keys for ``decline_curve._dca_path_counts`` (per-run summary, reset in vectorized / three-phase).
@@ -39,7 +41,12 @@ DCA_PATH_LEGACY_BACKUP_PRE = "legacy_backup_insufficient_initial_history"
 DCA_PATH_LEGACY_BACKUP_POST = "legacy_backup_insufficient_after_filters"
 DCA_PATH_LEGACY_BACKUP_FIT = "legacy_backup_curve_fit_failed"
 
-# Printed path breakdown is chosen from ``fit_method`` (monotone vs legacy only).
+DCA_LEGACY_ADJ_BULK_DOWNSIDE = "legacy_adj_bulk_downside_or_equal"
+DCA_LEGACY_ADJ_BULK_LOW_B = "legacy_adj_bulk_low_b_upside"
+DCA_LEGACY_ADJ_SOLVED_UPSIDE = "legacy_adj_solved_upside"
+DCA_LEGACY_ADJ_BULK_FALLBACK = "legacy_adj_bulk_upside_solver_fallback"
+
+# Printed path breakdown is chosen from ``fit_method`` (monotone vs default/legacy alias).
 _DCA_PATH_REPORT_MONOTONE = (
     (DCA_PATH_MONOTONE_PRIMARY, "Primary (longest monotone decline segment)"),
     (DCA_PATH_MONOTONE_TAIL, "Fallback (post-trough positive tail, no outlier screen)"),
@@ -81,6 +88,25 @@ _DCA_PATH_REPORT_LEGACY = (
 _ALL_DCA_PATH_COUNT_KEYS = frozenset(
     key for table in (_DCA_PATH_REPORT_MONOTONE, _DCA_PATH_REPORT_LEGACY) for key, _ in table
 )
+_LEGACY_ADJUSTMENT_REPORT = (
+    (
+        DCA_LEGACY_ADJ_BULK_DOWNSIDE,
+        "Bulk shift (L3M actual <= fitted q at latest month)",
+    ),
+    (
+        DCA_LEGACY_ADJ_BULK_LOW_B,
+        "Bulk shift (L3M actual > fitted q, but b < 0.1)",
+    ),
+    (
+        DCA_LEGACY_ADJ_SOLVED_UPSIDE,
+        "Solved qi/di (L3M up case, b >= 0.1, q-match at latest and convergence month)",
+    ),
+    (
+        DCA_LEGACY_ADJ_BULK_FALLBACK,
+        "Bulk shift fallback (up case solver unavailable/non-physical)",
+    ),
+)
+_ALL_LEGACY_ADJUSTMENT_KEYS = frozenset(key for key, _ in _LEGACY_ADJUSTMENT_REPORT)
 
 _decline_solver_type = None
 
@@ -114,10 +140,10 @@ class decline_curve:
         default_b_factor: Default Arps b-factor
         three_phase_mode: Enable three-phase forecasting mode
         fit_method: How ``dca_params`` estimates parameters per row (default
-            ``DCA_FIT_METHOD_LEGACY``; optional ``DCA_FIT_METHOD_MONOTONE_TWO_STEP``).
+            ``DCA_FIT_METHOD_DEFAULT``; optional ``DCA_FIT_METHOD_MONOTONE_TWO_STEP``).
     """
 
-    def __init__(self, fit_method=DCA_FIT_METHOD_LEGACY):
+    def __init__(self, fit_method=DCA_FIT_METHOD_DEFAULT):
         # Constants
         self.DAYS_PER_MONTH = 365/12
         self.GAS_CUTOFF = 3.2  # GOR for classifying well as gas or oil, MSCF/STB
@@ -161,7 +187,9 @@ class decline_curve:
         # Three-phase forecasting mode
         self.three_phase_mode = False
 
-        allowed = (DCA_FIT_METHOD_LEGACY, DCA_FIT_METHOD_MONOTONE_TWO_STEP)
+        if fit_method == "legacy":
+            fit_method = DCA_FIT_METHOD_DEFAULT
+        allowed = (DCA_FIT_METHOD_DEFAULT, DCA_FIT_METHOD_MONOTONE_TWO_STEP)
         if fit_method not in allowed:
             raise ValueError(f"fit_method must be one of {allowed!r}, got {fit_method!r}")
         self.fit_method = fit_method
@@ -719,11 +747,11 @@ class decline_curve:
         backup_path_key=None,
     ):
         """
-        Shared legacy semantics on irrecoverable fit: bump failure count, log if verbose,
+        Shared default-fit semantics on irrecoverable fit: bump failure count, log if verbose,
         then either ``handle_dca_error`` or NaN parameters.
 
         When ``backup_decline`` is True, ``backup_path_key`` selects which resolution path
-        counter to increment (legacy vs monotone backup reasons).
+        counter to increment (default/legacy alias vs monotone backup reasons).
         """
         self.V_DCA_FAILURES += 1
         if self.verbose:
@@ -739,11 +767,17 @@ class decline_curve:
 
     def _reset_dca_run_path_counts(self):
         self._dca_path_counts = {key: 0 for key in _ALL_DCA_PATH_COUNT_KEYS}
+        self._legacy_adjust_counts = {key: 0 for key in _ALL_LEGACY_ADJUSTMENT_KEYS}
 
     def _incr_dca_path(self, path_key):
         d = getattr(self, "_dca_path_counts", None)
         if d is not None and path_key in d:
             d[path_key] += 1
+
+    def _incr_legacy_adjustment(self, adjust_key):
+        d = getattr(self, "_legacy_adjust_counts", None)
+        if d is not None and adjust_key in d:
+            d[adjust_key] += 1
 
     def _print_dca_run_summary(self, heading, attempted, successful, elapsed_sec):
         """Uniform footer for vectorized and three-phase DCA generation."""
@@ -769,7 +803,7 @@ class decline_curve:
         counts = getattr(self, "_dca_path_counts", None) or {}
         path_rows = (
             _DCA_PATH_REPORT_LEGACY
-            if self.fit_method == DCA_FIT_METHOD_LEGACY
+            if self.fit_method == DCA_FIT_METHOD_DEFAULT
             else _DCA_PATH_REPORT_MONOTONE
         )
         print(
@@ -779,6 +813,11 @@ class decline_curve:
         )
         for key, label in path_rows:
             print(f"    - {label}: {counts.get(key, 0)}", file=sf, flush=True)
+        if self.fit_method == DCA_FIT_METHOD_DEFAULT:
+            ac = getattr(self, "_legacy_adjust_counts", None) or {}
+            print("  Legacy post-fit L3M adjustment usage:", file=sf, flush=True)
+            for key, label in _LEGACY_ADJUSTMENT_REPORT:
+                print(f"    - {label}: {ac.get(key, 0)}", file=sf, flush=True)
         print(f"  Wall time: {elapsed_sec:.2f} seconds", file=sf, flush=True)
 
     def _longest_mono_decreasing_span(self, y_vals):
@@ -900,7 +939,7 @@ class decline_curve:
         return uniq
 
     def _refine_di_int_legacy_style(self, ox, oy, di_int, q_max, q_min):
-        """Same di_int recovery logic as legacy ``_dca_params_legacy`` after first estimate."""
+        """Same di_int recovery logic as default fit after first estimate."""
         ox = np.asarray(ox, dtype=float)
         oy = np.asarray(oy, dtype=float)
         di_int = float(di_int)
@@ -1075,7 +1114,7 @@ class decline_curve:
         s["water_ratio"] = water_ratio
         return s
 
-    def _dca_params_legacy(self, s):
+    def _dca_params_default(self, s):
         """Original per-row fit: peak/zero/outlier filtering then ``curve_fit`` on Arps."""
 
         x_vals = s['T_INDEX']
@@ -1216,9 +1255,11 @@ class decline_curve:
                         )
 
                     if not np.isinf(popt[0]):
-
-                        s['qi']=popt[0]
-                        s['di']=popt[1]
+                        adj_qi, adj_di = self._adjust_default_fit_to_recent_l3m(
+                            popt[0], popt[1], popt[2], popt[3], x_vals, y_vals
+                        )
+                        s['qi']=adj_qi
+                        s['di']=adj_di
                         s['b']=popt[2]
                         s['t0']=popt[3]
                         s['q0']=y_vals[0] #Probably will need revision, high chance first value is zero
@@ -1268,6 +1309,10 @@ class decline_curve:
             )
 
         return s
+
+    # Backward-compatible internal alias.
+    def _dca_params_legacy(self, s):
+        return self._dca_params_default(s)
 
     def _dca_params_monotone_two_step(self, s):
         """
@@ -1321,12 +1366,12 @@ class decline_curve:
             fit_method: Override ``self.fit_method`` for this call only. ``None`` uses the instance default.
         """
         method = self.fit_method if fit_method is None else fit_method
-        if method == DCA_FIT_METHOD_LEGACY:
-            return self._dca_params_legacy(s)
+        if method in (DCA_FIT_METHOD_DEFAULT, "legacy"):
+            return self._dca_params_default(s)
         if method == DCA_FIT_METHOD_MONOTONE_TWO_STEP:
             return self._dca_params_monotone_two_step(s)
         raise ValueError(
-            f"Unknown fit_method {method!r}; expected {DCA_FIT_METHOD_LEGACY!r} or {DCA_FIT_METHOD_MONOTONE_TWO_STEP!r}."
+            f"Unknown fit_method {method!r}; expected {DCA_FIT_METHOD_DEFAULT!r} or {DCA_FIT_METHOD_MONOTONE_TWO_STEP!r}."
         )
 
     def vect_generate_params_tc(self,param_df):
@@ -2235,6 +2280,139 @@ class decline_curve:
         """Calculate month difference between two datetime series."""
         return 12 * (a.dt.year - b.dt.year) + (a.dt.month - b.dt.month)
 
+    @staticmethod
+    def _arps_rate_from_tau(qi, di, b, tau):
+        """Arps rate at elapsed months ``tau = t - t0``."""
+        qi = float(qi)
+        di = float(di)
+        b = float(b)
+        tau = float(tau)
+        if not np.isfinite(qi) or not np.isfinite(di) or not np.isfinite(b):
+            return np.nan
+        if qi <= 0 or di <= 0 or b <= 0:
+            return np.nan
+        den = 1.0 + b * di * tau
+        if den <= 0:
+            return np.nan
+        return float(qi / np.power(den, 1.0 / b))
+
+    @staticmethod
+    def _phase_base_qi_from_row(row):
+        """Best available base qi for export rows by phase (with ratio fallbacks)."""
+        phase = str(row.get("MAJOR", "")).upper()
+        if phase == "OIL":
+            return float(row.get("IPO", 0.0))
+        if phase == "GAS":
+            q = float(row.get("IPG", 0.0))
+            if q > 0:
+                return q
+            oil_q = float(row.get("IPO", 0.0))
+            return oil_q * float(row.get("MINOR_RATIO", 0.0))
+        if phase == "WATER":
+            q = float(row.get("IPW", 0.0))
+            if q > 0:
+                return q
+            oil_q = float(row.get("IPO", 0.0))
+            return oil_q * float(row.get("WATER_RATIO", 0.0))
+        return 0.0
+
+    def _export_rate_at_tau(self, row, tau):
+        """Forecast rate at elapsed months tau from fitted parameters."""
+        qi0 = self._phase_base_qi_from_row(row)
+        de = float(row.get("DE", 0.0))
+        b = float(row.get("B", 0.0))
+        q = self._arps_rate_from_tau(qi0, de, b, float(tau))
+        if np.isfinite(q) and q > 0:
+            return float(q)
+        return max(qi0, 0.0)
+
+    def _adjust_default_fit_to_recent_l3m(self, qi, di, b, t0, x_vals, y_vals):
+        """
+        Adjust default-fit ``(qi, di)`` to recent production behavior at fixed ``(b, t0)``.
+
+        Rules:
+        - L3M actual <= fitted q at last t: bulk shift (scale qi only).
+        - L3M actual > fitted q at last t and b < 0.1: bulk shift.
+        - L3M actual > fitted q at last t and b >= 0.1:
+          solve qi/di so q(last_t)=L3M actual and q(2*last_t - t0)=base q at same t.
+        """
+        qi0 = float(qi)
+        di0 = float(di)
+        b0 = float(b)
+        t0 = float(t0)
+        x = np.asarray(x_vals, dtype=float).reshape(-1)
+        y = np.asarray(y_vals, dtype=float).reshape(-1)
+
+        if len(x) == 0 or len(y) == 0:
+            return qi0, di0
+        if not (np.isfinite(qi0) and np.isfinite(di0) and np.isfinite(b0) and np.isfinite(t0)):
+            return qi0, di0
+        if qi0 <= 0 or di0 <= 0 or b0 <= 0:
+            return qi0, di0
+
+        tail = y[np.isfinite(y)][-3:]
+        if len(tail) == 0:
+            return qi0, di0
+        q_actual = float(np.mean(tail))
+        if not np.isfinite(q_actual) or q_actual <= 0:
+            return qi0, di0
+
+        tau1 = float(x[-1] - t0)
+        if not np.isfinite(tau1) or tau1 <= 0:
+            return qi0, di0
+        q_forecast_tau1 = self._arps_rate_from_tau(qi0, di0, b0, tau1)
+        if not np.isfinite(q_forecast_tau1) or q_forecast_tau1 <= 0:
+            return qi0, di0
+
+        # Bulk-shift path: preserve decline shape, scale qi to hit L3M target now.
+        scale = q_actual / q_forecast_tau1
+        qi_bulk = qi0 * scale if np.isfinite(scale) and scale > 0 else qi0
+        di_bulk = di0
+
+        if q_actual <= q_forecast_tau1:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_DOWNSIDE)
+            return float(qi_bulk), float(di_bulk)
+        if b0 < 0.1:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_LOW_B)
+            return float(qi_bulk), float(di_bulk)
+
+        tau2 = 2.0 * tau1
+        q_base_tau2 = self._arps_rate_from_tau(qi0, di0, b0, tau2)
+        if not np.isfinite(q_base_tau2) or q_base_tau2 <= 0:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_FALLBACK)
+            return float(qi_bulk), float(di_bulk)
+
+        ratio = q_actual / q_base_tau2
+        if not np.isfinite(ratio) or ratio <= 0:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_FALLBACK)
+            return float(qi_bulk), float(di_bulk)
+        # Let R = (q(tau1)/q(tau2))^b.
+        # Then R = (1 + b*di*tau2) / (1 + b*di*tau1), so:
+        # di = (1 - R) / (b * (R*tau1 - tau2)).
+        R = np.power(ratio, b0)
+        num = 1.0 - R
+        den = b0 * (R * tau1 - tau2)
+        if not np.isfinite(den) or abs(den) <= 1e-12:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_FALLBACK)
+            return float(qi_bulk), float(di_bulk)
+
+        di1 = num / den
+        den_tau1 = 1.0 + b0 * di1 * tau1
+        if not np.isfinite(di1) or di1 <= 0 or den_tau1 <= 0:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_FALLBACK)
+            return float(qi_bulk), float(di_bulk)
+
+        qi1 = q_actual * np.power(den_tau1, 1.0 / b0)
+        if not np.isfinite(qi1) or qi1 <= 0:
+            self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_FALLBACK)
+            return float(qi_bulk), float(di_bulk)
+        self._incr_legacy_adjustment(DCA_LEGACY_ADJ_SOLVED_UPSIDE)
+        return float(qi1), float(di1)
+
+    # Backward-compatible internal alias.
+    def _adjust_legacy_fit_to_recent_l3m(self, qi, di, b, t0, x_vals, y_vals):
+        return self._adjust_default_fit_to_recent_l3m(qi, di, b, t0, x_vals, y_vals)
+
     def qi_overwrite(self):
         """
         Calculate 3-month average production rates for initial rate estimation.
@@ -2320,6 +2498,9 @@ class decline_curve:
         oneline_df['revised_dt'] = self.month_diff(oneline_df['L3M_START'], oneline_df['T0'])
         oneline_df['revised_ai'] = oneline_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
         oneline_df['revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['revised_ai']*12)*x['B']+1),(-1/x['B'])))*100, axis=1)
+        oneline_df['forecast_major_rate'] = oneline_df.apply(
+            lambda r: self._export_rate_at_tau(r, r['revised_dt']), axis=1
+        )
         
         # Create output directory if it doesn't exist
         import os
@@ -2339,12 +2520,12 @@ class decline_curve:
                     start_line = start+start_padding+scenario
                     
                     if major_phase == 'OIL':
-                        major_val = round(row['L3M_OIL'],0)
+                        major_val = round(row['forecast_major_rate'],0)
                         major_units = "B/M"
                         minor = "  GAS/OIL".ljust(13) + f"{round(row['MINOR_RATIO'],3)} X M/B TO LIFE LIN TIME"
                         water = "  WTR/OIL".ljust(13) + f"{round(row['WATER_RATIO'],3)} X B/B TO LIFE LIN TIME"
                     else:
-                        major_val = round(row['L3M_GAS'],0)
+                        major_val = round(row['forecast_major_rate'],0)
                         major_units = "M/M"
                         minor = "  OIL/GAS".ljust(13) + f"{round(row['MINOR_RATIO'],3)} X B/M TO LIFE LIN TIME"
                         water = "  WTR/GAS".ljust(13) + f"{round(row['WATER_RATIO'],3)} X B/M TO LIFE LIN TIME"
@@ -2803,8 +2984,11 @@ class decline_curve:
         combined_df['revised_ai'] = combined_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
         combined_df['revised_aries_de'] = combined_df.apply(lambda x: (1-np.power(((x['revised_ai']*12)*x['B']+1),(-1/x['B'])))*100, axis=1)
         
-        # Calculate used IP based on major phase
-        combined_df['used_ip'] = combined_df.apply(lambda row: row[f"L3M_{row['MAJOR']}"], axis=1)
+        # Calculate used IP from fitted curve at export start date.
+        combined_df['used_ip'] = combined_df.apply(
+            lambda r: self._export_rate_at_tau(r, r['revised_dt']),
+            axis=1,
+        )
         
         # Format for Mosaic
         output_df = combined_df.rename(columns={
@@ -3012,19 +3196,10 @@ class decline_curve:
         # Convert to PhdWin decline rate format (percentage per year)
         tc_df['ARIES_DE'] = tc_df.apply(lambda x: 100*(1-np.exp(-x['revised_de']*12)), axis=1)
         
-        # Use direct L3M average as QI (no complex revisions)
-        tc_df['revised_qi'] = np.where(
-            tc_df['MAJOR'] == 'OIL',
-            tc_df['L3M_OIL'],
-            np.where(
-                tc_df['MAJOR'] == 'GAS',
-                tc_df['L3M_GAS'],
-                np.where(
-                    tc_df['MAJOR'] == 'WATER',
-                    tc_df['L3M_WATER'],
-                    0
-                )
-            )
+        # Use fitted curve rate at export start date (middle of last 3 months).
+        tc_df['revised_qi'] = tc_df.apply(
+            lambda r: self._export_rate_at_tau(r, r['revised_dt']),
+            axis=1,
         )
         
         # Format for PhdWin
