@@ -2072,6 +2072,36 @@ class decline_curve:
         return di_guess
 
     @staticmethod
+    def _tc_rate_at_t0_from_curve(t_arr, q_arr, t0):
+        """
+        Rate from a typecurve quantile/mean series at fitted ``t0``.
+
+        Uses the empirical probability curve (not Arps back-projection via ``qi``).
+        """
+        t_arr = np.asarray(t_arr, dtype=float).reshape(-1)
+        q_arr = np.asarray(q_arr, dtype=float).reshape(-1)
+        t0 = float(t0)
+        if len(t_arr) == 0 or len(q_arr) == 0 or not np.isfinite(t0):
+            return np.nan
+        n = min(len(t_arr), len(q_arr))
+        t_arr = t_arr[:n]
+        q_arr = q_arr[:n]
+        valid = np.isfinite(t_arr) & np.isfinite(q_arr)
+        t_arr = t_arr[valid]
+        q_arr = q_arr[valid]
+        if len(t_arr) == 0:
+            return np.nan
+        exact = np.isclose(t_arr, t0)
+        if np.any(exact):
+            return float(q_arr[exact][0])
+        order = np.argsort(t_arr)
+        t_sorted = t_arr[order]
+        q_sorted = q_arr[order]
+        if t0 < t_sorted[0] or t0 > t_sorted[-1]:
+            return np.nan
+        return float(np.interp(t0, t_sorted, q_sorted))
+
+    @staticmethod
     def _tc_decline_metrics(di, b):
         """Return nominal/tangent/secant decline metrics from monthly nominal di."""
         di = float(di)
@@ -2158,9 +2188,9 @@ class decline_curve:
                                     qi, di, b, t0, t_index_map[prob], target
                                 )
                             adjusted_di.append(di_new)
-                            q_time0.append(self._arps_rate_from_tau(qi, di_new, b, 0.0))
                             p_arr = np.asarray(l_df[l_df['level_1'] == prob][major].values, dtype=float)
                             t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
+                            q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr, t0))
                             if len(p_arr) > 0:
                                 i_peak = int(np.nanargmax(p_arr))
                                 q_peak.append(float(p_arr[i_peak]))
@@ -2281,9 +2311,9 @@ class decline_curve:
                                         qi, di, b, t0, t_index_map[prob], target
                                     )
                                 adjusted_di.append(di_new)
-                                q_time0.append(self._arps_rate_from_tau(qi, di_new, b, 0.0))
                                 p_arr = np.asarray(l_df[l_df['level_1'] == prob][phase].values, dtype=float)
                                 t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
+                                q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr, t0))
                                 if len(p_arr) > 0:
                                     i_peak = int(np.nanargmax(p_arr))
                                     q_peak.append(float(p_arr[i_peak]))
