@@ -333,6 +333,9 @@ class decline_curve:
     def generate_t_index(self):
         """Generate time index for production data."""
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
+        self._dataframe = self._dataframe.sort_values(
+            [self._uid_col, self._date_col]
+        ).reset_index(drop=True)
         min_by_well = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
         min_by_well = min_by_well.rename(columns={self._date_col:'MIN_DATE'})
         
@@ -779,6 +782,53 @@ class decline_curve:
         if d is not None and adjust_key in d:
             d[adjust_key] += 1
 
+    def _sort_well_series_by_t_index(self, s):
+        """Ensure per-well list columns are ordered by T_INDEX (chronological)."""
+        x_vals = s["T_INDEX"]
+        if len(x_vals) <= 1 or np.all(np.diff(x_vals) >= 0):
+            return s
+
+        logger.warning(
+            "Well %s: T_INDEX not monotonic — sorting by T_INDEX",
+            s["UID"],
+        )
+        order = np.argsort(x_vals)
+        s = s.copy()
+        for col in ("T_INDEX", "NORMALIZED_OIL", "NORMALIZED_GAS", "NORMALIZED_WATER"):
+            if col in s.index:
+                vals = s[col]
+                if isinstance(vals, list):
+                    s[col] = [vals[i] for i in order]
+        return s
+
+    def _raise_if_all_dca_failed(self, attempted, successful):
+        if attempted > 0 and successful == 0:
+            failures = getattr(self, "V_DCA_FAILURES", attempted)
+            raise ValueError(
+                f"DCA produced no valid parameters for any of {attempted} well(s) "
+                f"({failures} failures). A common cause is unsorted production dates "
+                f"per well — sort input by [{self._uid_col}, {self._date_col}] "
+                f"before calling resaid, or rely on generate_t_index() sorting."
+            )
+
+    def _require_valid_t0_params(self, df):
+        if df.empty:
+            failures = getattr(self, "V_DCA_FAILURES", "unknown")
+            raise ValueError(
+                f"DCA produced no valid t0 values for any well ({failures} failures). "
+                f"Check that production dates are sorted by [{self._uid_col}, "
+                f"{self._date_col}] per well and review data quality."
+            )
+
+    def _compute_t0_date_column(self, df):
+        return pd.Series(
+            [
+                self.add_months(min_date, round(t0, 0))
+                for min_date, t0 in zip(df["MIN_DATE"], df["t0"])
+            ],
+            index=df.index,
+        )
+
     def _print_dca_run_summary(self, heading, attempted, successful, elapsed_sec):
         """Uniform footer for vectorized and three-phase DCA generation."""
         sf = self.STAT_FILE
@@ -1117,6 +1167,7 @@ class decline_curve:
     def _dca_params_default(self, s):
         """Original per-row fit: peak/zero/outlier filtering then ``curve_fit`` on Arps."""
 
+        s = self._sort_well_series_by_t_index(s)
         x_vals = s['T_INDEX']
 
         if s['MAJOR'] == 'OIL':
@@ -1142,7 +1193,8 @@ class decline_curve:
                 indexMin = 0
                 t0Max = x_vals[indexMax]
                 t0Min = x_vals[indexMin]
-            
+
+            t0Min, t0Max = min(t0Min, t0Max), max(t0Min, t0Max)
 
             filtered_x = np.array(x_vals[indexMin:])
             filtered_y = np.array(y_vals[indexMin:])
@@ -1321,6 +1373,7 @@ class decline_curve:
         outlier filtering, then first-positive span). Uses the same terminal backup
         semantics as legacy via ``_dca_failure_finish`` / ``handle_dca_error``.
         """
+        s = self._sort_well_series_by_t_index(s)
         x_vals = np.asarray(s["T_INDEX"], dtype=float)
 
         if s["MAJOR"] == "OIL":
@@ -1386,6 +1439,7 @@ class decline_curve:
             'WATER':'NORMALIZED_WATER',
             'level_1':'UID'
         })
+        param_df = param_df.sort_values(['UID', 'T_INDEX'])
 
         imploded_df = param_df[[
             'UID',
@@ -1432,7 +1486,8 @@ class decline_curve:
         self._reset_dca_run_path_counts()
         l_start = time.time()
 
-        imploded_df = self._normalized_dataframe[[
+        norm_df = self._normalized_dataframe.sort_values(['UID', 'T_INDEX'])
+        imploded_df = norm_df[[
             'UID',
             'MAJOR',
             'HOLE_DIRECTION',
@@ -1458,6 +1513,7 @@ class decline_curve:
         imploded_df = imploded_df.progress_apply(self.dca_params, axis=1)
         attempted = len(imploded_df)
         successful = int(imploded_df["qi"].notna().sum())
+        self._raise_if_all_dca_failed(attempted, successful)
 
         imploded_df = imploded_df[[
             'UID',
@@ -1560,7 +1616,10 @@ class decline_curve:
                 phases_to_analyze.append('WATER')
 
             # Get well data for this UID
-            well_data = self._normalized_dataframe[self._normalized_dataframe['UID'] == uid]
+            well_data = (
+                self._normalized_dataframe[self._normalized_dataframe['UID'] == uid]
+                .sort_values('T_INDEX')
+            )
 
             for phase in phases_to_analyze:
                 # Create a temporary dataframe for this phase-well combination
@@ -1634,6 +1693,7 @@ class decline_curve:
 
         l_duration = time.time() - l_start
         successful = len(imploded_df)
+        self._raise_if_all_dca_failed(total_operations, successful)
         self._print_dca_run_summary(
             "DCA summary (three-phase mode)",
             total_operations,
@@ -1700,8 +1760,8 @@ class decline_curve:
         self._params_dataframe = self._params_dataframe.replace([np.inf, -np.inf], np.nan)
 
         self._params_dataframe = self._params_dataframe.dropna(subset='t0')
-
-        self._params_dataframe['T0_DATE'] =  self._params_dataframe.apply(lambda row: self.add_months(row["MIN_DATE"], round(row["t0"],0)), axis = 1)
+        self._require_valid_t0_params(self._params_dataframe)
+        self._params_dataframe['T0_DATE'] = self._compute_t0_date_column(self._params_dataframe)
 
         flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','T0_DATE','minor_ratio','water_ratio']].copy()
 
@@ -1763,7 +1823,8 @@ class decline_curve:
         params_with_dates = self._params_dataframe.merge(min_df, left_on='UID', right_on='UID')
         params_with_dates = params_with_dates.replace([np.inf, -np.inf], np.nan)
         params_with_dates = params_with_dates.dropna(subset='t0')
-        params_with_dates['T0_DATE'] = params_with_dates.apply(lambda row: self.add_months(row["MIN_DATE"], round(row["t0"],0)), axis = 1)
+        self._require_valid_t0_params(params_with_dates)
+        params_with_dates['T0_DATE'] = self._compute_t0_date_column(params_with_dates)
 
         # Create oneline data for each well
         well_summaries = []
@@ -2375,6 +2436,7 @@ class decline_curve:
             'WATER':'NORMALIZED_WATER',
             'level_1':'UID'
         })
+        param_df = param_df.sort_values(['UID', 'T_INDEX'])
 
         # Create a temporary dataframe for this phase
         temp_df = param_df[[
