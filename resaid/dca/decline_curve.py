@@ -2082,12 +2082,12 @@ class decline_curve:
         """
         Typecurve-only flowstream: historical rates overlaid on forecast.
 
-        Prefers historical OIL/GAS/WATER at matching ``(UID, T_INDEX)`` where present
-        and non-NA; keeps forecast elsewhere. Does not mutate ``_flowstream_dataframe``.
+        Prefers historical OIL/GAS/WATER where present and non-NA; keeps forecast
+        elsewhere. Does not mutate ``_flowstream_dataframe``.
 
-        Historical ``T_INDEX`` from ``month_diff`` starts at 0; forecast starts at 1.
-        Join is exact on ``T_INDEX`` only (no remap). Month-0 history with no forecast
-        row is omitted — the forecast grid stays authoritative.
+        Historical ``T_INDEX`` from ``month_diff`` starts at 0; forecast / typecurve
+        grid starts at 1. Historical indexes are shifted by +1 before joining so
+        first producing month overlays typecurve time zero (``T_INDEX=1``).
         """
         forecast = (
             self._flowstream_dataframe
@@ -2119,6 +2119,9 @@ class decline_curve:
                 'NORMALIZED_WATER': 'WATER',
             })
 
+        # Align well-life month 0 (history) to forecast/typecurve T_INDEX=1.
+        actual_df = actual_df.copy()
+        actual_df['T_INDEX'] = actual_df['T_INDEX'] + 1
         actual_df = actual_df.groupby(['UID', 'T_INDEX'], as_index=False)[['OIL', 'GAS', 'WATER']].sum()
 
         forecast = forecast.set_index(['UID', 'T_INDEX'])

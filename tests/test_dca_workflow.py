@@ -106,11 +106,11 @@ def test_typecurve_overlays_history_without_mutating_flowstream(combined_dca_dat
     dca.generate_flowstream(denormalize=True)
     flow_before = dca._flowstream_dataframe.copy()
 
-    # Force history at a forecast T_INDEX to differ from Arps forecast
+    # Force first producing month (hist T_INDEX=0 → overlay T_INDEX=1) above forecast
     hist_mask = (dca._dataframe[dca._uid_col] == dca._dataframe[dca._uid_col].iloc[0]) & (
-        dca._dataframe["T_INDEX"] == 1
+        dca._dataframe["T_INDEX"] == 0
     )
-    assert hist_mask.any(), "expected historical row at T_INDEX=1"
+    assert hist_mask.any(), "expected historical row at T_INDEX=0"
     uid = dca._dataframe.loc[hist_mask, dca._uid_col].iloc[0]
     bumped = float(dca._dataframe.loc[hist_mask, dca._oil_col].iloc[0]) + 1_000_000.0
     dca._dataframe.loc[hist_mask, dca._oil_col] = bumped
