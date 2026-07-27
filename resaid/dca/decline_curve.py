@@ -2063,7 +2063,7 @@ class decline_curve:
 
 
     def generate_typecurve(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, prob_levels=[.1,.5,.9], _verbose=False, return_params=False):
-        if self._flowstream_dataframe == None:
+        if self._flowstream_dataframe is None:
             self.generate_flowstream(num_months=num_months,denormalize=denormalize, _verbose=_verbose)
         if self._oneline.empty:
             if self._params_dataframe.empty:
@@ -2077,6 +2077,56 @@ class decline_curve:
             self._generate_typecurve_three_phase(num_months, denormalize, prob_levels, _verbose, return_params)
         else:
             self._generate_typecurve_original(num_months, denormalize, prob_levels, _verbose, return_params)
+
+    def _build_typecurve_flowstream(self, denormalize):
+        """
+        Typecurve-only flowstream: historical rates overlaid on forecast.
+
+        Prefers historical OIL/GAS/WATER at matching ``(UID, T_INDEX)`` where present
+        and non-NA; keeps forecast elsewhere. Does not mutate ``_flowstream_dataframe``.
+
+        Historical ``T_INDEX`` from ``month_diff`` starts at 0; forecast starts at 1.
+        Join is exact on ``T_INDEX`` only (no remap). Month-0 history with no forecast
+        row is omitted — the forecast grid stays authoritative.
+        """
+        forecast = (
+            self._flowstream_dataframe
+            .reset_index()[['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER']]
+            .copy()
+        )
+
+        if denormalize:
+            actual_df = self._dataframe[
+                [self._uid_col, 'T_INDEX', self._oil_col, self._gas_col, self._water_col]
+            ].copy()
+            actual_df = actual_df.rename(columns={
+                self._uid_col: 'UID',
+                self._oil_col: 'OIL',
+                self._gas_col: 'GAS',
+                self._water_col: 'WATER',
+            })
+        else:
+            actual_df = self._normalized_dataframe[[
+                'UID',
+                'T_INDEX',
+                'NORMALIZED_OIL',
+                'NORMALIZED_GAS',
+                'NORMALIZED_WATER',
+            ]].copy()
+            actual_df = actual_df.rename(columns={
+                'NORMALIZED_OIL': 'OIL',
+                'NORMALIZED_GAS': 'GAS',
+                'NORMALIZED_WATER': 'WATER',
+            })
+
+        actual_df = actual_df.groupby(['UID', 'T_INDEX'], as_index=False)[['OIL', 'GAS', 'WATER']].sum()
+
+        forecast = forecast.set_index(['UID', 'T_INDEX'])
+        actual_df = actual_df.set_index(['UID', 'T_INDEX'])
+        # History wins on overlap; forecast fills gaps. Restrict to forecast index.
+        overlay = actual_df.reindex(forecast.index).combine_first(forecast)
+
+        return overlay.reset_index()[['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER']]
 
     @staticmethod
     def _tc_model_sum(qi, di, b, t0, t_arr):
@@ -2133,16 +2183,21 @@ class decline_curve:
         return di_guess
 
     @staticmethod
-    def _tc_rate_at_t0_from_curve(t_arr, q_arr, t0):
+    def _tc_rate_at_t0_from_curve(t_arr, q_arr, t0=None):
         """
-        Rate from a typecurve quantile/mean series at fitted ``t0``.
+        Empirical rate on a typecurve quantile/mean series at time zero.
 
-        Uses the empirical probability curve (not Arps back-projection via ``qi``).
+        ``rate_t0`` is the actual curve rate at the start of the probability
+        series (minimum ``T_INDEX``), not the Arps-fitted ``t0`` and not a
+        back-projected ``qi``. ``_force_t0`` only constrains the Arps fit.
+
+        If ``t0`` is provided it is treated as an explicit lookup time (exact
+        match or linear interpolation); otherwise the first chronological
+        point on the curve is used.
         """
         t_arr = np.asarray(t_arr, dtype=float).reshape(-1)
         q_arr = np.asarray(q_arr, dtype=float).reshape(-1)
-        t0 = float(t0)
-        if len(t_arr) == 0 or len(q_arr) == 0 or not np.isfinite(t0):
+        if len(t_arr) == 0 or len(q_arr) == 0:
             return np.nan
         n = min(len(t_arr), len(q_arr))
         t_arr = t_arr[:n]
@@ -2152,12 +2207,15 @@ class decline_curve:
         q_arr = q_arr[valid]
         if len(t_arr) == 0:
             return np.nan
-        exact = np.isclose(t_arr, t0)
-        if np.any(exact):
-            return float(q_arr[exact][0])
         order = np.argsort(t_arr)
         t_sorted = t_arr[order]
         q_sorted = q_arr[order]
+        if t0 is None or (isinstance(t0, float) and not np.isfinite(t0)):
+            return float(q_sorted[0])
+        t0 = float(t0)
+        exact = np.isclose(t_sorted, t0)
+        if np.any(exact):
+            return float(q_sorted[exact][0])
         if t0 < t_sorted[0] or t0 > t_sorted[-1]:
             return np.nan
         return float(np.interp(t0, t_sorted, q_sorted))
@@ -2178,22 +2236,20 @@ class decline_curve:
 
     def _generate_typecurve_original(self, num_months, denormalize, prob_levels, _verbose, return_params):
         """Original typecurve generation using major phase with ratios"""
-        return_df = self._flowstream_dataframe.reset_index()
-        
+        tc_flow = self._build_typecurve_flowstream(denormalize)
+
         if self.debug_on:
-            return_df.to_csv('outputs/test_quantiles.csv')
-        
+            tc_flow.to_csv('outputs/test_quantiles.csv')
+
         # Ensure T_INDEX is a column before grouping (it may be an index)
         return_df = (
-            self._flowstream_dataframe
-                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+            tc_flow[['T_INDEX','OIL','GAS','WATER']]
                 .groupby('T_INDEX')
                 .quantile(prob_levels)
                 .reset_index()
         )
         avg_df = (
-            self._flowstream_dataframe
-                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+            tc_flow[['T_INDEX','OIL','GAS','WATER']]
                 .groupby('T_INDEX')
                 .mean()
                 .reset_index()
@@ -2251,7 +2307,8 @@ class decline_curve:
                             adjusted_di.append(di_new)
                             p_arr = np.asarray(l_df[l_df['level_1'] == prob][major].values, dtype=float)
                             t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
-                            q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr, t0))
+                            # Time-zero rate on the probability curve (not fitted Arps t0).
+                            q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr))
                             if len(p_arr) > 0:
                                 i_peak = int(np.nanargmax(p_arr))
                                 q_peak.append(float(p_arr[i_peak]))
@@ -2306,23 +2363,21 @@ class decline_curve:
 
     def _generate_typecurve_three_phase(self, num_months, denormalize, prob_levels, _verbose, return_params):
         """Three-phase typecurve generation with independent decline curves for each phase"""
-        return_df = self._flowstream_dataframe.reset_index()
-        
+        tc_flow = self._build_typecurve_flowstream(denormalize)
+
         if self.debug_on:
-            return_df.to_csv('outputs/test_quantiles.csv')
-        
+            tc_flow.to_csv('outputs/test_quantiles.csv')
+
         # Calculate quantiles and mean for each phase independently
         # Ensure T_INDEX is a column before grouping (it may be an index)
         return_df = (
-            self._flowstream_dataframe
-                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+            tc_flow[['T_INDEX','OIL','GAS','WATER']]
                 .groupby('T_INDEX')
                 .quantile(prob_levels)
                 .reset_index()
         )
         avg_df = (
-            self._flowstream_dataframe
-                .reset_index()[['T_INDEX','OIL','GAS','WATER']]
+            tc_flow[['T_INDEX','OIL','GAS','WATER']]
                 .groupby('T_INDEX')
                 .mean()
                 .reset_index()
@@ -2374,7 +2429,8 @@ class decline_curve:
                                 adjusted_di.append(di_new)
                                 p_arr = np.asarray(l_df[l_df['level_1'] == prob][phase].values, dtype=float)
                                 t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
-                                q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr, t0))
+                                # Time-zero rate on the probability curve (not fitted Arps t0).
+                                q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr))
                                 if len(p_arr) > 0:
                                     i_peak = int(np.nanargmax(p_arr))
                                     q_peak.append(float(p_arr[i_peak]))
