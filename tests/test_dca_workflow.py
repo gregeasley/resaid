@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -178,3 +179,60 @@ def test_tc_params_rate_t0_is_curve_time_zero(combined_dca_dataframe: pd.DataFra
     assert (oil_params["time_to_peak_months"] > t_min).any()
     late_rows = oil_params[oil_params["time_to_peak_months"] > t_min]
     assert (late_rows["rate_t0"] != late_rows["peak_rate"]).all()
+
+
+def test_tc_exponential_ramp_prepeak_volume():
+    from resaid.dca.decline_curve import decline_curve as DC
+
+    # 3 pre-peak months from 100 at t=1 to 800 at t=4
+    # q(1)=100, q(2)=100*(8)^(1/3), q(3)=100*(8)^(2/3)
+    vol = DC._tc_exponential_ramp_prepeak_volume(100.0, 800.0, 1.0, 4.0)
+    expected = 100.0 + 100.0 * (8.0 ** (1.0 / 3.0)) + 100.0 * (8.0 ** (2.0 / 3.0))
+    assert vol == pytest.approx(expected, rel=1e-12)
+
+    assert DC._tc_exponential_ramp_prepeak_volume(100.0, 800.0, 4.0, 4.0) == 0.0
+
+    t = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    q = np.array([100.0, 200.0, 400.0, 800.0, 100.0])  # sum=1600
+    target = DC._tc_postpeak_eur_target(t, q, 100.0, 800.0, 4.0)
+    assert target == pytest.approx(1600.0 - expected, rel=1e-12)
+
+
+def test_typecurve_p90_decline_not_degenerate():
+    """P90 oil TC decline should fit from peak forward, not blow up di."""
+    raw = pd.read_csv("ignore_samples/test_data_raw.csv")
+    raw["ProducingMonth"] = pd.to_datetime(raw["ProducingMonth"])
+    raw = raw.rename(
+        columns={
+            "Oil": "LiquidsProd_BBL",
+            "Gas": "GasProd_MCF",
+            "Water": "WaterProd_BBL",
+            "Lateral Length": "LateralLength_FT",
+        }
+    )
+    raw["MAJOR"] = "OIL"
+
+    dca = decline_curve()
+    dca.backup_decline = True
+    dca.STANDARD_LENGTH = 10000
+    dca.DEFAULT_B = 0.99
+    dca.dataframe = raw
+    dca.date_col = "ProducingMonth"
+    dca.phase_col = "MAJOR"
+    dca.length_col = "LateralLength_FT"
+    dca.uid_col = "API_UWI"
+    dca.oil_col = "LiquidsProd_BBL"
+    dca.gas_col = "GasProd_MCF"
+    dca.water_col = "WaterProd_BBL"
+    dca.min_h_b = 0.7
+    dca.max_h_b = 1.2
+    dca.OUTLIER_CORRECTION = False
+    dca.three_phase_mode = True
+    dca.generate_typecurve(return_params=True, num_months=120)
+
+    oil = dca.tc_params[dca.tc_params["phase"] == "OIL"]
+    p90 = oil[oil["probability"] == 0.9].iloc[0]
+    assert p90["time_to_peak_months"] >= 1
+    assert p90["nominal_initial_monthly_decline"] < 1.0
+    assert p90["secant_effective_decline_pct"] < 99.0
+    assert p90["peak_rate"] > p90["rate_t0"]

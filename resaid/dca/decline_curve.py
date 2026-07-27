@@ -1232,9 +1232,27 @@ class decline_curve:
                 )
 
             if self._force_t0:
-                outliered_x = x_vals
-                outliered_y = y_vals
-
+                # Typecurve fit: decline from empirical peak forward only.
+                # Do not fit the pre-peak ramp; pin t0 near peak; weight near-peak points highest.
+                x_arr = np.asarray(x_vals, dtype=float)
+                y_arr = np.asarray(y_vals, dtype=float)
+                finite = np.isfinite(x_arr) & np.isfinite(y_arr)
+                x_arr = x_arr[finite]
+                y_arr = y_arr[finite]
+                if len(y_arr) == 0:
+                    return self._dca_failure_finish(
+                        s,
+                        x_vals,
+                        y_vals,
+                        note_print="Insufficient data before filtering, well: " + str(s["UID"]),
+                        backup_path_key=DCA_PATH_LEGACY_BACKUP_PRE,
+                    )
+                i_peak = int(np.nanargmax(y_arr))
+                outliered_x = x_arr[i_peak:]
+                outliered_y = y_arr[i_peak:]
+                # Pin decline start to the empirical peak (strictly increasing bounds for curve_fit).
+                t0Min = float(outliered_x[0])
+                t0Max = t0Min + 1e-3
             
 
             if len(outliered_x) > 3:
@@ -1260,11 +1278,13 @@ class decline_curve:
                     bMax = self.max_h_b
 
                 if self._force_t0:
-                    weight_range = [1 for _ in range(1,len(outliered_x)+1)]
-                    di_min = .01
-                    di_max = .9
-                    t0Min = 1
-                    t0Max = 2
+                    # curve_fit sigma is uncertainty (larger => less weight).
+                    # Use increasing sigma so the peak (first point) is honored most.
+                    weight_range = list(range(1, len(outliered_x) + 1))
+                    di_min = max(di_int / 2.0, 0.01) if np.isfinite(di_int) and di_int > 0 else 0.01
+                    di_max = min(di_int * 2.0, 0.9) if np.isfinite(di_int) and di_int > 0 else 0.9
+                    if di_min >= di_max:
+                        di_min, di_max = 0.01, 0.9
                 else:
                     di_min = di_int/2
                     di_max = di_int*2
@@ -1307,20 +1327,25 @@ class decline_curve:
                         )
 
                     if not np.isinf(popt[0]):
-                        adj_qi, adj_di = self._adjust_default_fit_to_recent_l3m(
-                            popt[0], popt[1], popt[2], popt[3], x_vals, y_vals
-                        )
-                        s['qi']=adj_qi
-                        s['di']=adj_di
-                        s['b']=popt[2]
-                        s['t0']=popt[3]
+                        if self._force_t0:
+                            # Keep peak-forward Arps params; L3M well adjustment is for well DCA only.
+                            s['qi'] = popt[0]
+                            s['di'] = popt[1]
+                            s['b'] = popt[2]
+                            s['t0'] = popt[3]
+                            self._incr_dca_path(DCA_PATH_LEGACY_FORCE_T0)
+                        else:
+                            adj_qi, adj_di = self._adjust_default_fit_to_recent_l3m(
+                                popt[0], popt[1], popt[2], popt[3], x_vals, y_vals
+                            )
+                            s['qi'] = adj_qi
+                            s['di'] = adj_di
+                            s['b'] = popt[2]
+                            s['t0'] = popt[3]
+                            self._incr_dca_path(DCA_PATH_LEGACY_PRIMARY)
                         s['q0']=y_vals[0] #Probably will need revision, high chance first value is zero
                         s['minor_ratio']=minor_ratio
                         s['water_ratio']=water_ratio
-                        if self._force_t0:
-                            self._incr_dca_path(DCA_PATH_LEGACY_FORCE_T0)
-                        else:
-                            self._incr_dca_path(DCA_PATH_LEGACY_PRIMARY)
                     else:
                         return self._dca_failure_finish(
                             s,
@@ -2150,6 +2175,65 @@ class decline_curve:
             q = qi * np.power(den, -1.0 / b)
         return float(np.nansum(q))
 
+    @staticmethod
+    def _tc_exponential_ramp_prepeak_volume(rate_t0, peak_rate, t_start, t_peak):
+        """
+        Pre-peak volume assuming an exponential ramp from ``rate_t0`` at ``t_start``
+        to ``peak_rate`` at ``t_peak`` (peak month excluded — that starts Arps).
+
+        Discrete monthly rates for ``t`` in ``[t_start, t_peak)``:
+        ``q(t) = rate_t0 * (peak_rate / rate_t0) ** ((t - t_start) / (t_peak - t_start))``.
+        """
+        rate_t0 = float(rate_t0)
+        peak_rate = float(peak_rate)
+        t_start = float(t_start)
+        t_peak = float(t_peak)
+        if not (np.isfinite(rate_t0) and np.isfinite(peak_rate) and np.isfinite(t_start) and np.isfinite(t_peak)):
+            return 0.0
+        if t_peak <= t_start:
+            return 0.0
+        if rate_t0 <= 0 or peak_rate <= 0:
+            return 0.0
+
+        # Integer month indexes covering [t_start, t_peak)
+        t_months = np.arange(np.floor(t_start), np.ceil(t_peak), dtype=float)
+        t_months = t_months[(t_months >= t_start - 1e-12) & (t_months < t_peak - 1e-12)]
+        if len(t_months) == 0:
+            return 0.0
+
+        span = t_peak - t_start
+        frac = (t_months - t_start) / span
+        if np.isclose(rate_t0, peak_rate):
+            q = np.full_like(t_months, rate_t0, dtype=float)
+        else:
+            q = rate_t0 * np.power(peak_rate / rate_t0, frac)
+        return float(np.nansum(q))
+
+    @staticmethod
+    def _tc_postpeak_eur_target(t_arr, q_arr, rate_t0, peak_rate, t_peak):
+        """
+        Post-peak EUR target for decline matching:
+        ``sum(full curve) - exponential_ramp_prepeak(rate_t0 -> peak_rate)``.
+        """
+        t_arr = np.asarray(t_arr, dtype=float).reshape(-1)
+        q_arr = np.asarray(q_arr, dtype=float).reshape(-1)
+        n = min(len(t_arr), len(q_arr))
+        if n == 0:
+            return 0.0
+        t_arr = t_arr[:n]
+        q_arr = q_arr[:n]
+        total = float(np.nansum(q_arr))
+        t_start = float(np.nanmin(t_arr))
+        prepeak = decline_curve._tc_exponential_ramp_prepeak_volume(
+            rate_t0, peak_rate, t_start, t_peak
+        )
+        target = total - prepeak
+        if not np.isfinite(target) or target <= 0:
+            # Fallback: actual post-peak volumes on the curve
+            post = q_arr[t_arr >= float(t_peak) - 1e-12]
+            target = float(np.nansum(post))
+        return max(target, 0.0)
+
     def _tc_match_di_with_solver(self, qi, di_guess, b, t0, t_arr, target_sum):
         """
         Keep ``qi,b,t0`` fixed and use ``decline_solver`` to match EUR-like target by
@@ -2278,17 +2362,6 @@ class decline_curve:
                 param_df['probability'] = param_df['UID']
                 # Match EUR-like target by adjusting decline rate via solver (keep qi fixed).
                 try:
-                    # Extract available probability levels present in return_df
-                    prob_levels_available = sorted([p for p in l_df['level_1'].unique() if isinstance(p, (int, float))])
-                    # Build target sums per probability for this major phase
-                    target_sums = {
-                        p: l_df[l_df['level_1'] == p][major].sum() for p in prob_levels_available
-                    }
-                    # T_INDEX used for matching
-                    t_index_map = {
-                        p: l_df[l_df['level_1'] == p]['T_INDEX'].values for p in prob_levels_available
-                    }
-                    # param_df has columns: qi, di, b, t0, UID (probability)
                     if 'qi' in param_df.columns and 'di' in param_df.columns and 'b' in param_df.columns and 't0' in param_df.columns and 'UID' in param_df.columns:
                         adjusted_di = []
                         q_time0 = []
@@ -2301,24 +2374,31 @@ class decline_curve:
                             di = float(prow['di'])
                             b = float(prow['b'])
                             t0 = float(prow['t0'])
-                            di_new = di
-                            if prob in target_sums and prob in t_index_map:
-                                target = target_sums[prob]
-                                di_new = self._tc_match_di_with_solver(
-                                    qi, di, b, t0, t_index_map[prob], target
-                                )
-                            adjusted_di.append(di_new)
                             p_arr = np.asarray(l_df[l_df['level_1'] == prob][major].values, dtype=float)
                             t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
                             # Time-zero rate on the probability curve (not fitted Arps t0).
-                            q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr))
+                            rate_t0_val = self._tc_rate_at_t0_from_curve(t_arr, p_arr)
+                            q_time0.append(rate_t0_val)
+                            di_new = di
                             if len(p_arr) > 0:
                                 i_peak = int(np.nanargmax(p_arr))
-                                q_peak.append(float(p_arr[i_peak]))
-                                t_peak.append(float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan)
+                                peak_val = float(p_arr[i_peak])
+                                peak_t = float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan
+                                q_peak.append(peak_val)
+                                t_peak.append(peak_t)
+                                post_t = t_arr[i_peak:]
+                                # Full-curve EUR minus exponential pre-peak ramp (rate_t0 -> peak).
+                                target = self._tc_postpeak_eur_target(
+                                    t_arr, p_arr, rate_t0_val, peak_val, peak_t
+                                )
+                                if target > 0 and np.isfinite(qi) and qi > 0:
+                                    di_new = self._tc_match_di_with_solver(
+                                        qi, di, b, t0, post_t, target
+                                    )
                             else:
                                 q_peak.append(np.nan)
                                 t_peak.append(np.nan)
+                            adjusted_di.append(di_new)
                             p_list.append(prob)
                         param_df['di'] = adjusted_di
                         param_df['rate_t0'] = q_time0
@@ -2408,9 +2488,6 @@ class decline_curve:
                     param_df['probability'] = param_df['UID']
                     # Match EUR-like target by adjusting decline rate via solver (keep qi fixed).
                     try:
-                        prob_levels_available = sorted([p for p in l_df['level_1'].unique() if isinstance(p, (int, float))])
-                        target_sums = { p: l_df[l_df['level_1'] == p][phase].sum() for p in prob_levels_available }
-                        t_index_map = { p: l_df[l_df['level_1'] == p]['T_INDEX'].values for p in prob_levels_available }
                         if {'qi','di','b','t0','UID'}.issubset(param_df.columns):
                             adjusted_di = []
                             q_time0 = []
@@ -2423,24 +2500,31 @@ class decline_curve:
                                 di = float(prow['di'])
                                 b = float(prow['b'])
                                 t0 = float(prow['t0'])
-                                di_new = di
-                                if prob in target_sums and prob in t_index_map:
-                                    target = target_sums[prob]
-                                    di_new = self._tc_match_di_with_solver(
-                                        qi, di, b, t0, t_index_map[prob], target
-                                    )
-                                adjusted_di.append(di_new)
                                 p_arr = np.asarray(l_df[l_df['level_1'] == prob][phase].values, dtype=float)
                                 t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
                                 # Time-zero rate on the probability curve (not fitted Arps t0).
-                                q_time0.append(self._tc_rate_at_t0_from_curve(t_arr, p_arr))
+                                rate_t0_val = self._tc_rate_at_t0_from_curve(t_arr, p_arr)
+                                q_time0.append(rate_t0_val)
+                                di_new = di
                                 if len(p_arr) > 0:
                                     i_peak = int(np.nanargmax(p_arr))
-                                    q_peak.append(float(p_arr[i_peak]))
-                                    t_peak.append(float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan)
+                                    peak_val = float(p_arr[i_peak])
+                                    peak_t = float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan
+                                    q_peak.append(peak_val)
+                                    t_peak.append(peak_t)
+                                    post_t = t_arr[i_peak:]
+                                    # Full-curve EUR minus exponential pre-peak ramp (rate_t0 -> peak).
+                                    target = self._tc_postpeak_eur_target(
+                                        t_arr, p_arr, rate_t0_val, peak_val, peak_t
+                                    )
+                                    if target > 0 and np.isfinite(qi) and qi > 0:
+                                        di_new = self._tc_match_di_with_solver(
+                                            qi, di, b, t0, post_t, target
+                                        )
                                 else:
                                     q_peak.append(np.nan)
                                     t_peak.append(np.nan)
+                                adjusted_di.append(di_new)
                                 p_list.append(prob)
                             param_df['di'] = adjusted_di
                             param_df['rate_t0'] = q_time0
