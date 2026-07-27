@@ -198,6 +198,104 @@ def test_tc_exponential_ramp_prepeak_volume():
     assert target == pytest.approx(1600.0 - expected, rel=1e-12)
 
 
+def test_tc_well_eur_targets_from_oneline(combined_dca_dataframe: pd.DataFrame):
+    dca = decline_curve()
+    dca.three_phase_mode = True
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+    dca.run_DCA()
+    dca.generate_oneline(denormalize=True, num_months=120)
+
+    targets = dca._tc_well_eur_targets("OIL", [0.1, 0.5, 0.9])
+    oil = dca._oneline["OIL"]
+    oil = oil[np.isfinite(oil) & (oil > 0)]
+    assert targets[0.5] == pytest.approx(float(oil.quantile(0.5)), rel=1e-12)
+    assert targets["mean"] == pytest.approx(float(oil.mean()), rel=1e-12)
+
+
+@pytest.mark.parametrize("three_phase_mode", [True, False])
+def test_tc_params_eur_matches_well_eur_quantiles(
+    combined_dca_dataframe: pd.DataFrame, three_phase_mode: bool
+):
+    """Rebuilt tc_params volume (peak_rate + adjusted di) matches oneline EUR quantiles."""
+    from resaid.dca.solver import decline_solver
+
+    num_months = 120
+    prob_levels = [0.1, 0.5, 0.9]
+
+    dca = decline_curve()
+    dca.three_phase_mode = three_phase_mode
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+
+    dca.run_DCA()
+    dca.generate_flowstream(denormalize=True, num_months=num_months)
+    dca.generate_oneline(denormalize=True, num_months=num_months)
+    dca.generate_typecurve(
+        denormalize=True,
+        return_params=True,
+        num_months=num_months,
+        prob_levels=prob_levels,
+    )
+
+    assert not dca.tc_params.empty
+    phases = ["OIL", "GAS", "WATER"] if three_phase_mode else ["OIL", "GAS"]
+
+    for phase in phases:
+        phase_params = dca.tc_params[dca.tc_params["phase"] == phase]
+        assert not phase_params.empty
+        well_series = pd.to_numeric(dca._oneline[phase], errors="coerce")
+        well_series = well_series[np.isfinite(well_series) & (well_series > 0)]
+        assert not well_series.empty
+
+        for _, row in phase_params.iterrows():
+            prob = row["probability"]
+            peak = float(row["peak_rate"])
+            rate_t0 = float(row["rate_t0"])
+            peak_t = float(row["time_to_peak_months"])
+            di = float(row["nominal_initial_monthly_decline"])
+            b = float(row["matched_b_factor"])
+            if not (np.isfinite(peak) and peak > 0 and np.isfinite(di) and di > 0 and np.isfinite(b)):
+                continue
+
+            t_start = 1.0
+            prepeak = decline_curve._tc_exponential_ramp_prepeak_volume(
+                rate_t0, peak, t_start, peak_t
+            )
+            remaining = max(int(num_months) - int(peak_t) if np.isfinite(peak_t) else 0, 12)
+            solver = decline_solver(
+                qi=peak,
+                qf=None,
+                de=di,
+                dmin=dca.MIN_DECLINE_RATE,
+                b=b,
+                eur=None,
+                t_max=remaining,
+            )
+            _, _, _, _, post_eur, _, delta = solver.solve()
+            reconstructed = float(prepeak) + float(post_eur)
+
+            if prob == "mean":
+                expected = float(well_series.mean())
+            else:
+                expected = float(well_series.quantile(float(prob)))
+
+            assert reconstructed == pytest.approx(expected, rel=0.05), (
+                f"phase={phase} prob={prob}: reconstructed={reconstructed}, "
+                f"expected={expected}, delta={delta}"
+            )
+
+
 def test_typecurve_p90_decline_not_degenerate():
     """P90 oil TC decline should fit from peak forward, not blow up di."""
     raw = pd.read_csv("ignore_samples/test_data_raw.csv")

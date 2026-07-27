@@ -2234,10 +2234,40 @@ class decline_curve:
             target = float(np.nansum(post))
         return max(target, 0.0)
 
-    def _tc_match_di_with_solver(self, qi, di_guess, b, t0, t_arr, target_sum):
+    def _tc_well_eur_targets(self, phase, prob_levels):
+        """
+        Map probability labels to well-level EUR targets from ``_oneline``.
+
+        Uses positive finite per-well phase volumes (flowstream life sums). Includes
+        each entry in ``prob_levels`` plus ``'mean'``.
+        """
+        targets = {}
+        if self._oneline is None or getattr(self._oneline, "empty", True):
+            return targets
+        if phase not in self._oneline.columns:
+            return targets
+
+        series = pd.to_numeric(self._oneline[phase], errors="coerce")
+        series = series[np.isfinite(series) & (series > 0)]
+        if series.empty:
+            return targets
+
+        for p in prob_levels:
+            try:
+                targets[p] = float(series.quantile(float(p)))
+            except (TypeError, ValueError):
+                continue
+        targets["mean"] = float(series.mean())
+        return targets
+
+    def _tc_match_di_with_solver(self, qi, di_guess, b, t0, t_arr, target_sum, t_max=None):
         """
         Keep ``qi,b,t0`` fixed and use ``decline_solver`` to match EUR-like target by
         solving decline rate (``de``). Falls back to ``di_guess`` when solve is invalid.
+
+        ``t_max`` is the post-peak integration horizon (months). When omitted it is
+        derived from ``t_arr`` and fitted ``t0``. Prefer passing the typecurve /
+        oneline remaining life so solved EUR aligns with well sums.
         """
         qi = float(qi)
         di_guess = float(di_guess)
@@ -2249,10 +2279,13 @@ class decline_curve:
             return di_guess
 
         t_arr = np.asarray(t_arr, dtype=float).reshape(-1)
-        if len(t_arr) == 0:
+        if t_max is not None and np.isfinite(t_max):
+            t_max = max(int(t_max), 12)
+        elif len(t_arr) == 0:
             return di_guess
-        # Solver integrates from t=0 to t_max with t0=0 semantics.
-        t_max = max(int(np.nanmax(t_arr) - float(t0)) + 1, 12)
+        else:
+            # Solver integrates from t=0 to t_max with t0=0 semantics.
+            t_max = max(int(np.nanmax(t_arr) - float(t0)) + 1, 12)
         Solver = _decline_solver_cls()
         s = Solver(
             qi=qi,
@@ -2360,9 +2393,10 @@ class decline_curve:
                 param_df['secant_effective_decline_pct'] = [x[3] for x in nom]
                 param_df['phase'] = major
                 param_df['probability'] = param_df['UID']
-                # Match EUR-like target by adjusting decline rate via solver (keep qi fixed).
+                # Match well EUR quantile by adjusting di; qi fixed at peak_rate.
                 try:
                     if 'qi' in param_df.columns and 'di' in param_df.columns and 'b' in param_df.columns and 't0' in param_df.columns and 'UID' in param_df.columns:
+                        well_eur_targets = self._tc_well_eur_targets(major, prob_levels)
                         adjusted_di = []
                         q_time0 = []
                         q_peak = []
@@ -2370,7 +2404,6 @@ class decline_curve:
                         p_list = []
                         for _, prow in param_df.iterrows():
                             prob = prow['UID']
-                            qi = float(prow['qi'])
                             di = float(prow['di'])
                             b = float(prow['b'])
                             t0 = float(prow['t0'])
@@ -2387,13 +2420,26 @@ class decline_curve:
                                 q_peak.append(peak_val)
                                 t_peak.append(peak_t)
                                 post_t = t_arr[i_peak:]
-                                # Full-curve EUR minus exponential pre-peak ramp (rate_t0 -> peak).
-                                target = self._tc_postpeak_eur_target(
-                                    t_arr, p_arr, rate_t0_val, peak_val, peak_t
+                                t_start = float(np.nanmin(t_arr)) if len(t_arr) else np.nan
+                                prepeak = self._tc_exponential_ramp_prepeak_volume(
+                                    rate_t0_val, peak_val, t_start, peak_t
                                 )
-                                if target > 0 and np.isfinite(qi) and qi > 0:
+                                well_eur = well_eur_targets.get(prob, np.nan)
+                                if not np.isfinite(well_eur):
+                                    # Float key tolerance for quantile labels
+                                    try:
+                                        well_eur = well_eur_targets.get(float(prob), np.nan)
+                                    except (TypeError, ValueError):
+                                        well_eur = np.nan
+                                target = float(well_eur) - float(prepeak) if np.isfinite(well_eur) else 0.0
+                                if target > 0 and np.isfinite(peak_val) and peak_val > 0:
+                                    remaining = max(
+                                        int(num_months) - int(peak_t) if np.isfinite(peak_t) else 0,
+                                        len(post_t),
+                                        12,
+                                    )
                                     di_new = self._tc_match_di_with_solver(
-                                        qi, di, b, t0, post_t, target
+                                        peak_val, di, b, t0, post_t, target, t_max=remaining
                                     )
                             else:
                                 q_peak.append(np.nan)
@@ -2412,8 +2458,11 @@ class decline_curve:
                         param_df['phase'] = major
                         param_df['probability'] = p_list
                 except Exception:
-                    # Non-fatal; proceed without adjustment if anything unexpected occurs
-                    pass
+                    logger.warning(
+                        "Typecurve EUR match failed for phase %s; using fitted declines",
+                        major,
+                        exc_info=True,
+                    )
                 param_df = param_df[[
                     'rate_t0',
                     'peak_rate',
@@ -2486,9 +2535,10 @@ class decline_curve:
                     param_df['secant_effective_decline_pct'] = [x[3] for x in nom]
                     param_df['phase'] = phase
                     param_df['probability'] = param_df['UID']
-                    # Match EUR-like target by adjusting decline rate via solver (keep qi fixed).
+                    # Match well EUR quantile by adjusting di; qi fixed at peak_rate.
                     try:
                         if {'qi','di','b','t0','UID'}.issubset(param_df.columns):
+                            well_eur_targets = self._tc_well_eur_targets(phase, prob_levels)
                             adjusted_di = []
                             q_time0 = []
                             q_peak = []
@@ -2496,7 +2546,6 @@ class decline_curve:
                             p_list = []
                             for _, prow in param_df.iterrows():
                                 prob = prow['UID']
-                                qi = float(prow['qi'])
                                 di = float(prow['di'])
                                 b = float(prow['b'])
                                 t0 = float(prow['t0'])
@@ -2513,13 +2562,25 @@ class decline_curve:
                                     q_peak.append(peak_val)
                                     t_peak.append(peak_t)
                                     post_t = t_arr[i_peak:]
-                                    # Full-curve EUR minus exponential pre-peak ramp (rate_t0 -> peak).
-                                    target = self._tc_postpeak_eur_target(
-                                        t_arr, p_arr, rate_t0_val, peak_val, peak_t
+                                    t_start = float(np.nanmin(t_arr)) if len(t_arr) else np.nan
+                                    prepeak = self._tc_exponential_ramp_prepeak_volume(
+                                        rate_t0_val, peak_val, t_start, peak_t
                                     )
-                                    if target > 0 and np.isfinite(qi) and qi > 0:
+                                    well_eur = well_eur_targets.get(prob, np.nan)
+                                    if not np.isfinite(well_eur):
+                                        try:
+                                            well_eur = well_eur_targets.get(float(prob), np.nan)
+                                        except (TypeError, ValueError):
+                                            well_eur = np.nan
+                                    target = float(well_eur) - float(prepeak) if np.isfinite(well_eur) else 0.0
+                                    if target > 0 and np.isfinite(peak_val) and peak_val > 0:
+                                        remaining = max(
+                                            int(num_months) - int(peak_t) if np.isfinite(peak_t) else 0,
+                                            len(post_t),
+                                            12,
+                                        )
                                         di_new = self._tc_match_di_with_solver(
-                                            qi, di, b, t0, post_t, target
+                                            peak_val, di, b, t0, post_t, target, t_max=remaining
                                         )
                                 else:
                                     q_peak.append(np.nan)
@@ -2538,7 +2599,11 @@ class decline_curve:
                             param_df['phase'] = phase
                             param_df['probability'] = p_list
                     except Exception:
-                        pass
+                        logger.warning(
+                            "Typecurve EUR match failed for phase %s; using fitted declines",
+                            phase,
+                            exc_info=True,
+                        )
                     param_df = param_df[[
                         'rate_t0',
                         'peak_rate',
