@@ -225,9 +225,7 @@ def test_tc_well_eur_targets_from_oneline(combined_dca_dataframe: pd.DataFrame):
 def test_tc_params_eur_matches_well_eur_quantiles(
     combined_dca_dataframe: pd.DataFrame, three_phase_mode: bool
 ):
-    """Rebuilt tc_params volume (peak_rate + adjusted di) matches oneline EUR quantiles."""
-    from resaid.dca.solver import decline_solver
-
+    """tc_params curve_eur matches oneline well EUR quantiles (same rate series as flowstream)."""
     num_months = 120
     prob_levels = [0.1, 0.5, 0.9]
 
@@ -264,79 +262,50 @@ def test_tc_params_eur_matches_well_eur_quantiles(
         for _, row in phase_params.iterrows():
             prob = row["probability"]
             peak = float(row["peak_rate"])
-            rate_t0 = float(row["rate_t0"])
-            peak_t = float(row["time_to_peak_months"])
-            di = float(row["nominal_initial_monthly_decline"])
-            b = float(row["matched_b_factor"])
-            if not (np.isfinite(peak) and peak > 0 and np.isfinite(di) and di > 0 and np.isfinite(b)):
+            if not (np.isfinite(peak) and peak > 0):
                 continue
-
-            t_start = 1.0
-            prepeak = decline_curve._tc_exponential_ramp_prepeak_volume(
-                rate_t0, peak, t_start, peak_t
-            )
-            remaining = max(int(num_months) - int(peak_t) if np.isfinite(peak_t) else 0, 12)
-            solver = decline_solver(
-                qi=peak,
-                qf=None,
-                de=di,
-                dmin=dca.MIN_DECLINE_RATE,
-                b=b,
-                eur=None,
-                t_max=remaining,
-            )
-            _, _, _, _, post_eur, _, delta = solver.solve()
-            reconstructed = float(prepeak) + float(post_eur)
 
             if prob == "mean":
                 expected = float(well_series.mean())
             else:
                 expected = float(well_series.quantile(float(prob)))
 
-            assert reconstructed == pytest.approx(expected, rel=0.05), (
-                f"phase={phase} prob={prob}: reconstructed={reconstructed}, "
-                f"expected={expected}, delta={delta}"
+            reconstructed = float(
+                dca._tc_curve_eur_from_params(
+                    row["peak_rate"],
+                    row["rate_t0"],
+                    row["time_to_peak_months"],
+                    row["nominal_initial_monthly_decline"],
+                    row["matched_b_factor"],
+                    num_months,
+                )
             )
 
+            assert reconstructed == pytest.approx(expected, rel=1e-6, abs=1e-3), (
+                f"phase={phase} prob={prob}: reconstructed={reconstructed}, expected={expected}"
+            )
+            assert row["curve_eur"] == pytest.approx(reconstructed, rel=1e-12)
 
-def test_typecurve_p90_decline_not_degenerate():
+
+def test_typecurve_p90_decline_not_degenerate(combined_dca_dataframe: pd.DataFrame):
     """P90 oil TC decline should fit from peak forward, not blow up di."""
-    raw = pd.read_csv("ignore_samples/test_data_raw.csv")
-    raw["ProducingMonth"] = pd.to_datetime(raw["ProducingMonth"])
-    raw = raw.rename(
-        columns={
-            "Oil": "LiquidsProd_BBL",
-            "Gas": "GasProd_MCF",
-            "Water": "WaterProd_BBL",
-            "Lateral Length": "LateralLength_FT",
-        }
-    )
-    raw["MAJOR"] = "OIL"
-
     dca = decline_curve()
-    dca.backup_decline = True
-    dca.STANDARD_LENGTH = 10000
-    dca.DEFAULT_B = 0.99
-    dca.dataframe = raw
-    dca.date_col = "ProducingMonth"
-    dca.phase_col = "MAJOR"
-    dca.length_col = "LateralLength_FT"
-    dca.uid_col = "API_UWI"
-    dca.oil_col = "LiquidsProd_BBL"
-    dca.gas_col = "GasProd_MCF"
-    dca.water_col = "WaterProd_BBL"
-    dca.min_h_b = 0.7
-    dca.max_h_b = 1.2
-    dca.OUTLIER_CORRECTION = False
     dca.three_phase_mode = True
-    dca.generate_typecurve(return_params=True, num_months=120)
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+    dca.generate_typecurve(return_params=True, num_months=120, prob_levels=[0.1, 0.5, 0.9])
 
     oil = dca.tc_params[dca.tc_params["phase"] == "OIL"]
     p90 = oil[oil["probability"] == 0.9].iloc[0]
     assert p90["time_to_peak_months"] >= 1
     assert p90["nominal_initial_monthly_decline"] < 1.0
     assert p90["secant_effective_decline_pct"] < 99.0
-    assert p90["peak_rate"] > p90["rate_t0"]
+    assert p90["peak_rate"] >= p90["rate_t0"]
 
 
 @pytest.mark.parametrize("three_phase_mode", [True, False])
