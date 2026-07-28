@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from dateutil.relativedelta import relativedelta
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize_scalar
 from scipy.signal import argrelextrema
 from tqdm import tqdm
 
@@ -202,6 +202,7 @@ class decline_curve:
         self._oneline = pd.DataFrame()
 
         self.tc_params = pd.DataFrame()
+        self.tc_params_flowstream = pd.DataFrame()
         self.dca_param_df = []
         
 
@@ -2087,9 +2088,17 @@ class decline_curve:
         actual_df = actual_df.set_index(['UID', 'T_INDEX'])
 
 
-    def generate_typecurve(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, prob_levels=[.1,.5,.9], _verbose=False, return_params=False):
+    def generate_typecurve(
+        self,
+        num_months=DEFAULT_FORECAST_HORIZON_MONTHS,
+        denormalize=False,
+        prob_levels=[.1, .5, .9],
+        _verbose=False,
+        return_params=False,
+        return_params_flowstream=False,
+    ):
         if self._flowstream_dataframe is None:
-            self.generate_flowstream(num_months=num_months,denormalize=denormalize, _verbose=_verbose)
+            self.generate_flowstream(num_months=num_months, denormalize=denormalize, _verbose=_verbose)
         if self._oneline.empty:
             if self._params_dataframe.empty:
                 self.run_DCA(_verbose=_verbose)
@@ -2098,10 +2107,29 @@ class decline_curve:
             else:
                 self._generate_oneline_original(num_months, denormalize, _verbose)
 
+        if not return_params:
+            self.tc_params = pd.DataFrame()
+        if not return_params_flowstream:
+            self.tc_params_flowstream = pd.DataFrame()
+
         if self.three_phase_mode:
-            self._generate_typecurve_three_phase(num_months, denormalize, prob_levels, _verbose, return_params)
+            self._generate_typecurve_three_phase(
+                num_months,
+                denormalize,
+                prob_levels,
+                _verbose,
+                return_params,
+                return_params_flowstream,
+            )
         else:
-            self._generate_typecurve_original(num_months, denormalize, prob_levels, _verbose, return_params)
+            self._generate_typecurve_original(
+                num_months,
+                denormalize,
+                prob_levels,
+                _verbose,
+                return_params,
+                return_params_flowstream,
+            )
 
     def _build_typecurve_flowstream(self, denormalize):
         """
@@ -2302,6 +2330,252 @@ class decline_curve:
             return de_new
         return di_guess
 
+    def _tc_curve_eur_from_params(
+        self,
+        peak_rate,
+        rate_t0,
+        peak_t,
+        di,
+        b,
+        num_months,
+        t_start=1.0,
+    ):
+        """
+        Total reconstructed EUR for a typecurve parameter row.
+
+        Sum of the same monthly rates emitted by ``tc_params_flowstream``
+        (exponential pre-peak ramp plus post-peak ``arps_decline``).
+        """
+        row = {
+            "peak_rate": peak_rate,
+            "rate_t0": rate_t0,
+            "time_to_peak_months": peak_t,
+            "nominal_initial_monthly_decline": di,
+            "matched_b_factor": b,
+        }
+        series = self._tc_params_rate_series(row, num_months, t_start=t_start)
+        if series.empty:
+            return np.nan
+        return float(series.sum())
+
+    def _tc_match_di_for_total_eur(
+        self,
+        peak_rate,
+        rate_t0,
+        peak_t,
+        di_guess,
+        b,
+        num_months,
+        target_total_eur,
+    ):
+        """
+        Solve ``di`` so the parametric rate-series EUR equals ``target_total_eur``.
+
+        Uses the same monthly rates as ``tc_params_flowstream`` / ``curve_eur``.
+        """
+        target = float(target_total_eur)
+        di_guess = float(di_guess)
+        peak_rate = float(peak_rate)
+        b = float(b)
+        if not (
+            np.isfinite(target)
+            and target > 0
+            and np.isfinite(peak_rate)
+            and peak_rate > 0
+            and np.isfinite(di_guess)
+            and di_guess > 0
+            and np.isfinite(b)
+            and b > 0
+        ):
+            return di_guess
+
+        def objective(di):
+            eur = self._tc_curve_eur_from_params(
+                peak_rate, rate_t0, peak_t, float(di), b, num_months
+            )
+            if not np.isfinite(eur):
+                return 1e20
+            return abs(float(eur) - target)
+
+        try:
+            res = minimize_scalar(
+                objective,
+                bounds=(1e-8, 50.0),
+                method="bounded",
+                options={"maxiter": 250, "xatol": 1e-10},
+            )
+            di_new = float(res.x)
+            if np.isfinite(di_new) and di_new > 0:
+                err = objective(di_new)
+                if err <= max(1.0, target * 1e-8):
+                    return di_new
+        except Exception:
+            pass
+        return di_guess
+
+    def _attach_tc_params_eur_columns(self, param_df, num_months):
+        """Add ``curve_eur`` and ``standard_length`` to a tc_params frame."""
+        if param_df.empty:
+            return param_df
+        param_df = param_df.copy()
+        param_df["curve_eur"] = param_df.apply(
+            lambda row: self._tc_curve_eur_from_params(
+                row["peak_rate"],
+                row["rate_t0"],
+                row["time_to_peak_months"],
+                row["nominal_initial_monthly_decline"],
+                row["matched_b_factor"],
+                num_months,
+            ),
+            axis=1,
+        )
+        param_df["standard_length"] = float(self.STANDARD_LENGTH)
+        return param_df
+
+    @staticmethod
+    def _tc_exponential_ramp_rate(t, rate_t0, peak_rate, t_start, t_peak):
+        """Point rate on exponential pre-peak ramp (peak month uses ``peak_rate``)."""
+        t = float(t)
+        rate_t0 = float(rate_t0)
+        peak_rate = float(peak_rate)
+        t_start = float(t_start)
+        t_peak = float(t_peak)
+        if not (
+            np.isfinite(t)
+            and np.isfinite(rate_t0)
+            and np.isfinite(peak_rate)
+            and np.isfinite(t_start)
+            and np.isfinite(t_peak)
+        ):
+            return 0.0
+        if rate_t0 <= 0 or peak_rate <= 0:
+            return 0.0
+        if t >= t_peak - 1e-12:
+            return peak_rate
+        if t_peak <= t_start or t < t_start - 1e-12:
+            return rate_t0 if t >= t_start - 1e-12 else 0.0
+        span = t_peak - t_start
+        frac = (t - t_start) / span
+        if np.isclose(rate_t0, peak_rate):
+            return rate_t0
+        return float(rate_t0 * np.power(peak_rate / rate_t0, frac))
+
+    def _tc_params_rate_at_t(
+        self,
+        t,
+        peak_rate,
+        rate_t0,
+        peak_t,
+        di,
+        b,
+        t_start=1.0,
+    ):
+        """Monthly rate at ``t`` from tc_params ramp + Arps (``qi = peak_rate``)."""
+        peak_rate = float(peak_rate)
+        di = float(di)
+        b = float(b)
+        if not (np.isfinite(peak_rate) and peak_rate > 0 and np.isfinite(di) and di > 0 and np.isfinite(b)):
+            return 0.0
+        peak_t = float(peak_t) if np.isfinite(peak_t) else float(t)
+        if float(t) < peak_t - 1e-12:
+            rate_t0_val = float(rate_t0) if np.isfinite(rate_t0) else 0.0
+            return self._tc_exponential_ramp_rate(t, rate_t0_val, peak_rate, t_start, peak_t)
+        q = self.arps_decline(float(t), peak_rate, di, b, peak_t)
+        q = float(np.asarray(q, dtype=float).reshape(-1)[0])
+        return q if np.isfinite(q) and q > 0 else 0.0
+
+    def _tc_params_rate_series(self, row, num_months, t_start=1.0):
+        """Full parametric rate series for one tc_params row."""
+        t_range = np.arange(1, int(num_months) + 1, dtype=float)
+        peak = float(row["peak_rate"])
+        rate_t0 = float(row["rate_t0"])
+        peak_t = float(row["time_to_peak_months"])
+        di = float(row["nominal_initial_monthly_decline"])
+        b = float(row["matched_b_factor"])
+        rates = [
+            self._tc_params_rate_at_t(t, peak, rate_t0, peak_t, di, b, t_start=t_start)
+            for t in t_range
+        ]
+        return pd.Series(rates, index=t_range)
+
+    def _ratio_mode_major_counts(self):
+        """Well counts by major phase for ratio-mode WATER blending."""
+        if self._params_dataframe is None or getattr(self._params_dataframe, "empty", True):
+            return 1, 1
+        if "major" not in self._params_dataframe.columns:
+            return 1, 1
+        majors = self._params_dataframe["major"].astype(str).str.upper()
+        n_oil = int((majors == "OIL").sum())
+        n_gas = int((majors == "GAS").sum())
+        if n_oil + n_gas == 0:
+            return 1, 1
+        return n_oil, n_gas
+
+    def _build_tc_params_flowstream(self, tc_params, num_months, three_phase_mode):
+        """
+        Parametric typecurve flowstream matching ``_typecurve`` MultiIndex layout.
+
+        Index ``T_INDEX`` 1..num_months; columns ``(phase, probability)``.
+        """
+        if tc_params is None or getattr(tc_params, "empty", True):
+            return pd.DataFrame()
+
+        t_index = np.arange(1, int(num_months) + 1, dtype=float)
+        probs = tc_params["probability"].unique()
+        phases = ["OIL", "GAS", "WATER"]
+        series_map = {}
+
+        if three_phase_mode:
+            for phase in phases:
+                phase_df = tc_params[tc_params["phase"] == phase]
+                for prob in probs:
+                    rows = phase_df[phase_df["probability"] == prob]
+                    if rows.empty:
+                        continue
+                    series_map[(phase, prob)] = self._tc_params_rate_series(
+                        rows.iloc[0], num_months
+                    ).values
+        else:
+            n_oil, n_gas = self._ratio_mode_major_counts()
+            denom = float(n_oil + n_gas)
+            for prob in probs:
+                oil_rows = tc_params[
+                    (tc_params["phase"] == "OIL") & (tc_params["probability"] == prob)
+                ]
+                gas_rows = tc_params[
+                    (tc_params["phase"] == "GAS") & (tc_params["probability"] == prob)
+                ]
+                oil_series = None
+                gas_series = None
+                if not oil_rows.empty:
+                    oil_series = self._tc_params_rate_series(oil_rows.iloc[0], num_months)
+                    series_map[("OIL", prob)] = oil_series.values
+                if not gas_rows.empty:
+                    gas_series = self._tc_params_rate_series(gas_rows.iloc[0], num_months)
+                    series_map[("GAS", prob)] = gas_series.values
+
+                water = np.zeros(len(t_index), dtype=float)
+                if oil_series is not None:
+                    wr = float(oil_rows.iloc[0].get("water_ratio", 0.0) or 0.0)
+                    if np.isfinite(wr) and wr > 0:
+                        water += n_oil * oil_series.values * wr
+                if gas_series is not None:
+                    wr = float(gas_rows.iloc[0].get("water_ratio", 0.0) or 0.0)
+                    if np.isfinite(wr) and wr > 0:
+                        water += n_gas * gas_series.values * wr
+                series_map[("WATER", prob)] = water / denom
+
+        if not series_map:
+            return pd.DataFrame()
+
+        out = pd.DataFrame(
+            {key: vals for key, vals in series_map.items()},
+            index=t_index,
+        )
+        out.index.name = "T_INDEX"
+        out.columns = pd.MultiIndex.from_tuples(out.columns, names=[None, "level_1"])
+        return out
+
     @staticmethod
     def _tc_rate_at_t0_from_curve(t_arr, q_arr, t0=None):
         """
@@ -2354,7 +2628,15 @@ class decline_curve:
             sec_eff = (1.0 - np.power((nom_annual * b + 1.0), (-1.0 / b))) * 100.0
         return nom_month, nom_annual, tan_eff, sec_eff
 
-    def _generate_typecurve_original(self, num_months, denormalize, prob_levels, _verbose, return_params):
+    def _generate_typecurve_original(
+        self,
+        num_months,
+        denormalize,
+        prob_levels,
+        _verbose,
+        return_params,
+        return_params_flowstream=False,
+    ):
         """Original typecurve generation using major phase with ratios"""
         tc_flow = self._build_typecurve_flowstream(denormalize)
 
@@ -2377,8 +2659,9 @@ class decline_curve:
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
         
-        if return_params:
-            r_df = pd.DataFrame([])
+        need_params = return_params or return_params_flowstream
+        r_df = pd.DataFrame()
+        if need_params:
             for major in ['OIL','GAS']:
                 l_df = return_df.copy()
                 l_df['MAJOR'] = major
@@ -2419,11 +2702,6 @@ class decline_curve:
                                 peak_t = float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan
                                 q_peak.append(peak_val)
                                 t_peak.append(peak_t)
-                                post_t = t_arr[i_peak:]
-                                t_start = float(np.nanmin(t_arr)) if len(t_arr) else np.nan
-                                prepeak = self._tc_exponential_ramp_prepeak_volume(
-                                    rate_t0_val, peak_val, t_start, peak_t
-                                )
                                 well_eur = well_eur_targets.get(prob, np.nan)
                                 if not np.isfinite(well_eur):
                                     # Float key tolerance for quantile labels
@@ -2431,15 +2709,20 @@ class decline_curve:
                                         well_eur = well_eur_targets.get(float(prob), np.nan)
                                     except (TypeError, ValueError):
                                         well_eur = np.nan
-                                target = float(well_eur) - float(prepeak) if np.isfinite(well_eur) else 0.0
-                                if target > 0 and np.isfinite(peak_val) and peak_val > 0:
-                                    remaining = max(
-                                        int(num_months) - int(peak_t) if np.isfinite(peak_t) else 0,
-                                        len(post_t),
-                                        12,
-                                    )
-                                    di_new = self._tc_match_di_with_solver(
-                                        peak_val, di, b, t0, post_t, target, t_max=remaining
+                                if (
+                                    np.isfinite(well_eur)
+                                    and well_eur > 0
+                                    and np.isfinite(peak_val)
+                                    and peak_val > 0
+                                ):
+                                    di_new = self._tc_match_di_for_total_eur(
+                                        peak_val,
+                                        rate_t0_val,
+                                        peak_t,
+                                        di,
+                                        b,
+                                        num_months,
+                                        well_eur,
                                     )
                             else:
                                 q_peak.append(np.nan)
@@ -2479,11 +2762,17 @@ class decline_curve:
                 ]].rename(columns={
                     'b': 'matched_b_factor',
                 })
+                param_df = self._attach_tc_params_eur_columns(param_df, num_months)
                 if r_df.empty:
                     r_df = param_df
                 else:
                     r_df = pd.concat([r_df,param_df])
-            self.tc_params = r_df
+            if return_params:
+                self.tc_params = r_df
+            if return_params_flowstream:
+                self.tc_params_flowstream = self._build_tc_params_flowstream(
+                    r_df, num_months, three_phase_mode=False
+                )
             
         return_df = return_df.pivot(
                 index=['T_INDEX'],
@@ -2493,7 +2782,15 @@ class decline_curve:
 
         self._typecurve = return_df
 
-    def _generate_typecurve_three_phase(self, num_months, denormalize, prob_levels, _verbose, return_params):
+    def _generate_typecurve_three_phase(
+        self,
+        num_months,
+        denormalize,
+        prob_levels,
+        _verbose,
+        return_params,
+        return_params_flowstream=False,
+    ):
         """Three-phase typecurve generation with independent decline curves for each phase"""
         tc_flow = self._build_typecurve_flowstream(denormalize)
 
@@ -2517,7 +2814,9 @@ class decline_curve:
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
         
-        if return_params:
+        need_params = return_params or return_params_flowstream
+        r_df = pd.DataFrame()
+        if need_params:
             r_df = pd.DataFrame([])
             # In three-phase mode, we have independent parameters for each phase
             for phase in ['OIL','GAS','WATER']:
@@ -2561,26 +2860,26 @@ class decline_curve:
                                     peak_t = float(t_arr[i_peak]) if len(t_arr) > i_peak else np.nan
                                     q_peak.append(peak_val)
                                     t_peak.append(peak_t)
-                                    post_t = t_arr[i_peak:]
-                                    t_start = float(np.nanmin(t_arr)) if len(t_arr) else np.nan
-                                    prepeak = self._tc_exponential_ramp_prepeak_volume(
-                                        rate_t0_val, peak_val, t_start, peak_t
-                                    )
                                     well_eur = well_eur_targets.get(prob, np.nan)
                                     if not np.isfinite(well_eur):
                                         try:
                                             well_eur = well_eur_targets.get(float(prob), np.nan)
                                         except (TypeError, ValueError):
                                             well_eur = np.nan
-                                    target = float(well_eur) - float(prepeak) if np.isfinite(well_eur) else 0.0
-                                    if target > 0 and np.isfinite(peak_val) and peak_val > 0:
-                                        remaining = max(
-                                            int(num_months) - int(peak_t) if np.isfinite(peak_t) else 0,
-                                            len(post_t),
-                                            12,
-                                        )
-                                        di_new = self._tc_match_di_with_solver(
-                                            peak_val, di, b, t0, post_t, target, t_max=remaining
+                                    if (
+                                        np.isfinite(well_eur)
+                                        and well_eur > 0
+                                        and np.isfinite(peak_val)
+                                        and peak_val > 0
+                                    ):
+                                        di_new = self._tc_match_di_for_total_eur(
+                                            peak_val,
+                                            rate_t0_val,
+                                            peak_t,
+                                            di,
+                                            b,
+                                            num_months,
+                                            well_eur,
                                         )
                                 else:
                                     q_peak.append(np.nan)
@@ -2618,11 +2917,17 @@ class decline_curve:
                     ]].rename(columns={
                         'b': 'matched_b_factor',
                     })
+                    param_df = self._attach_tc_params_eur_columns(param_df, num_months)
                     if r_df.empty:
                         r_df = param_df
                     else:
                         r_df = pd.concat([r_df,param_df])
-            self.tc_params = r_df
+            if return_params:
+                self.tc_params = r_df
+            if return_params_flowstream:
+                self.tc_params_flowstream = self._build_tc_params_flowstream(
+                    r_df, num_months, three_phase_mode=True
+                )
             
         return_df = return_df.pivot(
                 index=['T_INDEX'],

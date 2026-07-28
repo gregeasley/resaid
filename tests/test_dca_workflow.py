@@ -134,6 +134,9 @@ def test_typecurve_overlays_history_without_mutating_flowstream(combined_dca_dat
     assert not dca._typecurve.empty
     assert hasattr(dca, "tc_params")
     assert not dca.tc_params.empty
+    assert "curve_eur" in dca.tc_params.columns
+    assert "standard_length" in dca.tc_params.columns
+    assert (dca.tc_params["standard_length"] == dca.STANDARD_LENGTH).all()
 
 
 def test_tc_params_rate_t0_is_curve_time_zero(combined_dca_dataframe: pd.DataFrame):
@@ -334,3 +337,146 @@ def test_typecurve_p90_decline_not_degenerate():
     assert p90["nominal_initial_monthly_decline"] < 1.0
     assert p90["secant_effective_decline_pct"] < 99.0
     assert p90["peak_rate"] > p90["rate_t0"]
+
+
+@pytest.mark.parametrize("three_phase_mode", [True, False])
+def test_tc_params_flowstream_structure_matches_typecurve(
+    combined_dca_dataframe: pd.DataFrame, three_phase_mode: bool
+):
+    dca = decline_curve()
+    dca.three_phase_mode = three_phase_mode
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+
+    num_months = 120
+    prob_levels = [0.1, 0.5, 0.9]
+    dca.run_DCA()
+    dca.generate_typecurve(
+        denormalize=True,
+        return_params=True,
+        return_params_flowstream=True,
+        num_months=num_months,
+        prob_levels=prob_levels,
+    )
+
+    tc = dca.typecurve
+    fs = dca.tc_params_flowstream
+    assert not fs.empty
+    assert list(fs.index) == list(range(1, num_months + 1))
+    assert fs.index.name == "T_INDEX"
+    assert set(fs.columns) == set(tc.columns)
+    assert fs.columns.names == tc.columns.names
+
+
+def test_tc_params_flowstream_endpoints_match_tc_params(combined_dca_dataframe: pd.DataFrame):
+    dca = decline_curve()
+    dca.three_phase_mode = False
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+
+    dca.run_DCA()
+    dca.generate_typecurve(
+        denormalize=True,
+        return_params=True,
+        return_params_flowstream=True,
+        num_months=120,
+        prob_levels=[0.1, 0.5, 0.9],
+    )
+
+    fs = dca.tc_params_flowstream
+    oil_params = dca.tc_params[dca.tc_params["phase"] == "OIL"]
+    t_min = float(fs.index.min())
+
+    for _, row in oil_params.iterrows():
+        p = row["probability"]
+        series = fs[("OIL", p)].astype(float)
+        assert series.loc[t_min] == pytest.approx(float(row["rate_t0"]), rel=1e-9)
+        assert float(series.max()) == pytest.approx(float(row["peak_rate"]), rel=1e-9)
+        assert float(series.idxmax()) == pytest.approx(float(row["time_to_peak_months"]), rel=1e-9)
+
+
+@pytest.mark.parametrize("three_phase_mode", [True, False])
+def test_tc_params_flowstream_eur_matches_curve_eur(
+    combined_dca_dataframe: pd.DataFrame, three_phase_mode: bool
+):
+    dca = decline_curve()
+    dca.three_phase_mode = three_phase_mode
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+
+    dca.run_DCA()
+    dca.generate_typecurve(
+        denormalize=True,
+        return_params=True,
+        return_params_flowstream=True,
+        num_months=120,
+        prob_levels=[0.1, 0.5, 0.9],
+    )
+
+    for _, row in dca.tc_params.iterrows():
+        phase = row["phase"]
+        prob = row["probability"]
+        peak = float(row["peak_rate"])
+        if not (np.isfinite(peak) and peak > 0):
+            continue
+        if three_phase_mode:
+            total = float(dca.tc_params_flowstream[(phase, prob)].sum())
+        elif phase in ("OIL", "GAS"):
+            total = float(dca.tc_params_flowstream[(phase, prob)].sum())
+        else:
+            continue
+        assert total == pytest.approx(float(row["curve_eur"]), rel=1e-12)
+
+
+def test_tc_params_flowstream_without_return_params(combined_dca_dataframe: pd.DataFrame):
+    dca = decline_curve()
+    dca.three_phase_mode = True
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+
+    dca.run_DCA()
+    dca.generate_typecurve(
+        denormalize=True,
+        return_params=False,
+        return_params_flowstream=True,
+        num_months=120,
+    )
+
+    assert dca.tc_params.empty
+    assert not dca.tc_params_flowstream.empty
+
+
+def test_tc_params_flowstream_default_empty(combined_dca_dataframe: pd.DataFrame):
+    dca = decline_curve()
+    dca.three_phase_mode = False
+    dca.dataframe = combined_dca_dataframe
+    dca.date_col = "DATE"
+    dca.phase_col = "PHASE"
+    dca.uid_col = "WELL_ID"
+    dca.oil_col = "OIL"
+    dca.gas_col = "GAS"
+    dca.water_col = "WATER"
+
+    dca.run_DCA()
+    dca.generate_typecurve(denormalize=True, num_months=120)
+    assert dca.tc_params_flowstream.empty
