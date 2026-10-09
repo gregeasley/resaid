@@ -94,13 +94,8 @@ def test_export_consistency():
         
         # Run DCA
         print("Running DCA...")
-        try:
-            dca.run_DCA()
-            dca.generate_oneline(denormalize=True)
-        except Exception as e:
-            print(f"Warning: DCA failed for {mode_name} mode: {e}")
-            print("Skipping export generation for this mode...")
-            continue
+        dca.run_DCA()
+        dca.generate_oneline(denormalize=True)
         
         # Generate exports
         print("Generating ARIES export...")
@@ -143,6 +138,17 @@ def test_export_consistency():
         print("Saving oneline data...")
         oneline_file = os.path.join(output_dir, f"oneline_data_{mode_name}.csv")
         dca.oneline_dataframe.to_csv(oneline_file, index=False)
+
+        # Every format must cover the same wells as the oneline.
+        wells = set(dca.oneline_dataframe['UID'].astype(str))
+        assert wells
+        with open(aries_file, encoding='utf-8') as f:
+            aries_wells = {line.strip() for line in f if line.strip() and not line.startswith(' ')}
+        mosaic_wells = set(pd.read_excel(mosaic_file)['Entity Name'].astype(str))
+        phdwin_wells = set(pd.read_csv(phdwin_file)['UniqueId'].astype(str))
+        assert aries_wells == wells
+        assert mosaic_wells <= wells and phdwin_wells <= wells
+        assert mosaic_wells and phdwin_wells
         
         print(f"All exports completed for {mode_name} mode")
     

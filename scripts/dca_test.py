@@ -23,7 +23,7 @@ def calculate_oneline(production_df,b_min,b_max)->pd.DataFrame:
     l_dca.water_col = 'WaterProd_BBL'
     l_dca.min_h_b = b_min
     l_dca.max_h_b = b_max
-    l_dca.OUTLIER_CORRECTION = False
+    l_dca.outlier_correction = False
 
     l_dca.generate_oneline(denormalize=True)
 
@@ -76,7 +76,7 @@ def make_prod_df(prod_df:pd.DataFrame,header_df:pd.DataFrame)->pd.DataFrame:
 
 
 def main():
-    """Performance / reference script — run from repo root: ``python tests/dca_test.py``."""
+    """Performance / reference script — run from repo root: ``python scripts/dca_test.py``."""
     # Check if we have a saved subset for faster debugging
     subset_file = "tests/prod_df_subset.csv"
     if os.path.exists(subset_file) and False:  # Set to False to use full dataset

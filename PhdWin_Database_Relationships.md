@@ -2,10 +2,20 @@
 
 This document provides an analysis of the key relationships between tables in the PhdWin database based on the latest pytopspeed-modernized 1.1.3 conversion.
 
+> **Status in RESAID:** `PhdWinDatabase` converts these files to SQLite, but RESAID does not
+> map any of the tables below. Its default mappings are the ARIES names (`AC_PRODUCT`,
+> `PROPNUM`, ...), which do not exist here, so you must name a production table and columns
+> yourself. The tables described here store production per product code or per year
+> (`PROD1`..`PROD5`) with integer dates (days since 1800-12-28). `prepare_data_for_dca`
+> expects one row per well and date with oil, gas and water columns, and parses any column
+> whose name contains `DATE` or `PROD` with `pd.to_datetime`. The data therefore needs
+> reshaping and date conversion before it can feed the DCA. The "RESAID Integration"
+> sections below are a planning guide, not implemented behavior.
+
 ## Database Overview
 
-- **Total Tables**: 76
-- **Total Records**: 14,756
+- **Total Tables**: 76 PhdWin tables (`reference/test_phdwin_output.sqlite` also contains 34 other, nearly empty tables)
+- **Total Records**: 14,756 (in the PhdWin tables)
 - **PhdWin Database Tables (phd_)**: 55 tables
 - **Model Tables (mod_)**: 21 tables
 
@@ -93,7 +103,7 @@ The **LSE_ID** serves as the primary entity identifier throughout the PhdWin dat
     - **Key Fields**: LSE_ID, GRP_ID, DESCR, INV_AMNT, INTANG_AMNT
     - **Relationship**: Links to LSE_ID for well identification
 
-11. **phd_ECON** (0 records) ⭐ **NOTE: No data in this conversion**
+11. **phd_ECON** (95 records)
     - **Purpose**: Economic parameters and calculations
     - **Key Fields**: LSE_ID, economic parameters, pricing data
     - **Relationship**: Links to LSE_ID for well identification
@@ -208,7 +218,7 @@ TPL_ID (Model Templates)
 8. **phd_GRAPHS** ⭐ **NEW** - Graph and visualization data (95 records)
 9. **phd_OWNER** - Ownership information (95 records)
 10. **phd_INVEST** - CAPEX and investment data (95 records)
-11. **phd_ECON** - Economic parameters (0 records in this conversion)
+11. **phd_ECON** - Economic parameters (95 records)
 
 ### Supporting Data:
 
@@ -216,7 +226,7 @@ TPL_ID (Model Templates)
 13. **phd_CLASS** - Reserve class definitions (3 records)
 14. **phd_CATEGORY** - Well category definitions (7 records)
 
-## Table Mapping for RESAID Integration
+## Table Mapping for RESAID Integration (planned, not implemented)
 
 ### Production Data (Primary)
 - **phd_FORCAST** ⭐ **NEW PRIMARY** → Similar to ARIES AC_PRODUCT (main production/forecast data)
@@ -233,7 +243,7 @@ TPL_ID (Model Templates)
 ### Economic Data
 - **phd_OWNER** → Ownership information
 - **phd_INVEST** → CAPEX and investment data
-- **phd_ECON** → Economic parameters (no data in this conversion)
+- **phd_ECON** → Economic parameters
 - **phd_ROYALTY** → Royalty information (no data in this conversion)
 
 ### Supporting Data
@@ -257,7 +267,7 @@ The latest pytopspeed-modernized 1.1.3 conversion has successfully extracted com
 10. **mod_MODSEGMENT**: 1,752 records - Model segments
 
 ### Conversion Success Metrics:
-- **Total Records**: 14,756 (increased from 14,564)
+- **Total Records**: 14,756 (increased from 14,564 in an earlier conversion)
 - **Conversion Time**: ~50 seconds
 - **Files Processed**: 2 (TxWells.PHD, TxWells.mod)
 - **Tables Created**: 76
@@ -274,4 +284,4 @@ This final structure provides the most comprehensive view of the PhdWin database
 - **Economic Data**: phd_OWNER, phd_INVEST
 - **Model Data**: Comprehensive modeling tables with templates and segments
 
-The database now contains 14,564 total records across 76 tables, making it fully suitable for DCA integration with RESAID.
+The PhdWin tables now contain 14,756 records across 76 tables. Using them in RESAID requires reshaping production to one row per well and date (see the status note at the top).

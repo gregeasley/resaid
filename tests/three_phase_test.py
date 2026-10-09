@@ -31,7 +31,7 @@ def calculate_oneline_three_phase(production_df, b_min, b_max) -> pd.DataFrame:
     l_dca.water_col = 'WaterProd_BBL'
     l_dca.min_h_b = b_min
     l_dca.max_h_b = b_max
-    l_dca.OUTLIER_CORRECTION = False
+    l_dca.outlier_correction = False
 
     # Enable three-phase mode
     l_dca.three_phase_mode = True
@@ -58,7 +58,7 @@ def calculate_oneline_original(production_df, b_min, b_max) -> pd.DataFrame:
     l_dca.water_col = 'WaterProd_BBL'
     l_dca.min_h_b = b_min
     l_dca.max_h_b = b_max
-    l_dca.OUTLIER_CORRECTION = False
+    l_dca.outlier_correction = False
 
     # Use original mode
     l_dca.three_phase_mode = False

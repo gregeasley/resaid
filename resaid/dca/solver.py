@@ -31,6 +31,14 @@ _SOLVER_VAR_BOUNDS = {
     "t_max": (1.0, 1e6),
 }
 
+# ``solve`` sets its warning flag when |cumulative - EUR| exceeds
+# max(_SOLVER_ABS_TOL, _SOLVER_REL_TOL * EUR, qf).
+_SOLVER_ABS_TOL = 1e-5
+_SOLVER_REL_TOL = 1e-4
+
+# Coarse log-spaced grid size used to bracket single-variable solves.
+_SOLVER_LOG_GRID_POINTS = 41
+
 
 class decline_solver:
     """
@@ -43,7 +51,8 @@ class decline_solver:
         qi: Initial production rate
         qf: Final production rate
         de: Decline rate
-        dmin: Minimum decline rate
+        dmin: Terminal (minimum) monthly decline rate used when integrating the
+            Arps curve. Defaults to ``decline_curve.MIN_DECLINE_RATE``.
         b: Arps b-factor
         eur: Estimated ultimate recovery
         t_max: Maximum time horizon (months). If omitted when solving, defaults to
@@ -51,10 +60,12 @@ class decline_solver:
     """
 
     def __init__(self, qi=None, qf=None, de=None, dmin=None, b=None, eur=None, t_max=None, l_dca=None):
+        self.l_dca = l_dca if l_dca is not None else _shared_l_dca()
         self.qi = qi
         self.qf = qf
         self.de = de
-        self.dmin = dmin
+        # Terminal decline used when integrating the Arps curve (monthly, nominal).
+        self.dmin = float(dmin) if dmin is not None else float(self.l_dca.MIN_DECLINE_RATE)
         self.b = b
         self.eur = eur
         self.t_max = t_max
@@ -64,7 +75,6 @@ class decline_solver:
         self.delta = 0
         
         self.variables_to_solve = []
-        self.l_dca = l_dca if l_dca is not None else _shared_l_dca()
         self._t_range = None
         self._t_range_n = None
 
@@ -158,14 +168,16 @@ class decline_solver:
         for var_name, var_value in zip(self.variables_to_solve, vec):
             setattr(self, var_name, float(var_value))
 
-        self.l_dca.D_MIN = self.dmin
         tn = int(self.t_max)
         if self._t_range_n != tn or self._t_range is None:
             self._t_range = np.arange(tn, dtype=float)
             self._t_range_n = tn
         t_range = self._t_range
 
-        dca_array = np.asarray(self.l_dca.arps_decline(t_range, self.qi, self.de, self.b, 0), dtype=float)
+        dca_array = np.asarray(
+            self.l_dca.arps_decline(t_range, self.qi, self.de, self.b, 0, dmin=self.dmin),
+            dtype=float,
+        )
         dca_array = np.where(dca_array > self.qf, dca_array, 0)
 
         self.l_t_max = len(np.where(dca_array > 0)[0])
@@ -183,7 +195,9 @@ class decline_solver:
         Solve for optimal decline curve parameters.
         
         Returns:
-            tuple: (qi, t_max, qf, de, eur, warning_flag, delta)
+            tuple: (qi, t_max, qf, de, eur, warning_flag, delta). ``warning_flag``
+            is True when the solved curve misses the EUR target by more than a
+            small relative tolerance (e.g. the target is unreachable).
         """
         self.determine_solve()
         
@@ -199,28 +213,39 @@ class decline_solver:
         def objective(vec):
             return float(self.dca_delta(vec))
 
-        res = None
-        opt_success = True
         try:
             if len(self.variables_to_solve) == 1:
                 lo, hi = bounds[0]
-                if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+                if not (np.isfinite(lo) and np.isfinite(hi) and 0 < lo < hi):
                     result = x0.copy()
-                    opt_success = False
                 else:
-                    def objective_scalar(xx):
-                        return float(self.dca_delta(np.array([float(xx)])))
+                    # Bounds span many decades, so search in log space: a coarse grid
+                    # (plus the initial guess) brackets the minimum, then Brent refines.
+                    # A linear-scale search probes only the top of the range, where
+                    # every curve looks alike, and can stall at the upper bound.
+                    def objective_log(g):
+                        return float(self.dca_delta(np.array([float(np.exp(g))])))
 
-                    res_sc = minimize_scalar(
-                        objective_scalar,
-                        bounds=(lo, hi),
-                        method="bounded",
-                        options={"maxiter": 120, "xatol": 1e-9},
-                    )
+                    grid = np.linspace(np.log(lo), np.log(hi), _SOLVER_LOG_GRID_POINTS)
+                    if np.isfinite(x0[0]) and x0[0] > 0:
+                        grid = np.unique(np.append(grid, np.log(x0[0])))
+                    vals = np.array([objective_log(g) for g in grid])
+                    i_best = int(np.argmin(vals))
+                    g_lo = grid[max(i_best - 1, 0)]
+                    g_hi = grid[min(i_best + 1, len(grid) - 1)]
+                    g_best = grid[i_best]
+                    if g_lo < g_hi:
+                        res_sc = minimize_scalar(
+                            objective_log,
+                            bounds=(g_lo, g_hi),
+                            method="bounded",
+                            options={"maxiter": 200, "xatol": 1e-12},
+                        )
+                        if float(res_sc.fun) <= vals[i_best]:
+                            g_best = float(res_sc.x)
                     result = np.array(
-                        [float(np.clip(res_sc.x, lo, hi))], dtype=float
+                        [float(np.clip(np.exp(g_best), lo, hi))], dtype=float
                     )
-                    opt_success = bool(getattr(res_sc, "success", True))
             else:
                 res = minimize(
                     objective,
@@ -231,20 +256,19 @@ class decline_solver:
                 )
                 result = np.atleast_1d(res.x).astype(float, copy=False).ravel()
                 result = np.clip(result, lb, ub)
-                opt_success = bool(res.success)
         except Exception:
-            opt_success = False
             result = x0.copy()
 
         self.dca_delta(result)
 
-        if len(self.variables_to_solve) == 1:
-            warning_flag = bool(not opt_success and self.delta > 1e-5)
-        elif res is not None:
-            # L-BFGS-B may set success=False on tight ftol while the residual is negligible.
-            warning_flag = bool(not res.success and self.delta > 1e-5)
-        else:
-            warning_flag = True
+        # Judge the solve by its residual rather than optimizer status: bounded
+        # optimizers report success when pinned at a bound on an unreachable EUR,
+        # and L-BFGS-B may report failure on a tight ftol with a negligible residual.
+        # Volumes are monthly sums truncated at ``qf``, so cumulative moves in steps
+        # of about one month at the economic limit; residuals below that are noise.
+        qf_step = float(self.qf) if self.qf is not None and np.isfinite(self.qf) else 0.0
+        tol = max(_SOLVER_ABS_TOL, _SOLVER_REL_TOL * abs(float(self.eur)), qf_step)
+        warning_flag = bool(not np.isfinite(self.delta) or self.delta > tol)
 
         if self.qf is None:
             self.qf = self.l_qf

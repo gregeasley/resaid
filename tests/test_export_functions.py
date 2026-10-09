@@ -25,6 +25,7 @@ class TestExportFunctions(unittest.TestCase):
     
     def setUp(self):
         """Set up test data."""
+        np.random.seed(0)  # reproducible noise
         # Create sample production data
         dates = pd.date_range(start='2020-01-01', end='2023-12-01', freq='ME')
         wells = ['WELL001', 'WELL002', 'WELL003']
@@ -302,22 +303,20 @@ class TestExportFunctions(unittest.TestCase):
     
     def test_export_with_three_phase_mode(self):
         """Test export functionality with three-phase mode."""
-        # Skip this test for now as three-phase mode has issues
-        self.skipTest("Three-phase mode export testing skipped due to column issues")
-        
-        # Enable three-phase mode
         self.dca.three_phase_mode = True
-        
-        # Run DCA
         self.dca.run_DCA()
-        
-        # Test ARIES export with three-phase mode
+        self.assertEqual(len(self.dca.params_dataframe), 3 * len(self.production_df['UID'].unique()))
+
         output_file = os.path.join(self.temp_dir, 'test_three_phase_aries.txt')
-        result_df = self.dca.generate_aries_export(output_file)
-        
-        # Should work without errors
-        self.assertTrue(os.path.exists(output_file))
-        self.assertIsInstance(result_df, pd.DataFrame)
+        result = self.dca.generate_aries_export(output_file, write_water=True)
+        self.assertIsNone(result)  # writes to file only
+
+        with open(output_file, encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        headers = {line.strip() for line in lines if line and not line.startswith(' ')}
+        self.assertEqual(headers, set(self.production_df['UID'].unique()))
+        for label in ('  OIL ', '  GAS ', '  WTR '):
+            self.assertTrue(any(line.startswith(label) for line in lines), label)
     
     def test_export_error_handling(self):
         """Test error handling in export functions."""

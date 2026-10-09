@@ -2,6 +2,16 @@
 
 This document provides an analysis of the PhdWin database structure based on the latest pytopspeed-modernized 1.1.3 conversion.
 
+> **Status in RESAID:** `PhdWinDatabase` converts these files to SQLite, but RESAID does not
+> map any of the tables below. Its default mappings are the ARIES names (`AC_PRODUCT`,
+> `PROPNUM`, ...), which do not exist here, so you must name a production table and columns
+> yourself. The tables described here store production per product code or per year
+> (`PROD1`..`PROD5`) with integer dates (days since 1800-12-28). `prepare_data_for_dca`
+> expects one row per well and date with oil, gas and water columns, and parses any column
+> whose name contains `DATE` or `PROD` with `pd.to_datetime`. The data therefore needs
+> reshaping and date conversion before it can feed the DCA. The "RESAID Integration"
+> sections below are a planning guide, not implemented behavior.
+
 ## ⚠️ Important Note About Sample Data
 
 **The sample data in this documentation is from a previous conversion and may not reflect the current database structure.** The latest pytopspeed-modernized 1.1.3 conversion has significantly improved the data structure, with proper column names and structured data instead of binary strings. 
@@ -10,7 +20,7 @@ This document provides an analysis of the PhdWin database structure based on the
 - Tables now have proper column names (e.g., `LSE_ID`, `PRODUCTCODE`, `CUMXPROD`)
 - Data is structured and readable instead of binary strings
 - All 76 tables successfully converted with 14,756 total records
-- Primary production tables have proper structure for DCA integration
+- Primary production tables are readable, but need reshaping before DCA use (see the status note above)
 
 **For the most accurate and up-to-date table structures, please refer to the actual SQLite database file: `reference/test_phdwin_output.sqlite`**
 

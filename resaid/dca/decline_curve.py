@@ -135,9 +135,17 @@ class decline_curve:
         DAYS_PER_MONTH: Days per month normalization factor
         GAS_CUTOFF: Gas-oil ratio cutoff for phase classification (MSCF/STB)
         STANDARD_LENGTH: Standard lateral length for normalization (ft)
-        MIN_DECLINE_RATE: Minimum monthly decline rate
-        default_initial_decline: Default initial decline rate
-        default_b_factor: Default Arps b-factor
+        MIN_DECLINE_RATE: Terminal decline, nominal per month (Arps curves switch
+            to exponential at this rate)
+        default_initial_decline: Initial decline for backup fits (``backup_decline``)
+        default_b_factor: b-factor for backup fits (``backup_decline``)
+        min_h_b, max_h_b: b-factor bounds used when fitting (all wells)
+        backup_decline: Give failed fits a backup decline instead of NaN parameters
+        outlier_correction, iqr_limit: Ratio mode only; cap high minor/water ratios
+            with an IQR rule
+        filter_bonfp: Bonferroni p-value cutoff for removing outlier months
+        detect_step_changes: Fit only the latest regime after a sustained step up
+            in rate (see ``_latest_regime_start``)
         three_phase_mode: Enable three-phase forecasting mode
         fit_method: How ``dca_params`` estimates parameters per row (default
             ``DCA_FIT_METHOD_DEFAULT``; optional ``DCA_FIT_METHOD_MONOTONE_TWO_STEP``).
@@ -154,13 +162,12 @@ class decline_curve:
         # User-configurable parameters
         self.verbose = False
         self.debug_on = False
+        # Run log in the current working directory; opened on first write (see
+        # ``STAT_FILE``). Set to ``None`` to disable file logging.
         self.stat_file_path = Path.cwd() / "DCA_LOG.txt"
-        try:
-            # Default run log in the current working directory.
-            self.STAT_FILE = open(self.stat_file_path, "a", encoding="utf-8", buffering=1)
-        except OSError:
-            # Fallback keeps prior behavior if the cwd is not writable.
-            self.STAT_FILE = None
+        self._stat_file = None
+        self._owns_stat_file = False
+        self._stat_file_disabled = False
         self.filter_bonfp = .5  # Bonferroni correction threshold
         self.default_initial_decline = .8/12
         self.default_b_factor = .5
@@ -171,6 +178,14 @@ class decline_curve:
         
         self.backup_decline = False
         self.qi_tail_points = 3
+
+        # Step-change (restim / recovery) handling: fit only the latest regime that
+        # starts with a sustained step up in rate. See ``_latest_regime_start``.
+        self.detect_step_changes = True
+        self.step_change_ratio = 1.5  # post/pre median rate ratio that counts as a step up
+        self.step_change_lookback = 6  # months before a candidate step (median baseline)
+        self.step_change_window = 3  # months after a candidate step (median level)
+        self.step_change_min_points = 6  # months needed from the regime peak to fit it
         self._dataframe = None
         self._date_col = None
         self._phase_col = None
@@ -204,7 +219,55 @@ class decline_curve:
         self.tc_params = pd.DataFrame()
         self.tc_params_flowstream = pd.DataFrame()
         self.dca_param_df = []
-        
+
+    @property
+    def STAT_FILE(self):
+        """
+        Text stream for the run log, opened lazily at ``stat_file_path``.
+
+        Returns ``None`` when ``stat_file_path`` is ``None`` or cannot be opened.
+        Assign any writable stream (e.g. ``sys.stdout``) to log there instead, or
+        ``None`` to disable the log file; assigned streams are never closed by
+        ``close()``.
+        """
+        if (
+            self._stat_file is None
+            and not self._stat_file_disabled
+            and self.stat_file_path is not None
+        ):
+            try:
+                self._stat_file = open(self.stat_file_path, "a", encoding="utf-8", buffering=1)
+                self._owns_stat_file = True
+            except OSError:
+                self._stat_file_disabled = True
+        return self._stat_file
+
+    @STAT_FILE.setter
+    def STAT_FILE(self, value):
+        self.close()
+        self._stat_file = value
+        self._owns_stat_file = False
+        self._stat_file_disabled = value is None
+
+    def close(self):
+        """Close the run log if this instance opened it. Safe to call repeatedly."""
+        f = getattr(self, "_stat_file", None)
+        if f is not None and getattr(self, "_owns_stat_file", False):
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._stat_file = None
+        self._owns_stat_file = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def __del__(self):
+        self.close()
 
     @property
     def dataframe(self):
@@ -320,16 +383,11 @@ class decline_curve:
         return self._typecurve
 
     def month_diff(self, a, b):
+        """Calculate month difference between two datetime series."""
         return 12 * (a.dt.year - b.dt.year) + (a.dt.month - b.dt.month)
 
     def day_diff(self,a,b):
         return (a - b) / np.timedelta64(1, 'D')
-
-    def infill_production(self):
-        """
-        An error was found where gaps in the historical production would be infilled
-        with the wrong P_DATE
-        """
 
     def generate_t_index(self):
         """Generate time index for production data."""
@@ -579,17 +637,24 @@ class decline_curve:
 
         return np.asarray(kept_x, dtype=float), np.asarray(kept_y, dtype=float)
 
-    def arps_decline(self, x, qi, di, b, t0):
+    def arps_decline(self, x, qi, di, b, t0, dmin=None):
         """
         Calculate Arps decline curve production rates.
-        
+
+        Hyperbolic decline from ``t0`` switches to exponential decline at the
+        terminal rate ``dmin`` once the instantaneous decline falls to ``dmin``.
+        When ``di`` is already at or below ``dmin`` the whole curve is exponential
+        at ``dmin`` starting from ``qi`` at ``t0``.
+
         Args:
             x: Time array
             qi: Initial production rate
             di: Initial decline rate
             b: Arps b-factor
             t0: Time offset
-            
+            dmin: Terminal (minimum) monthly decline rate. ``None`` uses
+                ``MIN_DECLINE_RATE``.
+
         Returns:
             numpy array: Production rates over time
         """
@@ -605,6 +670,7 @@ class decline_curve:
         di = float(di)
         b = float(b)
         t0 = float(t0)
+        d_min = float(self.MIN_DECLINE_RATE if dmin is None else dmin)
 
         bd = b * di
         if not np.isfinite(bd) or abs(bd) < 1e-30:
@@ -612,43 +678,37 @@ class decline_curve:
         else:
             problemX = t0 - 1.0 / bd
 
-        if di < self.MIN_DECLINE_RATE:
+        # ``tlim`` is the switch time to exponential decline at ``d_exp``; ``None``
+        # means the whole curve is exponential at ``d_exp`` from ``qi`` at ``t0``.
+        d_exp = d_min
+        if di < d_min:
             qlim = qi
-            di = float(self.MIN_DECLINE_RATE)
-            tlim = -1
+            tlim = None
+            problemX = -np.inf
+        elif abs(b) < 1e-14:
+            # b -> 0 limit of Arps: constant decline at di (already >= d_min).
+            qlim = qi
+            tlim = None
+            d_exp = di
+        elif d_min > 0:
+            # Instantaneous decline di / (1 + b*di*(t - t0)) reaches d_min at
+            # t = t0 + (di/d_min - 1) / (b*di), where the rate is qi*(d_min/di)**(1/b).
+            # Computed from the decline ratio directly (no round trip through qlim),
+            # so a qlim that underflows to 0 for steep, low-b declines stays 0.
+            t_switch = (di / d_min - 1.0) / (b * di) + t0
+            tlim = int(t_switch) if np.isfinite(t_switch) else np.inf
+            qlim = qi * float(np.exp(max((1.0 / b) * np.log(d_min / di), -745.0)))
         else:
-            ratio = self.MIN_DECLINE_RATE / di
-            if ratio <= 0 or not np.isfinite(ratio) or abs(b) < 1e-14:
-                qlim = qi
-            else:
-                qlim = qi * float(np.exp((1.0 / b) * np.log(ratio)))
-            if not np.isfinite(qlim) or qlim <= 0:
-                qlim = qi
-            try:
-                inner = (qi / qlim) ** (b) - 1.0
-                den_tl = b * di
-                if abs(den_tl) < 1e-30 or not np.isfinite(inner):
-                    tlim = -1
-                else:
-                    tlim = int(inner / den_tl + t0)
-                    if not np.isfinite(tlim):
-                        tlim = -1
-            except Exception:
-                if self.verbose:
-                    logger.warning(
-                        "DCA tlim calculation error: qi=%s, qlim=%s, di=%s, b=%s",
-                        qi,
-                        qlim,
-                        di,
-                        b,
-                    )
-                tlim = -1
+            # No terminal decline: hyperbolic for all time.
+            qlim = qi
+            tlim = np.inf
 
         mask_outer = (x_arr > problemX) & np.isfinite(x_arr)
         q_x = np.zeros_like(x_arr, dtype=float)
 
-        if tlim < 0 or not np.isfinite(tlim):
+        if tlim is None:
             mask_hyp = np.zeros_like(x_arr, dtype=bool)
+            tlim = t0
         else:
             mask_hyp = mask_outer & (x_arr < float(tlim))
 
@@ -667,7 +727,7 @@ class decline_curve:
 
         if np.any(mask_exp):
             q_x[mask_exp] = qlim * np.exp(
-                -self.MIN_DECLINE_RATE * (x_arr[mask_exp] - float(tlim))
+                -d_exp * (x_arr[mask_exp] - float(tlim))
             )
 
         return float(q_x[0]) if squeeze_back else q_x
@@ -870,6 +930,48 @@ class decline_curve:
             for key, label in _LEGACY_ADJUSTMENT_REPORT:
                 print(f"    - {label}: {ac.get(key, 0)}", file=sf, flush=True)
         print(f"  Wall time: {elapsed_sec:.2f} seconds", file=sf, flush=True)
+
+    def _latest_regime_start(self, y_vals):
+        """
+        Index of the peak that starts the latest production regime, or 0.
+
+        A regime starts at month ``i`` when the median rate over the next
+        ``step_change_window`` months exceeds ``step_change_ratio`` times the median
+        positive rate over the previous ``step_change_lookback`` months (a restim,
+        recompletion, or return from curtailment to a higher level). Medians keep
+        one-off dips and shut-in months from triggering. The regime begins at its
+        peak within the following ``step_change_lookback`` months, and only regimes
+        with at least ``step_change_min_points`` months from that peak count, so a
+        step too recent to fit leaves the earlier regime in use.
+        """
+        if not self.detect_step_changes:
+            return 0
+        y = np.asarray(y_vals, dtype=float)
+        n = len(y)
+        lookback = max(int(self.step_change_lookback), 2)
+        window = max(int(self.step_change_window), 1)
+        min_points = max(int(self.step_change_min_points), 4)
+
+        start = 0
+        i = 1
+        while i < n - window + 1:
+            before = y[max(0, i - lookback):i]
+            before = before[np.isfinite(before) & (before > 0)]
+            after = y[i:i + window]
+            if len(before) >= 2 and np.all(np.isfinite(after)):
+                baseline = float(np.median(before))
+                if float(np.median(after)) > self.step_change_ratio * baseline:
+                    seg = y[i:i + lookback]
+                    peak = i + int(np.nanargmax(seg))
+                    if n - peak >= min_points:
+                        start = peak
+                    # Resume once the baseline window lies wholly after the peak;
+                    # otherwise pre-step months keep re-triggering the same step and
+                    # walk the start past the true peak.
+                    i = peak + lookback
+                    continue
+            i += 1
+        return start
 
     def _longest_mono_decreasing_span(self, y_vals):
         """Inclusive (start, end) indices of the longest positive, non-increasing run."""
@@ -1136,6 +1238,9 @@ class decline_curve:
                 self.MIN_DECLINE_RATE,
                 min(abs(float(de_stage1)), float(di_max)),
             )
+        # An EUR the tail rate cannot reach drives the solve to its lower bound;
+        # declines below terminal give the same curve, so report the terminal rate.
+        di_new = max(di_new, self.MIN_DECLINE_RATE)
 
         if s["MAJOR"] == "OIL":
             minor_ratio = self._tail_phase_ratio(
@@ -1196,6 +1301,15 @@ class decline_curve:
                 t0Min = x_vals[indexMin]
 
             t0Min, t0Max = min(t0Min, t0Max), max(t0Min, t0Max)
+
+            # After a sustained step up (restim / recovery) fit only the latest
+            # regime; earlier history has a different decline and would bias it.
+            if not self._force_t0:
+                regime = self._latest_regime_start(z)
+                if regime > indexMin:
+                    indexMin = regime
+                    t0Min = x_vals[regime]
+                    t0Max = max(t0Max, t0Min)
 
             filtered_x = np.array(x_vals[indexMin:])
             filtered_y = np.array(y_vals[indexMin:])
@@ -1271,12 +1385,9 @@ class decline_curve:
                     outliered_x, outliered_y, di_int, q_max, q_min
                 )
 
-                if s['HOLE_DIRECTION'] == 'H':
-                    bMin = self.min_h_b
-                    bMax = self.max_h_b
-                else:
-                    bMin = self.min_h_b
-                    bMax = self.max_h_b
+                # Same b-factor bounds apply to horizontal and vertical wells.
+                bMin = self.min_h_b
+                bMax = self.max_h_b
 
                 if self._force_t0:
                     # curve_fit sigma is uncertainty (larger => less weight).
@@ -1420,7 +1531,11 @@ class decline_curve:
                 backup_path_key=DCA_PATH_MONOTONE_BACKUP_PRE,
             )
 
-        for path_key, mono_x, mono_y in self._monotone_fit_xy_candidates(x_vals, y_vals):
+        # After a sustained step up, choose fit windows from the latest regime only.
+        regime = self._latest_regime_start(y_vals)
+        for path_key, mono_x, mono_y in self._monotone_fit_xy_candidates(
+            x_vals[regime:], y_vals[regime:]
+        ):
             try:
                 out = self._monotone_two_step_core(s, x_vals, y_vals, mono_x, mono_y)
                 self._incr_dca_path(path_key)
@@ -1731,6 +1846,16 @@ class decline_curve:
 
 
     def run_DCA(self, _verbose=False):
+        """
+        Fit decline parameters for every well (or well and phase in three-phase mode).
+
+        Builds the time index, normalizes production, and fits each well with
+        ``fit_method``. Results are in ``params_dataframe``; a run summary is written
+        to the run log (``STAT_FILE``).
+
+        Args:
+            _verbose: Log per-well filtering details and step messages.
+        """
         self.verbose = _verbose
         if self.verbose:
             print('Generating time index.', file=self.STAT_FILE, flush=True)
@@ -1757,6 +1882,18 @@ class decline_curve:
         return end_date
     
     def generate_oneline(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, _verbose=False):
+        """
+        Build one summary row per well in ``oneline_dataframe``.
+
+        Regenerates the flowstream (running ``run_DCA`` first if needed). ``OIL``,
+        ``GAS`` and ``WATER`` are each well's flowstream volume summed over the
+        horizon; decline parameter columns depend on ``three_phase_mode``.
+
+        Args:
+            num_months: Forecast horizon in months.
+            denormalize: Scale from the standard lateral length to each well's own.
+            _verbose: Passed to ``run_DCA`` if it has to run.
+        """
         self.verbose = _verbose
 
         self.generate_flowstream(num_months=num_months,denormalize=denormalize,actual_dates=False,_verbose=_verbose)
@@ -1900,6 +2037,20 @@ class decline_curve:
 
 
     def generate_flowstream(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, actual_dates=False, _verbose=False):
+        """
+        Build monthly modeled volumes per well in ``flowstream_dataframe``.
+
+        Runs ``run_DCA`` first if needed. The result is indexed by ``[UID, T_INDEX]``
+        with ``T_INDEX`` from 1 to ``num_months - 1`` counted from each well's first
+        production month, and columns ``OIL``, ``GAS``, ``WATER`` (plus ``MAJOR`` in
+        ratio mode).
+
+        Args:
+            num_months: Forecast horizon in months.
+            denormalize: Scale from the standard lateral length to each well's own.
+            actual_dates: Add a ``P_DATE`` column (populated only on history rows).
+            _verbose: Passed to ``run_DCA`` if it has to run.
+        """
         self.verbose = _verbose
 
         if self._params_dataframe.empty:
@@ -2092,11 +2243,31 @@ class decline_curve:
         self,
         num_months=DEFAULT_FORECAST_HORIZON_MONTHS,
         denormalize=False,
-        prob_levels=[.1, .5, .9],
+        prob_levels=None,
         _verbose=False,
         return_params=False,
         return_params_flowstream=False,
     ):
+        """
+        Build probabilistic type curves in ``typecurve``.
+
+        Overlays each well's history on its forecast, then takes per-month quantiles
+        (``prob_levels``, default 0.1/0.5/0.9) and the mean across wells. Columns are
+        ``(phase, level)``; level 0.1 is the low case (P90 in reserves terms).
+
+        Args:
+            num_months: Forecast horizon in months.
+            denormalize: Scale from the standard lateral length to each well's own.
+            prob_levels: Quantile levels to compute.
+            _verbose: Passed to ``run_DCA`` if it has to run.
+            return_params: Also fit Arps parameters per phase and level into
+                ``tc_params``, with the decline matched to the same quantile of
+                per-well EURs (``curve_eur``).
+            return_params_flowstream: Also rebuild monthly rates from those
+                parameters into ``tc_params_flowstream``.
+        """
+        if prob_levels is None:
+            prob_levels = [.1, .5, .9]
         if self._flowstream_dataframe is None:
             self.generate_flowstream(num_months=num_months, denormalize=denormalize, _verbose=_verbose)
         if self._oneline.empty:
@@ -2996,10 +3167,6 @@ class decline_curve:
 
         return imploded_df
 
-    def month_diff(self, a, b):
-        """Calculate month difference between two datetime series."""
-        return 12 * (a.dt.year - b.dt.year) + (a.dt.month - b.dt.month)
-
     @staticmethod
     def _arps_rate_from_tau(qi, di, b, tau):
         """Arps rate at elapsed months ``tau = t - t0``."""
@@ -3142,7 +3309,8 @@ class decline_curve:
         Uses the production data already loaded into the decline_curve object.
         
         Returns:
-            DataFrame: Contains UID, L3M_OIL, L3M_GAS, L3M_WATER, L3M_START
+            DataFrame: Contains UID, L3M_OIL, L3M_GAS, L3M_WATER (mean raw volumes of
+            each well's last 3 rows) and L3M_START (its latest production date)
         """
         if self._dataframe is None:
             raise ValueError("No production data loaded. Set dataframe first.")
@@ -3182,7 +3350,7 @@ class decline_curve:
             oneline_df: Oneline results dataframe (uses self._oneline if None)
             file_path: Output file path
             scenario: Scenario name for ARIES
-            dmin: Minimum decline rate
+            dmin: Terminal (minimum) decline, % per year
             write_water: Whether to include water production
         """
         if oneline_df is None:
@@ -3303,7 +3471,7 @@ class decline_curve:
             oneline_df: Oneline results dataframe with phase-specific columns
             file_path: Output file path
             scenario: Scenario name for ARIES
-            dmin: Minimum decline rate
+            dmin: Terminal (minimum) decline, % per year
             write_water: Whether to include water production
         """
         if oneline_df is None:
@@ -3447,13 +3615,16 @@ class decline_curve:
         Generate ARIES export with integrated DCA analysis.
         
         This method combines DCA analysis with ARIES export generation.
-        When three_phase_mode is enabled, it uses the existing three-phase analysis.
-        Otherwise, it creates separate analyses for each phase.
+        When three_phase_mode is enabled, each phase uses its own fitted decline.
+        Otherwise (ratio mode) the minor phase and water follow the major phase's
+        decline, scaled by MINOR_RATIO and WATER_RATIO. Runs ``run_DCA`` and
+        ``generate_oneline(denormalize=True)`` first if needed. Writes the file
+        (creating its directory) and returns None.
         
         Args:
             file_path: Output file path
             scenario: Scenario name for ARIES
-            dmin: Minimum decline rate
+            dmin: Terminal (minimum) decline, % per year
             write_water: Whether to include water production
         """
         # Run DCA if not already done
@@ -3573,13 +3744,16 @@ class decline_curve:
         
         This method creates a comprehensive export for Mosaic software including
         all phases (OIL, GAS, WATER) with proper formatting and calculations.
-        When three_phase_mode is enabled, it uses the existing three-phase analysis.
-        Otherwise, it creates separate analyses for each phase.
+        When three_phase_mode is enabled, each phase uses its own fitted decline.
+        Otherwise (ratio mode) the minor phase and water follow the major phase's
+        decline, scaled by MINOR_RATIO and WATER_RATIO. Runs ``run_DCA`` and
+        ``generate_oneline(denormalize=True)`` first if needed. Writes the file
+        (creating its directory) and returns None.
         
         Args:
             file_path: Output file path (Excel format)
             reserve_category: Reserve category for Mosaic
-            dmin: Minimum decline rate
+            dmin: Terminal (minimum) decline, % per year
         """
         # Run DCA if not already done
         if self._params_dataframe.empty:
@@ -3776,21 +3950,18 @@ class decline_curve:
         
         This method creates a comprehensive export for PhdWin software including
         all phases (OIL, GAS, WATER) with proper formatting and calculations.
-        When three_phase_mode is enabled, it uses the existing three-phase analysis.
-        Otherwise, it creates separate analyses for each phase.
+        When three_phase_mode is enabled, each phase uses its own fitted decline.
+        Otherwise (ratio mode) the minor phase and water follow the major phase's
+        decline, scaled by MINOR_RATIO and WATER_RATIO. Runs ``run_DCA`` and
+        ``generate_oneline(denormalize=True)`` first if needed. Writes the file
+        (creating its directory) and returns None.
         
         Args:
             file_path: Output file path (CSV format)
-            dmin: Minimum decline rate
+            dmin: Terminal (minimum) decline, % per year
         """
         # Run DCA if not already done
         if self._params_dataframe.empty:
-            # Set parameters to match reference script
-            #self.D_MIN = 0.06/12
-            #self.backup_decline = False
-            #self.OUTLIER_CORRECTION = False
-            #self.min_h_b = 0.01
-            #self.max_h_b = 1.3
             self.run_DCA()
         
         # Generate oneline if not already done

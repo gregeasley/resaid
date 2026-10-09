@@ -31,7 +31,7 @@ def run_dca_analysis(mode='original'):
     l_dca.water_col = 'WaterProd_BBL'
     l_dca.min_h_b = 0.9
     l_dca.max_h_b = 1.3
-    l_dca.OUTLIER_CORRECTION = False
+    l_dca.outlier_correction = False
     
     # Set mode
     if mode == 'three_phase':

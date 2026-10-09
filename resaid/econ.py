@@ -8,9 +8,11 @@ Classes:
     npv_calc: Net Present Value and Internal Rate of Return calculations
     well_econ: Well economics analysis with cashflow generation and indicators
 
+All cashflows are monthly: discount rates are per month and IRR is annualized.
+
 Features:
     - NPV and IRR calculations for cashflow analysis
-    - Multi-phase production economics (oil, gas, water, NGL)
+    - Multi-phase production economics (oil, gas and NGL revenue; oil, gas and water costs)
     - Royalty and working interest calculations
     - Operating cost and capital expenditure modeling
     - Severance tax calculations
@@ -55,8 +57,12 @@ class npv_calc:
         """
         Calculate Net Present Value at given discount rate.
         
+        The first cashflow is undiscounted; each later one is discounted by one
+        more period.
+        
         Args:
-            discount_rate (float): Annual discount rate (e.g., 0.1 for 10%)
+            discount_rate (float): Discount rate per period. For monthly cashflows
+                use a monthly rate, e.g. ``0.10 / 12`` for 10% per year.
             
         Returns:
             float: Net Present Value
@@ -66,13 +72,15 @@ class npv_calc:
     
     def get_irr(self, iterations=50):
         """
-        Calculate Internal Rate of Return.
+        Calculate Internal Rate of Return for monthly cashflows.
         
         Args:
             iterations (int): Maximum iterations for Newton's method
             
         Returns:
-            float: Annual Internal Rate of Return (as percentage)
+            float: Annualized IRR as a fraction (12 x the monthly rate; 0.25 = 25%).
+            Returns 0 when the undiscounted cashflow sum is negative. Raises if
+            Newton's method does not converge.
         """
         guess = 0.1 / 12  # Initial guess of 10% annual rate
 
@@ -96,6 +104,11 @@ class well_econ:
     This class provides comprehensive economic analysis for oil and gas wells,
     including cashflow generation, economic indicators calculation, and
     multi-phase production economics.
+    
+    ``flowstreams`` needs one row per well per month with the well ID and
+    ``T_INDEX`` as columns (e.g. ``decline_curve.flowstream_dataframe.reset_index()``)
+    and ``OIL``, ``GAS``, ``WATER`` volumes. ``discount_rate`` (monthly) must be set;
+    other prices, costs and taxes default to 0.
     
     Attributes:
         OIL_COL (str): Column name for oil production data
@@ -294,6 +307,10 @@ class well_econ:
         """
         Generate CAPEX array for given time periods and well.
         
+        CAPEX is charged in the first period. Its amount comes from ``capex_col``
+        in the header data if set; otherwise ``capex_val * scale_column`` when
+        ``scale_capex`` is True; otherwise the flat ``capex_val``.
+        
         Args:
             times (np.array): Array of time periods
             well (str): Well identifier
@@ -344,13 +361,19 @@ class well_econ:
 
     def well_flowstream(self, input_well):
         """
-        Generate cashflow for a specific well.
+        Generate the monthly cashflow for a specific well.
         
         Args:
-            input_well (str): Well identifier
+            input_well (str): Well identifier (value of ``flowstream_uwi_col``)
             
         Returns:
-            pd.DataFrame: Cashflow DataFrame for the well
+            pd.DataFrame: The well's flowstream rows plus revenue, royalty, expense,
+            tax, capex, ``cf``/``dcf`` and ``wi_*``/``net_*`` columns. Volumes and
+            cashflows after the economic limit (last month with positive ``dcf``)
+            are zeroed.
+            
+        Raises:
+            ValueError: If the well is not in ``flowstreams``.
         """
         l_flow = self._flowstreams[self._flowstreams[self._flowstream_uwi_col] == input_well].reset_index(drop=True)
         
@@ -632,7 +655,11 @@ class well_econ:
         Generate economic indicators for all wells.
         
         Calculates various economic metrics including EUR, revenue, IRR, ROI,
-        payback period, and breakeven analysis for each well.
+        payback period, and breakeven analysis for each well. Columns: ``UWI``,
+        ``EURO``, ``EURG``, ``EURW``, ``REVENUE``, ``ROYALTY``, ``OPEX``, ``TAXES``,
+        ``CAPEX``, ``FCF``, ``DCF``, ``IRR`` (annualized fraction), ``ROI``,
+        ``PAYOUT`` (month index; 0 also when the well never pays out),
+        ``BREAKEVEN`` and ``BREAKEVEN_PHASE``.
         
         Returns:
             None: Sets self._indicators to a DataFrame with economic indicators

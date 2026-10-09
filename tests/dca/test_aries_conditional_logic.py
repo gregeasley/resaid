@@ -1,185 +1,85 @@
-#!/usr/bin/env python3
 """
-Test script to verify that the three-phase ARIES export correctly implements
-the conditional logic for decline type selection (hyperbolic vs exponential vs flat).
+ARIES export decline-type selection (hyperbolic / exponential / flat).
+
+Every phase line written by ``generate_aries_export`` is checked against an
+independent model of the selection rules, across scenarios chosen so that each
+branch is exercised.
 """
 
-import pandas as pd
-import numpy as np
-import sys
-import os
-from io import StringIO
-from contextlib import redirect_stdout
+from __future__ import annotations
 
-# Add the parent directory to the path to import resaid
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+import pytest
 
-from resaid.dca import decline_curve
+from aries_helpers import expected_aries, fit, make_production, parse_aries
+
+SCENARIO = "TEST"
 
 
-def create_test_data_with_different_conditions():
-    """Create test data that will trigger different conditional logic paths"""
-    np.random.seed(42)  # For reproducible results
-    
-    # Create test data for wells with different characteristics
-    wells = [f'CONDITIONAL_TEST_WELL_{i:03d}' for i in range(1, 4)]
-    dates = pd.date_range('2023-01-01', periods=12, freq='ME')
-    
-    data = []
-    for i, well in enumerate(wells):
-        for j, date in enumerate(dates):
-            # Create different production profiles for each well
-            if i == 0:  # Well 1: High production, should trigger hyperbolic
-                oil_prod = max(2000 * np.exp(-0.05 * j) + np.random.normal(0, 100), 0)
-            elif i == 1:  # Well 2: Medium production, should trigger exponential
-                oil_prod = max(1000 * np.exp(-0.1 * j) + np.random.normal(0, 50), 0)
-            else:  # Well 3: Low production, should trigger flat
-                oil_prod = max(100 * np.exp(-0.2 * j) + np.random.normal(0, 10), 0)
-            
-            gas_prod = oil_prod * (1000 + np.random.normal(0, 100))
-            water_prod = oil_prod * (0.5 + np.random.normal(0, 0.1))
-            
-            data.append({
-                'API_UWI': well,
-                'MAJOR': 'OIL',
-                'ProducingMonth': date,
-                'LateralLength_FT': 5000,
-                'LiquidsProd_BBL': oil_prod,
-                'GasProd_MCF': gas_prod,
-                'WaterProd_BBL': water_prod
-            })
-    
-    return pd.DataFrame(data)
+def _export_and_compare(dca, tmp_path, dmin, write_water=True):
+    path = tmp_path / f"aries_{dmin}.txt"
+    dca.generate_aries_export(file_path=str(path), scenario=SCENARIO, dmin=dmin, write_water=write_water)
+    actual = parse_aries(path, SCENARIO)
+    expected = expected_aries(dca, dmin, write_water)
+
+    assert set(actual) == set(expected)
+    for uid, exp in expected.items():
+        got = actual[uid]
+        assert got["start"] == exp["start"], uid
+        assert set(got["phases"]) == set(exp["phases"]), uid
+        for label, exp_line in exp["phases"].items():
+            got_line = got["phases"][label]
+            assert got_line["kind"] == exp_line["kind"], (uid, label, got_line, exp_line)
+            for key, value in exp_line.items():
+                if key != "kind":
+                    assert got_line[key] == pytest.approx(value), (uid, label, key)
+    return actual
 
 
-def test_conditional_logic():
-    """Test that the conditional logic works correctly for different scenarios"""
-    print("Testing conditional logic in three-phase ARIES export...")
-    
-    # Create test data
-    test_df = create_test_data_with_different_conditions()
-    
-    dca = decline_curve()
-    dca.dataframe = test_df
-    dca.date_col = 'ProducingMonth'
-    dca.uid_col = 'API_UWI'
-    dca.oil_col = 'LiquidsProd_BBL'
-    dca.gas_col = 'GasProd_MCF'
-    dca.water_col = 'WaterProd_BBL'
-    dca.phase_col = 'MAJOR'
-    dca.length_col = 'LateralLength_FT'
-    dca.backup_decline = True
-    dca.three_phase_mode = True
-    
-    # Run DCA and generate oneline
-    dca.run_DCA(_verbose=False)
-    dca.generate_oneline(denormalize=True, _verbose=False)
-    
-    # Generate ARIES export to test the conditional logic
-    output_file = "tests/test_aries_conditional_logic.txt"
-    
-    # Capture any output
-    with redirect_stdout(StringIO()):
-        dca.generate_aries_export(file_path=output_file, scenario="TEST", dmin=6, write_water=True)
-    
-    # Check if the file was created
-    if os.path.exists(output_file):
-        print("   ✓ ARIES export file created successfully")
-        
-        # Read the file and analyze the conditional logic
-        with open(output_file, 'r') as f:
-            content = f.read()
-        
-        lines = content.split('\n')
-        
-        # Look for different decline type patterns
-        hyperbolic_lines = [line for line in lines if "EXP B/" in line and "TEST" in line]
-        exponential_lines = [line for line in lines if "99 YRS EXP" in line and "EXP B/" not in line and "TEST" in line]
-        flat_lines = [line for line in lines if "1 YRS FLAT" in line and "TEST" in line]
-        
-        print(f"   ✓ Found {len(hyperbolic_lines)} hyperbolic decline lines")
-        print(f"   ✓ Found {len(exponential_lines)} exponential decline lines")
-        print(f"   ✓ Found {len(flat_lines)} flat decline lines")
-        
-        # Show examples of each type
-        if hyperbolic_lines:
-            print(f"   Sample hyperbolic: {hyperbolic_lines[0].strip()}")
-        if exponential_lines:
-            print(f"   Sample exponential: {exponential_lines[0].strip()}")
-        if flat_lines:
-            print(f"   Sample flat: {flat_lines[0].strip()}")
-        
-        # Verify that we have different decline types (indicating conditional logic is working)
-        total_decline_lines = len(hyperbolic_lines) + len(exponential_lines) + len(flat_lines)
-        if total_decline_lines > 0:
-            print(f"   ✓ Total decline lines found: {total_decline_lines}")
-            print("   ✓ Conditional logic appears to be working correctly")
-        else:
-            print("   ⚠ No decline lines found - conditional logic may not be working")
-        
-        # Clean up test file
-        os.remove(output_file)
-        
-    else:
-        print("   ✗ ARIES export file was not created")
+@pytest.mark.parametrize("three_phase", [True, False], ids=["three_phase", "ratio"])
+def test_hyperbolic_lines_match_model(tmp_path, three_phase):
+    dca = fit(make_production(), three_phase)
+    actual = _export_and_compare(dca, tmp_path, dmin=6)
+    kinds = {p["kind"] for w in actual.values() for p in w["phases"].values()}
+    assert "hyperbolic" in kinds
 
 
-def test_minimum_decline_logic():
-    """Test that the minimum decline rate logic works correctly"""
-    print("\nTesting minimum decline rate logic...")
-    
-    # Create test data
-    test_df = create_test_data_with_different_conditions()
-    
-    dca = decline_curve()
-    dca.dataframe = test_df
-    dca.date_col = 'ProducingMonth'
-    dca.uid_col = 'API_UWI'
-    dca.oil_col = 'LiquidsProd_BBL'
-    dca.gas_col = 'GasProd_MCF'
-    dca.water_col = 'WaterProd_BBL'
-    dca.phase_col = 'MAJOR'
-    dca.length_col = 'LateralLength_FT'
-    dca.backup_decline = True
-    dca.three_phase_mode = True
-    
-    # Run DCA and generate oneline
-    dca.run_DCA(_verbose=False)
-    dca.generate_oneline(denormalize=True, _verbose=False)
-    
-    # Test with different minimum decline rates
-    for dmin in [6, 12, 18]:
-        output_file = f"tests/test_aries_dmin_{dmin}.txt"
-        
-        with redirect_stdout(StringIO()):
-            dca.generate_aries_export(file_path=output_file, scenario="TEST", dmin=dmin, write_water=True)
-        
-        if os.path.exists(output_file):
-            with open(output_file, 'r') as f:
-                content = f.read()
-            
-            # Count lines with the specific dmin value
-            dmin_lines = [line for line in content.split('\n') if f"EXP {dmin}" in line and "TEST" in line]
-            print(f"   ✓ dmin={dmin}: Found {len(dmin_lines)} lines with minimum decline rate")
-            
-            # Clean up
-            os.remove(output_file)
+def test_low_b_uses_exponential_at_revised_decline(tmp_path):
+    # Force b <= 0.05 so the hyperbolic branch is not eligible.
+    dca = fit(make_production(), True, min_h_b=0.01, max_h_b=0.04)
+    actual = _export_and_compare(dca, tmp_path, dmin=6)
+    lines = [p for w in actual.values() for p in w["phases"].values()]
+    assert lines and all(p["kind"] == "exponential" for p in lines)
+    assert any(p["de"] > 6 for p in lines)
 
 
-if __name__ == "__main__":
-    print("ARIES Conditional Logic Test")
-    print("=" * 50)
-    
-    try:
-        test_conditional_logic()
-        test_minimum_decline_logic()
-        
-        print("\n" + "=" * 50)
-        print("✓ All conditional logic tests completed!")
-        
-    except Exception as e:
-        print(f"\n✗ Test failed with error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+def test_decline_below_dmin_uses_terminal_exponential(tmp_path):
+    # With a very high terminal decline every revised decline is below dmin.
+    dca = fit(make_production(), True)
+    actual = _export_and_compare(dca, tmp_path, dmin=99)
+    lines = [p for w in actual.values() for p in w["phases"].values()]
+    assert lines and all(p["kind"] == "exponential" and p["de"] == 99 for p in lines)
 
+
+def test_shut_in_well_is_flat(tmp_path):
+    shut_in = "ARIES_WELL_001"
+    dca = fit(make_production(shut_in_well=shut_in), True)
+    actual = _export_and_compare(dca, tmp_path, dmin=6)
+    flat = [label for label, p in actual[shut_in]["phases"].items() if p["kind"] == "flat"]
+    assert flat, actual[shut_in]
+    others = [p for uid, w in actual.items() if uid != shut_in for p in w["phases"].values()]
+    assert all(p["kind"] != "flat" for p in others)
+
+
+@pytest.mark.parametrize("dmin", [6, 12, 18])
+def test_dmin_written_on_hyperbolic_and_continuation_lines(tmp_path, dmin):
+    dca = fit(make_production(), True)
+    actual = _export_and_compare(dca, tmp_path, dmin=dmin)
+    hyperbolic = [p for w in actual.values() for p in w["phases"].values() if p["kind"] == "hyperbolic"]
+    assert hyperbolic
+    assert all(p["dmin"] == dmin and p["continuation"] == dmin for p in hyperbolic)
+
+
+def test_water_omitted_unless_requested(tmp_path):
+    dca = fit(make_production(), True)
+    actual = _export_and_compare(dca, tmp_path, dmin=6, write_water=False)
+    assert all("WTR" not in w["phases"] for w in actual.values())

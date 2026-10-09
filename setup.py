@@ -41,10 +41,10 @@ setuptools.setup(
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
@@ -55,14 +55,17 @@ setuptools.setup(
         'statsmodels>=0.13.5',
         'python-dateutil>=2.8.0',
         'tqdm>=4.65.0',
-        'pyodbc>=4.0.0',  # For ARIES database connectivity (Access files)
-        'jpype1>=1.0.0',  # For Java-based database access
-        'pytopspeed-modernized>=1.1.0',  # For PhdWin database connectivity (TopSpeed files)
     ],
     packages=setuptools.find_packages(),
     python_requires=">=3.8",
     include_package_data=False,
     extras_require={
+        # Optional database connectivity: pip install "resaid[database]"
+        "database": [
+            'pyodbc>=4.0.0',  # ARIES / Access (.mdb/.accdb)
+            'jpype1>=1.0.0',  # Java-based database access
+            'pytopspeed-modernized>=1.1.0',  # PhdWin (TopSpeed files)
+        ],
         "test": [
             "pytest>=7.0",
             "openpyxl>=3.0.0",

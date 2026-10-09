@@ -2,7 +2,7 @@
 """
 Test PhdWin database integration with RESAID.
 
-Run manually: ``python tests/test_phdwin_integration.py`` (from repo root).
+Run manually: ``python scripts/check_phdwin_integration.py`` (from repo root).
 """
 
 from __future__ import annotations

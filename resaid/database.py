@@ -20,9 +20,14 @@ class DatabaseInterface:
     Flexible interface for reading industry standard databases and generating DCA forecasts
     
     Supports:
-    - ARIES databases (.mdb, .accdb files) - Access format
-    - PhdWin databases (.phd, .mod, .tps, .phz files) - TopSpeed format via pytopspeed-modernized
-    - Future: Other database formats
+    - ARIES databases (.mdb, .accdb files) - Access format, via pyodbc and the
+      Microsoft Access ODBC driver
+    - PhdWin databases (.phd, .mod, .tps, .phz files) - TopSpeed format, converted to
+      a temporary SQLite database via pytopspeed-modernized (experimental)
+
+    Install the drivers with ``pip install "resaid[database]"``. Used as a context
+    manager, the connection (and any temporary SQLite file) is closed on exit; the
+    connection itself is opened by ``connect()`` or the first data call.
     """
     
     def __init__(self, db_path: Union[str, Path]):
@@ -48,7 +53,7 @@ class DatabaseInterface:
         self.table_mapping = {}
         
     def _detect_db_type(self) -> str:
-        """Detect database type based on file extension and content"""
+        """Detect database type from the file extension"""
         ext = self.db_path.suffix.lower()
         
         if ext in ['.mdb', '.accdb']:
@@ -69,7 +74,12 @@ class DatabaseInterface:
             return False
     
     def _try_jpype_connection(self) -> bool:
-        """Try to establish connection using JPype and Java libraries"""
+        """
+        Placeholder for a JPype/UCanAccess connection; not implemented.
+
+        Always returns False. Note that it starts a JVM (without UCanAccess on the
+        classpath) as a side effect when jpype is installed.
+        """
         try:
             import jpype
             if not jpype.isJVMStarted():
@@ -117,14 +127,19 @@ class DatabaseInterface:
             return True
             
         except ImportError:
-            warnings.warn("pytopspeed-modernized not available. Install with: pip install pytopspeed-modernized")
+            warnings.warn('pytopspeed-modernized not available. Install with: pip install "resaid[database]"')
             return False
         except Exception as e:
             warnings.warn(f"Failed to convert PhdWin database: {e}")
             return False
     
     def _try_external_tools(self) -> bool:
-        """Try to use external tools like mdbtools or mdb-tools"""
+        """
+        Check whether mdbtools can read the file.
+
+        Returns True if ``mdb-tables`` succeeds, but does not set ``self.connection``,
+        so data reads still fail afterwards.
+        """
         try:
             # Try mdbtools if available
             result = subprocess.run(['mdb-tables', str(self.db_path)], 
@@ -252,8 +267,10 @@ class DatabaseInterface:
         Set header column mapping for well-level properties
         
         Args:
-            mapping: Dictionary mapping RESAID field names to header table column names
-                    Optional: 'well_id', 'phase', 'length', 'dayson', 'field', 'operator'
+            mapping: Dictionary mapping RESAID field names to header table column names.
+                    Supported fields: 'well_id', 'phase', 'length', 'dayson', 'field',
+                    'operator'. Include only fields whose columns exist: every mapped
+                    column is selected, and a missing one makes the read fail.
                     Example: {
                         'well_id': 'PROPNUM',
                         'phase': 'MAJOR',
@@ -319,11 +336,13 @@ class DatabaseInterface:
             production_columns: Dictionary mapping RESAID fields to production table columns
                                Required: 'well_id', 'date', 'oil', 'gas', 'water'
             header_table: Optional name of header data table
-            header_columns: Optional dictionary mapping RESAID fields to header table columns
-            **kwargs: Additional arguments for data preparation
+            header_columns: Optional dictionary mapping RESAID fields to header table
+                columns; pass an empty dict to skip the header read
+            **kwargs: Accepted for compatibility; unused
             
         Returns:
-            DataFrame ready for DCA analysis
+            DataFrame with columns WELL_ID, DATE, OIL, GAS, WATER (plus mapped header
+            fields when the header merge succeeds), sorted by WELL_ID and DATE
         """
         # Validate required production columns
         required_prod_fields = ['well_id', 'date', 'oil', 'gas', 'water']
@@ -389,10 +408,12 @@ class DatabaseInterface:
         Args:
             data: DataFrame with production data
             three_phase_mode: Whether to use three-phase forecasting
-            **dca_kwargs: Additional arguments for decline_curve
+            **dca_kwargs: Accepted for compatibility; currently unused
             
         Returns:
-            Dictionary mapping well IDs to decline_curve objects
+            Dictionary mapping well IDs to decline_curve objects. Each has been run
+            and has a oneline (not denormalized). Wells with fewer than 3 rows are
+            skipped with a warning.
         """
         results = {}
         
@@ -452,11 +473,14 @@ class DatabaseInterface:
         
         Args:
             dca_results: Dictionary of DCA results
-            export_format: Export format ('aries', 'phdwin', 'mosaic')
+            export_format: Export format ('aries' or 'mosaic'). 'phdwin' is
+                accepted but currently fails for every well (a warning is issued
+                and the well is omitted from the result).
             output_dir: Output directory (defaults to current directory)
             
         Returns:
-            Dictionary mapping well IDs to output file paths
+            Dictionary mapping well IDs to output file paths. Failures, including an
+            unsupported format, are reported as warnings, not raised.
         """
         if output_dir is None:
             output_dir = Path.cwd()
@@ -565,12 +589,15 @@ class ARIESDatabase(DatabaseInterface):
         """
         Prepare ARIES data for DCA analysis with common defaults
         
+        Defaults read AC_PRODUCT (PROPNUM, P_DATE, OIL, GAS, WATER) and AC_PROPERTY.
+        
         Args:
             production_table: Override default production table name
             production_columns: Override default production column mapping
             header_table: Override default header table name  
-            header_columns: Override default header column mapping
-            **kwargs: Additional arguments
+            header_columns: Override default header column mapping; every mapped
+                column must exist, or pass {} to skip the header read
+            **kwargs: Accepted for compatibility; unused
         """
         # Use defaults if not specified
         if production_table is None:
@@ -595,15 +622,23 @@ class ARIESDatabase(DatabaseInterface):
 
 
 class PhdWinDatabase(DatabaseInterface):
-    """Specialized interface for PhdWin databases"""
+    """
+    Interface for PhdWin TopSpeed databases (experimental).
+
+    The file is converted to a temporary SQLite database on connect. Its default
+    table and column mappings are the ARIES ones, which converted PhdWin data does
+    not contain, so pass ``production_table`` and ``production_columns`` (and
+    ``header_columns={}`` or a valid header mapping) to ``prepare_data_for_dca``.
+    """
     
     def __init__(self, db_path: Union[str, Path]):
         super().__init__(db_path)
         if self.db_type != 'phdwin':
             raise ValueError("PhdWin databases must be TopSpeed format (.phd/.mod/.tps/.phz)")
         
-        # Set common PhdWin table mappings as defaults
-        # Note: These will be determined after conversion to SQLite
+        # Defaults mirror ARIESDatabase. Converted PhdWin tables (phd_*/mod_*,
+        # keyed on LSE_ID) do not use these names, so callers must pass
+        # production_table / production_columns (and header settings) explicitly.
         self.set_table_mapping({
             'production': 'AC_PRODUCT',  # Default, may be overridden
             'header': 'AC_PROPERTY',     # Default, may be overridden
@@ -636,14 +671,18 @@ class PhdWinDatabase(DatabaseInterface):
                             header_columns: Optional[Dict[str, str]] = None,
                             **kwargs) -> pd.DataFrame:
         """
-        Prepare PhdWin data for DCA analysis with common defaults
+        Prepare PhdWin data for DCA analysis
+        
+        The production table must have one row per well and date with oil, gas
+        and water columns; PhdWin integer dates must be converted beforehand.
         
         Args:
-            production_table: Override default production table name
-            production_columns: Override default production column mapping
+            production_table: Production table name (the default, AC_PRODUCT, does
+                not exist in converted PhdWin data)
+            production_columns: Production column mapping
             header_table: Override default header table name  
-            header_columns: Override default header column mapping
-            **kwargs: Additional arguments
+            header_columns: Header column mapping; pass {} to skip the header read
+            **kwargs: Accepted for compatibility; unused
         """
         # Use defaults if not specified
         if production_table is None:
