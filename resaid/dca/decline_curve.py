@@ -49,8 +49,8 @@ DCA_LEGACY_ADJ_BULK_FALLBACK = "legacy_adj_bulk_upside_solver_fallback"
 # Printed path breakdown is chosen from ``fit_method`` (monotone vs default/legacy alias).
 _DCA_PATH_REPORT_MONOTONE = (
     (DCA_PATH_MONOTONE_PRIMARY, "Primary (longest monotone decline segment)"),
-    (DCA_PATH_MONOTONE_TAIL, "Fallback (post-trough positive tail, no outlier screen)"),
-    (DCA_PATH_MONOTONE_TAIL_OL, "Fallback (post-trough tail after outlier screen)"),
+    (DCA_PATH_MONOTONE_TAIL, "Fallback (positive tail from first peak, no outlier screen)"),
+    (DCA_PATH_MONOTONE_TAIL_OL, "Fallback (tail from first peak after outlier screen)"),
     (DCA_PATH_MONOTONE_FIRST_POS, "Fallback (first positive month through last month)"),
     (
         DCA_PATH_MONOTONE_BACKUP_PRE,
@@ -1003,15 +1003,27 @@ class decline_curve:
             best_start, best_end = 0, len(y_vals) - 1
         return int(best_start), int(best_end)
 
+    @staticmethod
+    def _first_peak_index(y_vals):
+        """
+        Index of the first production peak, or 0 when the series has no local maximum.
+
+        ``argrelextrema`` only reports interior maxima, so a well whose highest month is its
+        first would otherwise start at a later minor bump and drop its early decline. The
+        peak is the highest month up to and including the first local maximum.
+        """
+        z = np.asarray(y_vals, dtype=float)
+        a = argrelextrema(z, np.greater)[0]
+        if len(a) == 0:
+            return 0
+        head = z[: int(a[0]) + 1]
+        return int(np.argmax(np.where(np.isfinite(head), head, -np.inf)))
+
     def _legacy_style_positive_tail_xy(self, x_vals, y_vals):
-        """Post-trough slice + positive filter (same geometry as legacy pre-outlier path)."""
+        """Positive months from the first production peak (``_first_peak_index``) on."""
         x_vals = np.asarray(x_vals, dtype=float)
         z = np.asarray(y_vals, dtype=float)
-        a = argrelextrema(z, np.greater)
-        if len(a[0]) > 0:
-            index_min = int(a[-1][0])
-        else:
-            index_min = 0
+        index_min = self._first_peak_index(z)
         filtered_x = x_vals[index_min:]
         filtered_y = z[index_min:]
         m = (filtered_y > 0) & np.isfinite(filtered_y) & np.isfinite(filtered_x)
@@ -1271,7 +1283,12 @@ class decline_curve:
         return s
 
     def _dca_params_default(self, s):
-        """Original per-row fit: peak/zero/outlier filtering then ``curve_fit`` on Arps."""
+        """
+        Original per-row fit: peak/zero/outlier filtering then ``curve_fit`` on Arps.
+
+        The fit window starts at the first production peak (``_first_peak_index``), or at
+        the latest step-up regime (``_latest_regime_start``) when one is detected.
+        """
 
         s = self._sort_well_series_by_t_index(s)
         x_vals = s['T_INDEX']
@@ -1291,7 +1308,7 @@ class decline_curve:
             a = argrelextrema(z, np.greater)
             if len(a[0]) > 0:
                 indexMax = a[-1][-1]
-                indexMin = a[-1][0]
+                indexMin = self._first_peak_index(z)
                 t0Max = x_vals[indexMax]
                 t0Min = x_vals[indexMin]
             else:

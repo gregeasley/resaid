@@ -137,11 +137,16 @@ other phases follow it:
 
 `decline_curve(fit_method=...)` selects how each well is fit:
 
-- `"default"`: Starts at the production peak, or at the latest step-up regime. Removes zero
-  months and statistical outliers, then runs a weighted `curve_fit` of Arps parameters.
+- `"default"`: Starts at the first production peak, or at the latest step-up regime. Removes
+  zero months and statistical outliers, then runs a weighted `curve_fit` of Arps parameters.
   Finally it rescales to match the last three months of production.
 - `"monotone_two_step"`: Fits the longest monotone decline segment. It then solves for EUR
   and re-solves the initial decline so the curve starts from the recent producing rate.
+  If that fails, it falls back to the decline from the first production peak.
+
+The first production peak is the highest month up to and including the first local
+maximum. A well that peaks in its first month therefore keeps its whole early decline,
+even if a later month shows a small bump.
 
 If a fit fails and `backup_decline = True`, the well gets a backup decline instead:
 the last positive rate with `default_initial_decline` and `default_b_factor`. Otherwise
@@ -544,7 +549,9 @@ python scripts/validate_three_phase.py
 
 ## Known Issues
 
-These are known in 0.3.0 and scheduled for a follow-up release:
+Release notes are in `CHANGELOG.md`.
+
+These are known in 0.3.1 and scheduled for a follow-up release:
 
 - **Database header merge**: with the default mappings, `prepare_data_for_dca` does not merge
   header data (phase, lateral length, days on) into the production data, so it never
