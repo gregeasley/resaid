@@ -40,6 +40,7 @@ DCA_PATH_LEGACY_FORCE_T0 = "legacy_primary_forced_t0_full_series"
 DCA_PATH_LEGACY_BACKUP_PRE = "legacy_backup_insufficient_initial_history"
 DCA_PATH_LEGACY_BACKUP_POST = "legacy_backup_insufficient_after_filters"
 DCA_PATH_LEGACY_BACKUP_FIT = "legacy_backup_curve_fit_failed"
+DCA_PATH_LEGACY_SHORT_REGIME = "legacy_short_regime_eur_match"
 
 DCA_LEGACY_ADJ_BULK_DOWNSIDE = "legacy_adj_bulk_downside_or_equal"
 DCA_LEGACY_ADJ_BULK_LOW_B = "legacy_adj_bulk_low_b_upside"
@@ -82,6 +83,10 @@ _DCA_PATH_REPORT_LEGACY = (
     (
         DCA_PATH_LEGACY_BACKUP_FIT,
         "Backup (curve_fit error, non-finite qi, or infinite popt[0])",
+    ),
+    (
+        DCA_PATH_LEGACY_SHORT_REGIME,
+        "Short regime (prior regime fit, its EUR matched from the current tail rate)",
     ),
 )
 
@@ -186,6 +191,13 @@ class decline_curve:
         self.step_change_lookback = 6  # months before a candidate step (median baseline)
         self.step_change_window = 3  # months after a candidate step (median level)
         self.step_change_min_points = 6  # months needed from the regime peak to fit it
+        # A step too recent to fit (fewer than step_change_min_points months) takes the EUR of
+        # the previous regime with its IP from the current tail (``_short_regime_eur_match``).
+        self.short_regime_eur_match = True
+        # A workover restores roughly the previous regime: when the current tail rate exceeds this
+        # multiple of the previous regime's peak, the step is a new completion (recompletion to a
+        # new zone, restimulation), not a workover, and no EUR match is applied.
+        self.short_regime_max_ratio = 1.25
         self._dataframe = None
         self._date_col = None
         self._phase_col = None
@@ -931,28 +943,28 @@ class decline_curve:
                 print(f"    - {label}: {ac.get(key, 0)}", file=sf, flush=True)
         print(f"  Wall time: {elapsed_sec:.2f} seconds", file=sf, flush=True)
 
-    def _latest_regime_start(self, y_vals):
+    def _regime_steps(self, y_vals):
         """
-        Index of the peak that starts the latest production regime, or 0.
+        Peaks that start production regimes after a sustained step up, oldest first, as
+        ``(peak_index, fittable, onset_index)`` (onset: first month of the step).
 
         A regime starts at month ``i`` when the median rate over the next
         ``step_change_window`` months exceeds ``step_change_ratio`` times the median
         positive rate over the previous ``step_change_lookback`` months (a restim,
-        recompletion, or return from curtailment to a higher level). Medians keep
-        one-off dips and shut-in months from triggering. The regime begins at its
-        peak within the following ``step_change_lookback`` months, and only regimes
-        with at least ``step_change_min_points`` months from that peak count, so a
-        step too recent to fit leaves the earlier regime in use.
+        recompletion, workover, or return from curtailment to a higher level). Medians keep
+        one-off dips and shut-in months from triggering. The regime begins at its peak within
+        the following ``step_change_lookback`` months; it is ``fittable`` when at least
+        ``step_change_min_points`` months follow from that peak.
         """
         if not self.detect_step_changes:
-            return 0
+            return []
         y = np.asarray(y_vals, dtype=float)
         n = len(y)
         lookback = max(int(self.step_change_lookback), 2)
         window = max(int(self.step_change_window), 1)
         min_points = max(int(self.step_change_min_points), 4)
 
-        start = 0
+        steps = []
         i = 1
         while i < n - window + 1:
             before = y[max(0, i - lookback):i]
@@ -963,15 +975,114 @@ class decline_curve:
                 if float(np.median(after)) > self.step_change_ratio * baseline:
                     seg = y[i:i + lookback]
                     peak = i + int(np.nanargmax(seg))
-                    if n - peak >= min_points:
-                        start = peak
+                    steps.append((peak, n - peak >= min_points, i))
                     # Resume once the baseline window lies wholly after the peak;
                     # otherwise pre-step months keep re-triggering the same step and
                     # walk the start past the true peak.
                     i = peak + lookback
                     continue
             i += 1
-        return start
+        return steps
+
+    def _latest_regime_start(self, y_vals):
+        """
+        Index of the peak that starts the latest fittable production regime, or 0
+        (see ``_regime_steps``). A step too recent to fit leaves the earlier regime in use;
+        ``_short_regime_start`` reports it.
+        """
+        fittable = [peak for peak, ok, _ in self._regime_steps(y_vals) if ok]
+        return fittable[-1] if fittable else 0
+
+    def _short_regime_start(self, y_vals):
+        """
+        Onset index (first month of the step) of the newest regime when it is too short to fit
+        (fewer than ``step_change_min_points`` months from its peak) and looks like a workover
+        of the previous regime, else ``None``.  The previous regime (from
+        ``_first_peak_index`` / the latest fittable regime up to the onset) must itself be
+        fittable (at least ``step_change_min_points`` months; a young well's rising ramp is not
+        a regime), and the current tail rate (``qi_tail_points``) must not exceed
+        ``short_regime_max_ratio`` x that regime's peak.
+        """
+        step = self._unfit_step(y_vals)
+        if step is None:
+            return None
+        onset = step[2]
+        y = np.asarray(y_vals, dtype=float)
+        start = max(self._first_peak_index(y[:onset]), self._latest_regime_start(y))
+        prev = y[start:onset]
+        prev = prev[np.isfinite(prev) & (prev > 0)]
+        if len(prev) < max(int(self.step_change_min_points), 4):   # producing months only
+            return None
+        tail = y[np.isfinite(y) & (y > 0)][-max(int(self.qi_tail_points), 1):]
+        if len(prev) == 0 or len(tail) == 0:
+            return None
+        if float(np.mean(tail)) > self.short_regime_max_ratio * float(np.max(prev)):
+            return None
+        return onset
+
+    def _unfit_step(self, y_vals):
+        """``(peak, fittable, onset)`` of the newest step up when it is too short to fit, else ``None``."""
+        steps = self._regime_steps(y_vals)
+        if steps and not steps[-1][1]:
+            return steps[-1]
+        return None
+
+    def _short_regime_target(self, qi, di, b, x_vals, y_vals, short, t0=None):
+        """
+        EUR match for a regime too short to fit (``short``: its onset index).
+
+        The previous regime's EUR is what it would have produced without the step: its actual
+        production from the regime start (``_first_peak_index`` / ``_latest_regime_start``) up
+        to the onset, plus its fitted curve (``qi, di, b`` at the fitted ``t0``, with terminal
+        decline) from the onset over ``DEFAULT_SOLVER_T_MAX_MONTHS``. The new regime gets
+        that EUR: less what it has produced before the current tail, it is the remaining
+        volume the tail rate must reach. Returns ``(qi_tail, t0_tail, remaining)`` or ``None``.
+        """
+        x = np.asarray(x_vals, dtype=float)
+        y = np.asarray(y_vals, dtype=float)
+        good = np.isfinite(y) & (y > 0)
+        start = max(self._first_peak_index(y[:short]), self._latest_regime_start(y))
+        produced_prev = float(np.sum(y[start:short][good[start:short]]))
+        t0 = float(x[start]) if t0 is None else float(t0)
+        t_after = np.arange(x[short], x[short] + DEFAULT_SOLVER_T_MAX_MONTHS, dtype=float)
+        remaining_prev = float(np.sum(self.arps_decline(t_after, qi, di, b, t0)))
+        eur_prev = produced_prev + remaining_prev
+        pos = np.where(good)[0]
+        tail = pos[-max(int(self.qi_tail_points), 1):]
+        if len(tail) == 0 or not np.isfinite(eur_prev) or eur_prev <= 0:
+            return None
+        qi_tail = float(np.mean(y[tail]))
+        t0_tail = float(np.mean(x[tail]))
+        # Produced in the new regime before the tail rate's time (half the month at t0).
+        new = (np.arange(len(y)) >= short) & good
+        produced = float(np.sum(y[new & (x < t0_tail)]) + 0.5 * np.sum(y[new & (x == t0_tail)]))
+        target = eur_prev - produced
+        if not (np.isfinite(qi_tail) and qi_tail > 0 and target > qi_tail):
+            return None
+        return qi_tail, t0_tail, target
+
+    def _short_regime_eur_match(self, qi, di, b, x_vals, y_vals, short, t0=None):
+        """
+        ``(qi, di, t0)`` for a regime too short to fit: IP from the current tail
+        (``qi_tail_points``), the previous regime's ``b``, and the decline that gives the
+        new regime the previous regime's EUR. ``None`` when it cannot be solved.
+        """
+        tgt = self._short_regime_target(qi, di, b, x_vals, y_vals, short, t0)
+        if tgt is None or not (np.isfinite(b) and b > 0):
+            return None
+        qi_tail, t0_tail, target = tgt
+        Solver = _decline_solver_cls()
+        try:
+            _, _, _, di_new, _, _, _ = Solver(
+                qi=qi_tail, qf=None, de=None, dmin=self.MIN_DECLINE_RATE, b=float(b),
+                eur=target, t_max=DEFAULT_SOLVER_T_MAX_MONTHS,
+            ).solve()
+        except Exception:
+            return None
+        di_new = float(di_new)
+        if not np.isfinite(di_new) or di_new <= 0:
+            return None
+        return qi_tail, max(di_new, self.MIN_DECLINE_RATE), t0_tail
 
     def _longest_mono_decreasing_span(self, y_vals):
         """Inclusive (start, end) indices of the longest positive, non-increasing run."""
@@ -1134,10 +1245,12 @@ class decline_curve:
             di_int = 0.1
         return di_int
 
-    def _monotone_two_step_core(self, s, x_vals, y_vals, mono_x, mono_y):
+    def _monotone_two_step_core(self, s, x_vals, y_vals, mono_x, mono_y, short=None):
         """
         Single attempt: Arps ``curve_fit`` on ``(mono_x, mono_y)`` then EUR + di solves.
         Returns ``s`` on success; raises on recoverable failure so callers can try another window.
+        ``short``: peak index of a newer regime too short to fit; its production to date is
+        taken off the EUR the tail rate must reach.
         """
         mono_x = np.asarray(mono_x, dtype=float)
         mono_y = np.asarray(mono_y, dtype=float)
@@ -1224,6 +1337,12 @@ class decline_curve:
             )
             eur_fit = max(cum_obs * 1.05, qi_fit * 24.0, float(np.sum(mono_y)), 1.0)
 
+        if short is not None:
+            tgt = self._short_regime_target(qi_fit, de_stage1, b_fit, x_vals, y_vals, short,
+                                            float(popt[3]))
+            if tgt is not None:
+                eur_fit = tgt[2]
+
         n_tail = max(int(self.qi_tail_points), 1)
         pos_tail_idx = np.where(np.isfinite(y_vals) & (y_vals > 0))[0]
         if len(pos_tail_idx) == 0:
@@ -1287,7 +1406,9 @@ class decline_curve:
         Original per-row fit: peak/zero/outlier filtering then ``curve_fit`` on Arps.
 
         The fit window starts at the first production peak (``_first_peak_index``), or at
-        the latest step-up regime (``_latest_regime_start``) when one is detected.
+        the latest step-up regime (``_latest_regime_start``) when one is detected. A newer
+        step too short to fit is left out of the fit and gets the fitted regime's EUR from
+        its current tail rate (``_short_regime_eur_match``).
         """
 
         s = self._sort_well_series_by_t_index(s)
@@ -1321,15 +1442,25 @@ class decline_curve:
 
             # After a sustained step up (restim / recovery) fit only the latest
             # regime; earlier history has a different decline and would bias it.
+            short = None
             if not self._force_t0:
                 regime = self._latest_regime_start(z)
                 if regime > indexMin:
                     indexMin = regime
                     t0Min = x_vals[regime]
                     t0Max = max(t0Max, t0Min)
+                # A newer step too short to fit: fit the previous regime without it, then
+                # give the new regime that regime's EUR (``_short_regime_eur_match``).
+                if self.short_regime_eur_match:
+                    short = self._short_regime_start(z)
+                    if short is not None and short - indexMin <= 3:
+                        short = None
+                    if short is not None:
+                        t0Max = max(min(t0Max, x_vals[short - 1]), t0Min)
 
-            filtered_x = np.array(x_vals[indexMin:])
-            filtered_y = np.array(y_vals[indexMin:])
+            end = short if short is not None else len(z)
+            filtered_x = np.array(x_vals[indexMin:end])
+            filtered_y = np.array(y_vals[indexMin:end])
             
             if self.verbose:
                 logger.info(
@@ -1464,14 +1595,24 @@ class decline_curve:
                             s['t0'] = popt[3]
                             self._incr_dca_path(DCA_PATH_LEGACY_FORCE_T0)
                         else:
-                            adj_qi, adj_di = self._adjust_default_fit_to_recent_l3m(
-                                popt[0], popt[1], popt[2], popt[3], x_vals, y_vals
-                            )
-                            s['qi'] = adj_qi
-                            s['di'] = adj_di
-                            s['b'] = popt[2]
-                            s['t0'] = popt[3]
-                            self._incr_dca_path(DCA_PATH_LEGACY_PRIMARY)
+                            matched = None
+                            if short is not None:
+                                matched = self._short_regime_eur_match(
+                                    popt[0], popt[1], popt[2], x_vals, y_vals, short, popt[3]
+                                )
+                            if matched is not None:
+                                s['qi'], s['di'], s['t0'] = matched
+                                s['b'] = popt[2]
+                                self._incr_dca_path(DCA_PATH_LEGACY_SHORT_REGIME)
+                            else:
+                                adj_qi, adj_di = self._adjust_default_fit_to_recent_l3m(
+                                    popt[0], popt[1], popt[2], popt[3], x_vals, y_vals
+                                )
+                                s['qi'] = adj_qi
+                                s['di'] = adj_di
+                                s['b'] = popt[2]
+                                s['t0'] = popt[3]
+                                self._incr_dca_path(DCA_PATH_LEGACY_PRIMARY)
                         s['q0']=y_vals[0] #Probably will need revision, high chance first value is zero
                         s['minor_ratio']=minor_ratio
                         s['water_ratio']=water_ratio
@@ -1548,13 +1689,18 @@ class decline_curve:
                 backup_path_key=DCA_PATH_MONOTONE_BACKUP_PRE,
             )
 
-        # After a sustained step up, choose fit windows from the latest regime only.
+        # After a sustained step up, choose fit windows from the latest regime only; a newer
+        # step too short to fit is left out and gets that regime's EUR from its tail rate.
         regime = self._latest_regime_start(y_vals)
+        short = self._short_regime_start(y_vals) if self.short_regime_eur_match else None
+        if short is not None and short - regime <= 3:
+            short = None
+        end = short if short is not None else len(y_vals)
         for path_key, mono_x, mono_y in self._monotone_fit_xy_candidates(
-            x_vals[regime:], y_vals[regime:]
+            x_vals[regime:end], y_vals[regime:end]
         ):
             try:
-                out = self._monotone_two_step_core(s, x_vals, y_vals, mono_x, mono_y)
+                out = self._monotone_two_step_core(s, x_vals, y_vals, mono_x, mono_y, short=short)
                 self._incr_dca_path(path_key)
                 return out
             except Exception:

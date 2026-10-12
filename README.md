@@ -81,6 +81,10 @@ dca.backup_decline = True
 dca.detect_step_changes = True
 dca.step_change_ratio = 1.5       # 3-month median vs prior 6-month median
 dca.step_change_min_points = 6    # months needed after the new peak to fit it
+# A newer step too short to fit (e.g. a recent workover) gets the previous regime's EUR,
+# with its IP from the current tail; larger steps (new completions) are left alone
+dca.short_regime_eur_match = True
+dca.short_regime_max_ratio = 1.25  # current rate vs previous regime peak: above = new completion
 
 # Fit decline parameters for every well
 dca.run_DCA()
@@ -147,6 +151,15 @@ other phases follow it:
 The first production peak is the highest month up to and including the first local
 maximum. A well that peaks in its first month therefore keeps its whole early decline,
 even if a later month shows a small bump.
+
+A step up too recent to fit (fewer than `step_change_min_points` months from its peak) is
+treated as a workover of the previous regime when its current rate is at most
+`short_regime_max_ratio` x that regime's peak and that regime has at least
+`step_change_min_points` producing months (so a young well's ramp is not mistaken for a
+workover). Both methods then fit the previous regime on its own months and give the new
+regime that regime's EUR (its actual production to the
+step's onset plus its fitted curve from the onset on). The IP comes from the current tail
+(`qi_tail_points`), b from the previous regime, and the decline is solved to reach the EUR.
 
 If a fit fails and `backup_decline = True`, the well gets a backup decline instead:
 the last positive rate with `default_initial_decline` and `default_b_factor`. Otherwise
@@ -334,6 +347,8 @@ Columns that are not mapped are ignored.
 - `outlier_correction`, `iqr_limit`: in ratio mode, cap high minor/water ratios using an IQR rule (defaults `True`, 1.5)
 - `detect_step_changes`, `step_change_ratio`, `step_change_lookback`, `step_change_window`,
   `step_change_min_points`: step-change (restim) detection (defaults `True`, 1.5, 6, 3, 6)
+- `short_regime_eur_match`, `short_regime_max_ratio`: EUR match for a step too recent to fit
+  (defaults `True`, 1.25)
 
 ### Economic Parameters
 
@@ -492,23 +507,54 @@ with ARIESDatabase("path/to/database.accdb") as db:     # closes the connection 
     if not db.connect():                                # returns False rather than raising
         raise RuntimeError("Could not connect (pyodbc and the Access ODBC driver are required)")
 
-    # DataFrame with WELL_ID, DATE, OIL, GAS, WATER (defaults read AC_PRODUCT)
-    dca_data = db.prepare_data_for_dca(
-        production_table="AC_PRODUCT",
-        production_columns={"well_id": "PROPNUM", "date": "P_DATE",
-                            "oil": "OIL", "gas": "GAS", "water": "WATER"},
-        header_columns={},          # skip the AC_PROPERTY header read (see note below)
-    )
+    # Defaults: AC_PRODUCT (PROPNUM, P_DATE, OIL, GAS, WATER) and AC_PROPERTY
+    dca_data = db.prepare_data_for_dca()
 
     results = db.run_dca_analysis(dca_data, three_phase_mode=True)    # {well_id: decline_curve}
     files = db.export_results(results, export_format="aries", output_dir="outputs")
     db.export_results(results, export_format="mosaic", output_dir="outputs")
 ```
 
-Notes on the current behavior:
-- Every column in `header_columns` must exist in the header table, or the read fails.
-- With the default mappings, header data (phase, lateral length, days on) is not merged
-  into the production data, so it does not reach the DCA.
+`prepare_data_for_dca` returns one row per well and month with `WELL_ID`, `DATE`, `OIL`,
+`GAS`, `WATER`, plus any header fields that were read: `PHASE`, `LENGTH`, `DAYSON`, `FIELD`, `OPERATOR`.
+`run_dca_analysis` uses `PHASE` (when it is OIL or GAS), `LENGTH` and `DAYSON` in the fit.
+
+**Specifying tables and columns.** `AC_PROPERTY` fields are user-defined in ARIES, and other
+tables and columns may be named differently in your database. Map RESAID fields to your
+table and column names, either per call:
+
+```python
+dca_data = db.prepare_data_for_dca(
+    production_table="AC_PRODUCT",
+    production_columns={"well_id": "PROPNUM", "date": "P_DATE",
+                        "oil": "OIL", "gas": "GAS", "water": "WATER"},
+    header_table="AC_PROPERTY",
+    header_columns={"well_id": "PROPNUM", "phase": "MAJOR", "length": "LAT_LEN"},
+)
+```
+
+or once for the connection:
+
+```python
+db.set_table_mapping({"production": "AC_PRODUCT", "header": "AC_PROPERTY"})
+db.set_column_mapping({"well_id": "PROPNUM", "date": "P_DATE",
+                       "oil": "OIL", "gas": "GAS", "water": "WATER"})
+db.set_header_column_mapping({"well_id": "PROPNUM", "phase": "MAJOR", "length": "LAT_LEN"})
+dca_data = db.prepare_data_for_dca()
+```
+
+- Production fields `well_id`, `date`, `oil`, `gas` and `water` are required. Header
+  fields are optional apart from `well_id`: `phase`, `length` (lateral, ft), `dayson`,
+  `field` and `operator`.
+- Column names match case-insensitively and may contain spaces or reserved words.
+- Each mapped column is checked before the table is read. A missing column raises a
+  `ValueError` naming it and listing the table's columns.
+- The built-in default header mapping is the exception: default header columns that your
+  `AC_PROPERTY` lacks (commonly `LATERAL` and `DAYS_ON`) are skipped with a warning.
+  `skip_missing_header_columns=True` gives the same behavior for your own mapping.
+- Pass `header_columns={}` to skip the header table.
+
+Other notes:
 - `export_format="phdwin"` currently fails through this interface. Call
   `generate_phdwin_export()` on each `decline_curve` in `results` instead.
 - `export_results` writes one file per well (`{well_id}_aries_export.txt`, etc.) and returns `{well_id: path}`.
@@ -551,11 +597,8 @@ python scripts/validate_three_phase.py
 
 Release notes are in `CHANGELOG.md`.
 
-These are known in 0.3.1 and scheduled for a follow-up release:
+These are known in 0.4.0 and scheduled for a follow-up release:
 
-- **Database header merge**: with the default mappings, `prepare_data_for_dca` does not merge
-  header data (phase, lateral length, days on) into the production data, so it never
-  reaches the DCA.
 - **PhdWin export via the database interface**: `export_results(export_format="phdwin")` fails
   for every well. Call `generate_phdwin_export()` on each `decline_curve` instead.
 - **Silent connection failure**: `connect()` returns `False` without saying why when pyodbc
