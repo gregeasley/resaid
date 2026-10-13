@@ -10,14 +10,16 @@ References:
 - https://towardsdatascience.com/how-to-package-your-python-code-df5a7739ab2e
 """
 
+import re
 from pathlib import Path
 
 import setuptools
 
 _VERSION_FILE = Path(__file__).resolve().parent / "resaid" / "_version.py"
-_ns: dict = {}
-exec(_VERSION_FILE.read_text(encoding="utf-8"), _ns)
-__version__ = _ns["__version__"]
+_match = re.search(r'^__version__ = "([^"]+)"', _VERSION_FILE.read_text(encoding="utf-8"), re.MULTILINE)
+if _match is None:
+    raise RuntimeError(f"__version__ not found in {_VERSION_FILE}")
+__version__ = _match.group(1)
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -57,7 +59,7 @@ setuptools.setup(
         'tqdm>=4.65.0',
     ],
     packages=setuptools.find_packages(),
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     include_package_data=False,
     extras_require={
         # Optional database connectivity: pip install "resaid[database]"

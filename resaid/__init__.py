@@ -19,16 +19,17 @@ from ._version import __version__
 __author__ = "Greg Easley"
 __email__ = "greg@easley.dev"
 
+from .database import ARIESDatabase, DatabaseInterface, PhdWinDatabase
 from .dca import decline_curve, decline_solver
 from .econ import npv_calc, well_econ
-from .database import DatabaseInterface, ARIESDatabase, PhdWinDatabase
 
 __all__ = [
-    'decline_curve', 
-    'decline_solver', 
-    'npv_calc', 
-    'well_econ',
+    'ARIESDatabase',
     'DatabaseInterface',
-    'ARIESDatabase', 
-    'PhdWinDatabase'
+    'PhdWinDatabase',
+    '__version__',
+    'decline_curve',
+    'decline_solver',
+    'npv_calc',
+    'well_econ'
 ]

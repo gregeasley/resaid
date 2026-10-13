@@ -57,7 +57,7 @@ def main():
         try:
             dca_data = aries_db.prepare_data_for_dca()
             print(f"✓ Data prepared with defaults: {dca_data.shape}")
-            print(f"Sample data:")
+            print("Sample data:")
             print(dca_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].head())
         except Exception as e:
             print(f"✗ Default mapping failed: {e}")
@@ -92,7 +92,7 @@ def main():
                 header_columns=custom_header_columns
             )
             print(f"✓ Data prepared with custom mappings: {dca_data.shape}")
-            print(f"Sample data:")
+            print("Sample data:")
             print(dca_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].head())
             
             # Show optional columns if they exist
@@ -156,17 +156,17 @@ def main():
         
         # Close database connection
         aries_db.close()
-        print(f"\n✓ Database connection closed")
+        print("\n✓ Database connection closed")
         
-        print(f"\n🎉 Example completed successfully!")
-        print(f"Check the 'outputs' folder for exported files.")
+        print("\n🎉 Example completed successfully!")
+        print("Check the 'outputs' folder for exported files.")
         
-        print(f"\nKey Points:")
-        print(f"- Production data comes from AC_PRODUCT table (well_id, date, oil, gas, water)")
-        print(f"- Header data comes from AC_PROPERTY table (phase, length, dayson, field, operator)")
-        print(f"- Required: well_id, date, oil, gas, water")
-        print(f"- Optional: phase, length, dayson, field, operator")
-        print(f"- The interface automatically merges production and header data")
+        print("\nKey Points:")
+        print("- Production data comes from AC_PRODUCT table (well_id, date, oil, gas, water)")
+        print("- Header data comes from AC_PROPERTY table (phase, length, dayson, field, operator)")
+        print("- Required: well_id, date, oil, gas, water")
+        print("- Optional: phase, length, dayson, field, operator")
+        print("- The interface automatically merges production and header data")
         
     except Exception as e:
         print(f"✗ Error: {e}")

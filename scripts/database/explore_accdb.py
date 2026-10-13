@@ -45,14 +45,14 @@ def explore_accdb():
             print(f"  {i:2d}. {table}")
         
         # Look for potential production data tables
-        print(f"\nPotential production data tables:")
+        print("\nPotential production data tables:")
         prod_keywords = ['PRODUCT', 'PROD', 'MONTHLY', 'DAILY', 'PRODUCTION']
         for table in tables:
             if any(keyword in table.upper() for keyword in prod_keywords):
                 print(f"  - {table}")
         
         # Look for potential property/header tables
-        print(f"\nPotential property/header tables:")
+        print("\nPotential property/header tables:")
         prop_keywords = ['PROPERTY', 'WELL', 'HEADER', 'LEASE']
         for table in tables:
             if any(keyword in table.upper() for keyword in prop_keywords):
@@ -75,7 +75,7 @@ def explore_accdb():
                     query = f"SELECT TOP 3 * FROM {table_name}"
                     df = pd.read_sql(query, aries_db.connection)
                     print(f"  Sample data shape: {df.shape}")
-                    print(f"  First few rows:")
+                    print("  First few rows:")
                     print(df.head())
                     
                 except Exception as e:

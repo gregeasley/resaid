@@ -3,15 +3,14 @@
 Test script for three-phase forecasting mode in the DCA module.
 """
 
-import os
 import time
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 
 from resaid.dca import decline_curve
+
 
 def calculate_oneline_three_phase(production_df, b_min, b_max) -> pd.DataFrame:
     """Calculate oneline using three-phase forecasting mode"""
@@ -19,8 +18,6 @@ def calculate_oneline_three_phase(production_df, b_min, b_max) -> pd.DataFrame:
     l_dca = decline_curve()
 
     l_dca.backup_decline = True
-    l_dca.SET_LENGTH = 10000
-    l_dca.DEFAULT_B = (b_min + b_max) / 2
     l_dca.dataframe = production_df
     l_dca.date_col = 'ProducingMonth'
     l_dca.phase_col = 'MAJOR'
@@ -46,8 +43,6 @@ def calculate_oneline_original(production_df, b_min, b_max) -> pd.DataFrame:
     l_dca = decline_curve()
 
     l_dca.backup_decline = True
-    l_dca.SET_LENGTH = 10000
-    l_dca.DEFAULT_B = (b_min + b_max) / 2
     l_dca.dataframe = production_df
     l_dca.date_col = 'ProducingMonth'
     l_dca.phase_col = 'MAJOR'

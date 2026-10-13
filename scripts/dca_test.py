@@ -1,8 +1,11 @@
-import pandas as pd
-from resaid.dca import decline_curve
-import numpy as np
-import time
 import os
+import time
+
+import numpy as np
+import pandas as pd
+
+from resaid.dca import decline_curve
+
 
 def calculate_oneline(production_df,b_min,b_max)->pd.DataFrame:
 
@@ -10,8 +13,6 @@ def calculate_oneline(production_df,b_min,b_max)->pd.DataFrame:
 
     l_dca.backup_decline = True
     #l_dca.DEFAULT_DI = 2.75/12
-    l_dca.SET_LENGTH = 10000
-    l_dca.DEFAULT_B = (b_min+b_max)/2
     l_dca.dataframe = production_df
     l_dca.date_col = 'ProducingMonth'
     l_dca.phase_col = 'MAJOR'

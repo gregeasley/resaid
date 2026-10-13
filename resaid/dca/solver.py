@@ -4,11 +4,12 @@ Decline curve parameter solver (`decline_solver`).
 This module is part of the ``resaid.dca`` package; import from ``resaid.dca`` or ``resaid``.
 """
 
+
 import numpy as np
 from scipy.optimize import minimize, minimize_scalar
 
+from .._strict import StrictAttributes
 from ..dca_constants import DEFAULT_SOLVER_T_MAX_MONTHS
-
 from .decline_curve import decline_curve
 
 # One shared engine for Arps integration — avoids constructing ``decline_curve``
@@ -40,7 +41,7 @@ _SOLVER_REL_TOL = 1e-4
 _SOLVER_LOG_GRID_POINTS = 41
 
 
-class decline_solver:
+class decline_solver(StrictAttributes):
     """
     Decline curve parameter solver for optimization problems.
     
@@ -72,11 +73,29 @@ class decline_solver:
 
         self.l_qf = qf
         self.l_t_max = t_max
-        self.delta = 0
+        self.delta = 0.0
         
         self.variables_to_solve = []
         self._t_range = None
         self._t_range_n = None
+        self._given: tuple = ()
+
+    _PARAMETERS = ("qi", "qf", "de", "eur", "t_max", "b")
+
+    def _need(self, name: str) -> float:
+        """Value of parameter ``name`` as a float; raises ``ValueError`` if it is unset."""
+        value = getattr(self, name)
+        if value is None:
+            given_names = self._given or tuple(
+                n for n in self._PARAMETERS if getattr(self, n) is not None
+            )
+            given = ", ".join(given_names) or "none"
+            raise ValueError(
+                f"decline_solver needs {name!r} to solve with the given inputs "
+                f"(given: {given}). Provide b and enough of qi, qf, de, eur and t_max "
+                "to determine the curve."
+            )
+        return float(value)
 
     def determine_solve(self):
         """
@@ -85,63 +104,65 @@ class decline_solver:
         Uses conditional logic to identify missing parameters and sets initial estimates
         for the optimization solver.
         """
+        self._given = tuple(n for n in self._PARAMETERS if getattr(self, n) is not None)
+
         # Check which parameters are missing and set up initial estimates
         if self.qi is None and self.qf is None:
             self.variables_to_solve = ['qi']
-            self.qi = self.de * self.eur / 2
+            self.qi = self._need('de') * self._need('eur') / 2
             self.qf = 1
         elif self.qi is None and self.de is None:
             self.variables_to_solve = ['qi', 'de']
             # Set initial estimates for both variables
-            self.qi = self.qf + self.dmin * self.eur
-            self.de = self.dmin
+            self.qi = self._need('qf') + self._need('dmin') * self._need('eur')
+            self.de = self._need('dmin')
         elif self.qi is None and self.eur is None:
             self.variables_to_solve = ['qi', 'eur']
             # Set initial estimates for both variables
-            self.qi = self.qf * 2  # Reasonable initial guess
-            self.eur = self.qi * 100  # Reasonable initial guess
+            self.qi = self._need('qf') * 2  # Reasonable initial guess
+            self.eur = self._need('qi') * 100  # Reasonable initial guess
         elif self.qi is None and self.t_max is None:
             self.variables_to_solve = ['qi']
-            self.qi = self.qf + self.de * self.eur
+            self.qi = self._need('qf') + self._need('de') * self._need('eur')
             self.t_max = DEFAULT_SOLVER_T_MAX_MONTHS
         elif self.t_max is None and self.qf is None:
             self.variables_to_solve = ['qf']
-            self.qf = max(self.qi - self.de * self.eur, 1)
+            self.qf = max(self._need('qi') - self._need('de') * self._need('eur'), 1)
             self.t_max = DEFAULT_SOLVER_T_MAX_MONTHS
         elif self.t_max is None and self.de is None:
             self.variables_to_solve = ['de']
-            self.de = (self.qi - self.qf) / self.eur
+            self.de = (self._need('qi') - self._need('qf')) / self._need('eur')
             self.t_max = DEFAULT_SOLVER_T_MAX_MONTHS
         elif self.t_max is None and self.eur is None:
             self.variables_to_solve = ['eur']
             self.t_max = DEFAULT_SOLVER_T_MAX_MONTHS
-            self.eur = (self.qi - self.qf) / self.de
+            self.eur = (self._need('qi') - self._need('qf')) / self._need('de')
         elif self.qf is None and self.de is None:
             self.variables_to_solve = ['de']
-            self.de = self.qi / self.eur
+            self.de = self._need('qi') / self._need('eur')
             self.qf = 1
         elif self.qf is None and self.eur is None:
             self.variables_to_solve = ['eur']
-            self.eur = self.qi / self.de
+            self.eur = self._need('qi') / self._need('de')
             self.qf = 1
         elif self.de is None and self.eur is None:
             self.variables_to_solve = ['de', 'eur']
             # Set initial estimates for both variables
-            self.de = self.dmin
-            self.eur = self.qi * self.t_max
+            self.de = self._need('dmin')
+            self.eur = self._need('qi') * self._need('t_max')
         # Handle cases where only one parameter is missing
         elif self.qi is None:
             self.variables_to_solve = ['qi']
-            self.qi = self.qf + self.de * self.eur
+            self.qi = self._need('qf') + self._need('de') * self._need('eur')
         elif self.qf is None:
             self.variables_to_solve = ['qf']
-            self.qf = max(self.qi - self.de * self.eur, 1)
+            self.qf = max(self._need('qi') - self._need('de') * self._need('eur'), 1)
         elif self.de is None:
             self.variables_to_solve = ['de']
-            self.de = (self.qi - self.qf) / self.eur
+            self.de = (self._need('qi') - self._need('qf')) / self._need('eur')
         elif self.eur is None:
             self.variables_to_solve = ['eur']
-            self.eur = (self.qi - self.qf) / self.de
+            self.eur = (self._need('qi') - self._need('qf')) / self._need('de')
         elif self.t_max is None:
             self.variables_to_solve = ['t_max']
             self.t_max = DEFAULT_SOLVER_T_MAX_MONTHS
@@ -168,23 +189,25 @@ class decline_solver:
         for var_name, var_value in zip(self.variables_to_solve, vec):
             setattr(self, var_name, float(var_value))
 
-        tn = int(self.t_max)
+        tn = int(self._need("t_max"))
         if self._t_range_n != tn or self._t_range is None:
             self._t_range = np.arange(tn, dtype=float)
             self._t_range_n = tn
         t_range = self._t_range
 
         dca_array = np.asarray(
-            self.l_dca.arps_decline(t_range, self.qi, self.de, self.b, 0, dmin=self.dmin),
+            self.l_dca.arps_decline(
+                t_range, self._need("qi"), self._need("de"), self._need("b"), 0, dmin=self.dmin
+            ),
             dtype=float,
         )
-        dca_array = np.where(dca_array > self.qf, dca_array, 0)
+        dca_array = np.where(dca_array > self._need("qf"), dca_array, 0)
 
         self.l_t_max = len(np.where(dca_array > 0)[0])
         if self.l_t_max > 0:
             # Calculate cumulative production and compare with EUR
             cumulative_production = np.sum(dca_array)
-            self.delta = abs(cumulative_production - self.eur)
+            self.delta = float(abs(cumulative_production - self._need("eur")))
         else:
             self.delta = 1e10
             
@@ -202,7 +225,7 @@ class decline_solver:
         self.determine_solve()
         
         if len(self.variables_to_solve) == 0:
-            return self.qi, self.t_max, self.qf, self.de, self.eur, False, self.delta
+            return self._result(False)
 
         x0 = np.array([float(getattr(self, var)) for var in self.variables_to_solve], dtype=float)
         bounds = [_SOLVER_VAR_BOUNDS[v] for v in self.variables_to_solve]
@@ -256,7 +279,7 @@ class decline_solver:
                 )
                 result = np.atleast_1d(res.x).astype(float, copy=False).ravel()
                 result = np.clip(result, lb, ub)
-        except Exception:
+        except Exception:  # noqa: BLE001 - optimizer failure falls back to the initial guess
             result = x0.copy()
 
         self.dca_delta(result)
@@ -267,11 +290,23 @@ class decline_solver:
         # Volumes are monthly sums truncated at ``qf``, so cumulative moves in steps
         # of about one month at the economic limit; residuals below that are noise.
         qf_step = float(self.qf) if self.qf is not None and np.isfinite(self.qf) else 0.0
-        tol = max(_SOLVER_ABS_TOL, _SOLVER_REL_TOL * abs(float(self.eur)), qf_step)
+        tol = max(_SOLVER_ABS_TOL, _SOLVER_REL_TOL * abs(self._need("eur")), qf_step)
         warning_flag = bool(not np.isfinite(self.delta) or self.delta > tol)
 
         if self.qf is None:
             self.qf = self.l_qf
-        return self.qi, self.t_max, self.qf, self.de, self.eur, warning_flag, self.delta
+        return self._result(warning_flag)
+
+    def _result(self, warning_flag: bool) -> tuple[float, float, float, float, float, bool, float]:
+        """Solved parameters as floats: (qi, t_max, qf, de, eur, warning_flag, delta)."""
+        return (
+            self._need("qi"),
+            self._need("t_max"),
+            self._need("qf"),
+            self._need("de"),
+            self._need("eur"),
+            bool(warning_flag),
+            float(self.delta),
+        )
 
 

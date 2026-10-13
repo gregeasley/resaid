@@ -11,6 +11,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_INPUT = REPO_ROOT / "examples" / "input_data"
 
 
+def require_access_driver() -> None:
+    """Skip unless pyodbc and the Microsoft Access ODBC driver are installed.
+
+    Checks the installed drivers instead of connecting, so the JPype fallback (which
+    starts a Java VM) is never tried.
+    """
+    pyodbc = pytest.importorskip("pyodbc", reason="pyodbc not installed (resaid[database])")
+    if not any("Microsoft Access Driver" in d for d in pyodbc.drivers()):
+        pytest.skip("Microsoft Access ODBC driver not installed")
+
+
 @pytest.fixture(scope="session")
 def example_production_csv() -> Path:
     p = EXAMPLE_INPUT / "production_data.csv"

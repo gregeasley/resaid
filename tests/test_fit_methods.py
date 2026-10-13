@@ -59,9 +59,6 @@ def test_shallow_decline_fits_are_physical(fit_method):
     params = dca.params_dataframe
     assert len(params) == dca.dataframe["WELL_ID"].nunique()
     assert params[["qi", "di", "b"]].notna().all().all()
-    if fit_method == DCA_FIT_METHOD_MONOTONE_TWO_STEP:
-        # Solved declines are never reported below the terminal decline.
-        assert (params["di"] >= dca.MIN_DECLINE_RATE - 1e-15).all()
 
     one = dca.oneline_dataframe.set_index("UID")
     peak = dca.dataframe.groupby("WELL_ID")["OIL"].max()

@@ -41,7 +41,7 @@ def explore_accdb_deeper():
         tables = aries_db.get_tables()
         
         # Check which tables actually have data
-        print(f"\nChecking tables for data content...")
+        print("\nChecking tables for data content...")
         tables_with_data = {}
         
         for table_name in tables:
@@ -55,7 +55,7 @@ def explore_accdb_deeper():
                 if row_count > 0:
                     tables_with_data[table_name] = row_count
                     
-            except Exception as e:
+            except Exception:
                 # Table might not exist or be accessible
                 pass
         
@@ -67,7 +67,7 @@ def explore_accdb_deeper():
             print(f"  {table_name}: {row_count:,} rows")
         
         # Examine the largest tables in detail
-        print(f"\nExamining largest tables in detail...")
+        print("\nExamining largest tables in detail...")
         for table_name, row_count in sorted_tables[:5]:  # Top 5
             print(f"\n{'='*60}")
             print(f"Table: {table_name} ({row_count:,} rows)")
@@ -85,7 +85,7 @@ def explore_accdb_deeper():
                 df = pd.read_sql(sample_query, aries_db.connection)
                 
                 if not df.empty:
-                    print(f"\nSample data:")
+                    print("\nSample data:")
                     print(df.head())
                     
                     # Check for potential production-related columns

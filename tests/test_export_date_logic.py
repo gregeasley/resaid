@@ -100,7 +100,7 @@ def test_mosaic_export_uses_t0_date(fitted_dca, tmp_path):
     for _, r in out.iterrows():
         o = one.loc[r["Entity Name"]]
         start = pd.Timestamp(r["Start Date T0  (y-m-d)"])
-        assert start == last[r["Entity Name"]]
+        assert start == last[r["Entity Name"]]                             # the last actual month
 
         de, b = _de_b(fitted_dca, o, r["Product Type"])
         dt = _months(start, o["T0_DATE"])

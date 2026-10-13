@@ -3,10 +3,12 @@
 Validate that three-phase mode produces identical major phase results to original mode.
 """
 
-import pandas as pd
-import numpy as np
-from resaid.dca import decline_curve
 import time
+
+import pandas as pd
+
+from resaid.dca import decline_curve
+
 
 def run_dca_analysis(mode='original'):
     """Run DCA analysis in specified mode"""
@@ -19,8 +21,6 @@ def run_dca_analysis(mode='original'):
     # Setup DCA with exact same parameters
     l_dca = decline_curve()
     l_dca.backup_decline = True
-    l_dca.SET_LENGTH = 10000
-    l_dca.DEFAULT_B = 1.1  # (0.9 + 1.3) / 2
     l_dca.dataframe = prod_df
     l_dca.date_col = 'ProducingMonth'
     l_dca.phase_col = 'MAJOR'

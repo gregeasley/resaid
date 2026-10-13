@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "standard",
+  "exclude": [
+    "build",
+    "dist",
+    "reference",
+    "ignore_samples",
+    "**/__pycache__",
+    "**/.*"
+  ]
+}

@@ -9,7 +9,6 @@ branch is exercised.
 from __future__ import annotations
 
 import pytest
-
 from aries_helpers import expected_aries, fit, make_production, parse_aries
 
 SCENARIO = "TEST"

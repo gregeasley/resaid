@@ -4,10 +4,12 @@ Compare original and three-phase mode results against reference file
 to ensure major phase parameters haven't changed.
 """
 
-import pandas as pd
-import numpy as np
-from resaid.dca import decline_curve
 import time
+
+import pandas as pd
+
+from resaid.dca import decline_curve
+
 
 def load_reference_data():
     """Load the reference oneline data"""
@@ -27,8 +29,6 @@ def run_dca_analysis(mode='original'):
     # Setup DCA with exact same parameters as original test
     l_dca = decline_curve()
     l_dca.backup_decline = True
-    l_dca.SET_LENGTH = 10000
-    l_dca.DEFAULT_B = 1.1  # (0.9 + 1.3) / 2
     l_dca.dataframe = prod_df
     l_dca.date_col = 'ProducingMonth'
     l_dca.phase_col = 'MAJOR'

@@ -13,10 +13,10 @@ from .decline_curve import (
 from .solver import decline_solver
 
 __all__ = [
-    "decline_curve",
-    "decline_solver",
     "DCA_FIT_METHOD_DEFAULT",
     "DCA_FIT_METHOD_LEGACY",
     "DCA_FIT_METHOD_MONOTONE_TWO_STEP",
+    "decline_curve",
+    "decline_solver",
 ]
 

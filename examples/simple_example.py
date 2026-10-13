@@ -6,14 +6,16 @@ This script demonstrates how to use the RESAID library to generate
 forecasts and exports for ARIES, PhdWin, and Mosaic.
 """
 
-import pandas as pd
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 # Add the parent directory to the path to import resaid
 sys.path.append(str(Path(__file__).parent.parent))
 
 from resaid.dca import decline_curve
+
 
 def main():
     """Main example function"""

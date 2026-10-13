@@ -5,12 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from test_step_changes import _arps, _plain_well
 
 from resaid.dca import DCA_FIT_METHOD_MONOTONE_TWO_STEP, decline_curve
 from resaid.dca.decline_curve import DCA_PATH_LEGACY_SHORT_REGIME, _decline_solver_cls
 from resaid.dca_constants import DEFAULT_SOLVER_T_MAX_MONTHS
-
-from test_step_changes import _arps, _plain_well
 
 
 def _workover_well(months=48, short=4, k=2.5, seed=0):
@@ -115,7 +114,7 @@ def _unadjusted_fit(y):
 
 def test_short_regime_match_can_be_disabled():
     y, _ = _workover_well(short=4)
-    d, r = _params(y, short_regime_eur_match=False)
+    d, _r = _params(y, short_regime_eur_match=False)
     assert not d._dca_path_counts.get(DCA_PATH_LEGACY_SHORT_REGIME)
 
 
@@ -129,7 +128,7 @@ def test_plain_well_unchanged(fit_method):
 
 def test_recompletion_sized_step_is_not_a_workover(dca):
     # A jump far above the previous regime's peak (new zone) gets no EUR match.
-    y, step = _workover_well(short=4, k=30.0)
+    y, _step = _workover_well(short=4, k=30.0)
     assert dca._unfit_step(y) is not None
     assert dca._short_regime_start(y) is None
     d, _ = _params(y)

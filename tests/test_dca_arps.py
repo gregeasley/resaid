@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pytest
 
@@ -124,4 +126,4 @@ def test_arps_decline_steep_low_b_decline_stays_near_zero():
     assert np.all(q[1:] < 1e-6)
     # Volume must fall as decline steepens.
     vols = [dca.arps_decline(x, 16805.0, d, 0.01, 0.0).sum() for d in (0.01, 0.1, 1.0, 10.0, 50.0)]
-    assert all(a > b for a, b in zip(vols, vols[1:]))
+    assert all(a > b for a, b in itertools.pairwise(vols))

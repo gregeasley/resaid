@@ -130,7 +130,12 @@ def revised_aries_de(de, b, dt):
 
 
 def expected_aries(dca, dmin, write_water):
-    """Independent model of what ``generate_aries_export`` should write."""
+    """
+    Independent model of what ``generate_aries_export`` should write: START is the last actual
+    month, each phase starts at its fitted curve's rate at START (the curve passes through the
+    last-three-month average at the midpoint of those months, one month earlier), and a phase
+    whose last three months are all zero is FLAT.
+    """
     raw = dca.dataframe
     raw = raw.assign(**{dca.date_col: pd.to_datetime(raw[dca.date_col])})
     one = dca.oneline_dataframe.set_index("UID")
@@ -154,10 +159,15 @@ def expected_aries(dca, dmin, write_water):
             else:
                 de, b = o["DE"], o["B"]
                 ratio = {"OIL": 1.0, "GAS": o["MINOR_RATIO"], "WATER": o["WATER_RATIO"]}[phase]
+                ip = o["IPO"] * ratio
                 active = o["IPO"] > 0 and ratio > 0
             if not active:
                 continue
-            volume = round(float(last3[vol_col].mean()), 0)
+            if float(last3[vol_col].mean()) > 0:
+                rate = float(dca.arps_decline(float(dt), float(ip), float(de), float(b), 0.0))
+            else:
+                rate = 0.0                                   # shut in: last three months all zero
+            volume = round(rate, 0)
             rev = round(revised_aries_de(float(de), float(b), dt), 2)
             if b > 0.05 and rev > dmin and volume > 0:
                 info = {"kind": "hyperbolic", "volume": volume, "dmin": dmin, "b": round(float(b), 2), "de": rev, "continuation": dmin}

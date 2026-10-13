@@ -5,14 +5,13 @@ This module tests the integration of ARIES, Mosaic, and PhdWin export capabiliti
 into the decline_curve class.
 """
 
-import unittest
-import pandas as pd
-import numpy as np
-import tempfile
 import os
-from datetime import datetime, timedelta
 import sys
-import os
+import tempfile
+import unittest
+
+import numpy as np
+import pandas as pd
 
 # Add the parent directory to the path to import resaid
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))

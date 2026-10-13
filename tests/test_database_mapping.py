@@ -12,9 +12,9 @@ import sqlite3
 import warnings
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
+from conftest import require_access_driver
 
 from resaid.database import ARIESDatabase
 
@@ -183,10 +183,9 @@ def test_real_aries_default_header_mapping(path):
     """Against a local ARIES database (skipped when the file or Access driver is absent)."""
     if not path.is_file():
         pytest.skip(f"Optional ARIES fixture not present: {path}")
-    pytest.importorskip("pyodbc")
+    require_access_driver()
     with ARIESDatabase(path) as db:
-        if not db.connect():
-            pytest.skip("Microsoft Access ODBC driver not available")
+        assert db.connect()
         with pytest.warns(UserWarning, match="LATERAL"):
             data = db.prepare_data_for_dca(production_table="AC_PRODUCT", header_table="AC_PROPERTY")
         assert len(data) > 0

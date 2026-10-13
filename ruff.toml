@@ -1,0 +1,7 @@
+# Ruff uses its default rule set; this pins the Python target to match setup.py.
+target-version = "py310"
+
+[lint.per-file-ignores]
+# Developer scripts and examples report any failure and continue to the next step.
+"scripts/**" = ["BLE001", "S110"]
+"examples/**" = ["BLE001", "S110"]

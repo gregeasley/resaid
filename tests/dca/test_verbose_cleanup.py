@@ -10,7 +10,6 @@ import logging
 
 import pandas as pd
 import pytest
-
 from aries_helpers import fit, make_production
 
 LOGGER = "resaid.dca.decline_curve"

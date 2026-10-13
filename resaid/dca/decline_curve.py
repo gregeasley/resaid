@@ -8,6 +8,7 @@ import logging
 import time
 import warnings
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,7 @@ from scipy.optimize import curve_fit, minimize_scalar
 from scipy.signal import argrelextrema
 from tqdm import tqdm
 
+from .._strict import StrictAttributes
 from ..dca_constants import DEFAULT_FORECAST_HORIZON_MONTHS, DEFAULT_SOLVER_T_MAX_MONTHS
 
 logger = logging.getLogger(__name__)
@@ -126,16 +128,16 @@ def _decline_solver_cls():
     return _decline_solver_type
 
 
-class decline_curve:
+class decline_curve(StrictAttributes):
     """
     Main decline curve analysis class for production forecasting.
-    
+
     This class provides comprehensive decline curve analysis capabilities including:
     - Production data preprocessing and normalization
     - Arps decline curve parameter fitting
     - Single-phase and three-phase forecasting modes
     - Flowstream, oneline, and typecurve generation
-    
+
     Attributes:
         DAYS_PER_MONTH: Days per month normalization factor
         GAS_CUTOFF: Gas-oil ratio cutoff for phase classification (MSCF/STB)
@@ -163,7 +165,7 @@ class decline_curve:
         self.MINOR_TAIL_MONTHS = 6  # Number of months from tail to use for minor phase ratios
         self.STANDARD_LENGTH = 5280  # Length to normalize horizontals to
         self.MIN_DECLINE_RATE = .08/12  # Minimum monthly decline rate
-        
+
         # User-configurable parameters
         self.verbose = False
         self.debug_on = False
@@ -179,8 +181,8 @@ class decline_curve:
         self.outlier_correction = True
         self.iqr_limit = 1.5
         self.min_h_b = .99
-        self.max_h_b = 2
-        
+        self.max_h_b = 2.0
+
         self.backup_decline = False
         self.qi_tail_points = 3
 
@@ -198,7 +200,11 @@ class decline_curve:
         # multiple of the previous regime's peak, the step is a new completion (recompletion to a
         # new zone, restimulation), not a workover, and no EUR match is applied.
         self.short_regime_max_ratio = 1.25
-        self._dataframe = None
+        # Three-phase mode: minor phases start their fit window where the major phase's does
+        # (its first peak / latest regime), so a spike in a minor phase does not cut its fit to
+        # a short recent window. Zero months and outliers are still screened per phase.
+        self.minor_window_from_major = True
+        self._dataframe: pd.DataFrame | None = None
         self._date_col = None
         self._phase_col = None
         self._length_col = None
@@ -224,13 +230,19 @@ class decline_curve:
         # Data storage
         self._normalized_dataframe = pd.DataFrame()
         self._params_dataframe = pd.DataFrame([])
-        self._flowstream_dataframe = None
-        self._typecurve = None
+        self._flowstream_dataframe: pd.DataFrame | None = None
+        self._typecurve: pd.DataFrame | None = None
         self._oneline = pd.DataFrame()
 
         self.tc_params = pd.DataFrame()
         self.tc_params_flowstream = pd.DataFrame()
         self.dca_param_df = []
+
+        # Per-run fit statistics (reset at the start of each run).
+        self.V_DCA_FAILURES = 0
+        self._dca_path_counts: dict = {}
+        self._legacy_adjust_counts: dict = {}
+        self._reset_dca_run_path_counts()
 
     @property
     def STAT_FILE(self):
@@ -248,7 +260,10 @@ class decline_curve:
             and self.stat_file_path is not None
         ):
             try:
-                self._stat_file = open(self.stat_file_path, "a", encoding="utf-8", buffering=1)
+                # Kept open across calls and closed by close(); a with-block would close it.
+                self._stat_file = open(  # noqa: SIM115
+                    self.stat_file_path, "a", encoding="utf-8", buffering=1
+                )
                 self._owns_stat_file = True
             except OSError:
                 self._stat_file_disabled = True
@@ -267,8 +282,8 @@ class decline_curve:
         if f is not None and getattr(self, "_owns_stat_file", False):
             try:
                 f.close()
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("Error closing run log", exc_info=True)
         self._stat_file = None
         self._owns_stat_file = False
 
@@ -401,21 +416,71 @@ class decline_curve:
     def day_diff(self,a,b):
         return (a - b) / np.timedelta64(1, 'D')
 
+    # Column-name attributes checked by ``_require_data``: (attribute, label).
+    _REQUIRED_COLUMN_ATTRS = (
+        ("_date_col", "date_col"),
+        ("_uid_col", "uid_col"),
+        ("_oil_col", "oil_col"),
+        ("_gas_col", "gas_col"),
+        ("_water_col", "water_col"),
+    )
+    _OPTIONAL_COLUMN_ATTRS = (
+        ("_phase_col", "phase_col"),
+        ("_length_col", "length_col"),
+        ("_dayson_col", "dayson_col"),
+    )
+
+    def _require_data(self) -> pd.DataFrame:
+        """
+        Return the production data after checking it is ready for DCA.
+
+        Raises ``ValueError`` naming the problem when ``dataframe`` is unset or empty,
+        a required column name (date, uid, oil, gas, water) is unset, or any configured
+        column (including phase, length and dayson when set) is not in the data.
+        """
+        df = self._dataframe
+        if df is None:
+            raise ValueError("No production data: set dca.dataframe before running DCA.")
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(f"dataframe must be a pandas DataFrame, got {type(df).__name__}")
+        unset = [label for attr, label in self._REQUIRED_COLUMN_ATTRS if not getattr(self, attr)]
+        if unset:
+            raise ValueError(
+                f"Set the column name(s) {', '.join(unset)} before running DCA "
+                "(e.g. dca.date_col = 'DATE')."
+            )
+        configured = [
+            (label, getattr(self, attr))
+            for attr, label in self._REQUIRED_COLUMN_ATTRS + self._OPTIONAL_COLUMN_ATTRS
+            if getattr(self, attr)
+        ]
+        missing = [f"{label}={col!r}" for label, col in configured if col not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Column(s) not found in dataframe: {', '.join(missing)}. "
+                f"Available columns: {', '.join(map(str, df.columns))}"
+            )
+        if df.empty:
+            raise ValueError("dataframe has no rows.")
+        return df
+
+    def _require_flowstream(self) -> pd.DataFrame:
+        """Return the flowstream, or raise if ``generate_flowstream`` has not run."""
+        if self._flowstream_dataframe is None:
+            raise RuntimeError("No flowstream: call generate_flowstream() first.")
+        return self._flowstream_dataframe
+
     def generate_t_index(self):
         """Generate time index for production data."""
+        self._dataframe = self._require_data()
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
         self._dataframe = self._dataframe.sort_values(
-            [self._uid_col, self._date_col]
+            [cast(str, self._uid_col), cast(str, self._date_col)]
         ).reset_index(drop=True)
-        min_by_well = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
-        min_by_well = min_by_well.rename(columns={self._date_col:'MIN_DATE'})
-        
-        self._dataframe = self._dataframe.merge(
-            min_by_well, 
-            left_on = self._uid_col,
-            right_on = self._uid_col,
-            suffixes=(None,'_MIN')
-        )
+        # Each well's first production date, assigned in place so that running DCA again on
+        # the same object neither duplicates the column nor reuses a stale one (a merge did,
+        # and pandas 3 rejects the duplicate column a third run created).
+        self._dataframe['MIN_DATE'] = self._dataframe.groupby(self._uid_col)[self._date_col].transform('min')
 
         if self._input_monthly:
             self._dataframe['T_INDEX'] = self.month_diff(
@@ -451,11 +516,12 @@ class decline_curve:
         )
 
     def normalize_production(self):
+        self._dataframe = self._require_data()
 
         self._normalized_dataframe['UID'] = self._dataframe[self._uid_col]
         self._normalized_dataframe['T_INDEX'] = self._dataframe['T_INDEX']
 
-        if self._length_col == None:
+        if self._length_col is None:
             self._normalized_dataframe['LENGTH_NORM'] = 1.0
         else:
             self._dataframe[self._length_col] = self._dataframe[self._length_col].fillna(0)
@@ -472,7 +538,7 @@ class decline_curve:
             "V"
         )
 
-        if self._length_col == None:
+        if self._length_col is None:
             self._normalized_dataframe['LENGTH_SET'] = 1.0
         else:
             self._normalized_dataframe['LENGTH_SET'] = np.where(
@@ -481,9 +547,9 @@ class decline_curve:
                 1.0
             )
 
-        
 
-        if self._dayson_col == None:
+
+        if self._dayson_col is None:
             self._normalized_dataframe['DAYSON'] = 30.4
         else:
             self._dataframe[self._dayson_col] = self._dataframe[self._dayson_col].fillna(30.4)
@@ -526,12 +592,12 @@ class decline_curve:
             (self._normalized_dataframe['LENGTH_NORM'] * self._normalized_dataframe['DAYSON'])
         )
 
-        
-        if self._phase_col == None:
+
+        if self._phase_col is None:
             self.assign_major()
         else:
             self._normalized_dataframe['MAJOR'] = self._dataframe[self._phase_col]
-        
+
 
         self._normalized_dataframe = self._normalized_dataframe[[
             'UID',
@@ -544,26 +610,26 @@ class decline_curve:
             'NORMALIZED_WATER'
         ]]
 
-        self._normalized_dataframe['NORMALIZED_OIL'] = self._normalized_dataframe['NORMALIZED_OIL'].fillna(0) 
-        self._normalized_dataframe['NORMALIZED_GAS'] = self._normalized_dataframe['NORMALIZED_GAS'].fillna(0) 
-        self._normalized_dataframe['NORMALIZED_WATER'] = self._normalized_dataframe['NORMALIZED_WATER'].fillna(0) 
-    
+        self._normalized_dataframe['NORMALIZED_OIL'] = self._normalized_dataframe['NORMALIZED_OIL'].fillna(0)
+        self._normalized_dataframe['NORMALIZED_GAS'] = self._normalized_dataframe['NORMALIZED_GAS'].fillna(0)
+        self._normalized_dataframe['NORMALIZED_WATER'] = self._normalized_dataframe['NORMALIZED_WATER'].fillna(0)
+
         if self.debug_on:
             self._normalized_dataframe.to_csv('outputs/norm_test.csv')
-    
+
     def outlier_detection(self, input_x, input_y):
         """
         Detect and filter outliers using Bonferroni correction.
-        
+
         Runs a log-rate vs time OLS on points with strictly positive rates, then
         ``outlier_test``. Skips when the design is too small, singular, or would
         leave ``df_resid == 0`` (which otherwise triggers divide-by-zero inside
         statsmodels).
-        
+
         Args:
             input_x: Time values
             input_y: Production values
-            
+
         Returns:
             tuple: (filtered_x, filtered_y) - filtered data without outliers
         """
@@ -594,7 +660,7 @@ class decline_curve:
 
         try:
             regression = sm.formula.ols(
-                "data ~ x", data=dict(data=ln_y, x=vx)
+                "data ~ x", data=pd.DataFrame({"data": ln_y, "x": vx})
             ).fit()
         except Exception:
             if self.verbose:
@@ -648,6 +714,10 @@ class decline_curve:
             )
 
         return np.asarray(kept_x, dtype=float), np.asarray(kept_y, dtype=float)
+
+    def _arps_fit_model(self, x, qi, di, b, t0) -> np.ndarray:
+        """``arps_decline`` as a ``curve_fit`` model: always returns an array."""
+        return np.atleast_1d(np.asarray(self.arps_decline(x, qi, di, b, t0), dtype=float))
 
     def arps_decline(self, x, qi, di, b, t0, dmin=None):
         """
@@ -907,7 +977,7 @@ class decline_curve:
         sf = self.STAT_FILE
         if sf is None:
             return
-        print("", file=sf)
+        print(file=sf)
         print(heading, file=sf, flush=True)
         print(f"  Total fits attempted: {attempted}", file=sf, flush=True)
         print(f"  Successful fits: {successful}", file=sf, flush=True)
@@ -993,6 +1063,30 @@ class decline_curve:
         fittable = [peak for peak, ok, _ in self._regime_steps(y_vals) if ok]
         return fittable[-1] if fittable else 0
 
+    def _window_start(self, y_vals):
+        """Index where a phase's fit window starts: its first peak or latest fittable regime."""
+        y = np.asarray(y_vals, dtype=float)
+        return max(self._first_peak_index(y), self._latest_regime_start(y))
+
+    @staticmethod
+    def _forced_window_index(s, x_vals):
+        """
+        Index of the first month at or after a row's ``WINDOW_START_T`` (the major phase's
+        window start in three-phase mode), or ``None`` when the row has none.
+        """
+        start = s.get("WINDOW_START_T") if hasattr(s, "get") else None
+        if start is None:
+            return None
+        try:
+            start = float(start)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(start):
+            return None
+        x = np.asarray(x_vals, dtype=float)
+        idx = np.flatnonzero(x >= start)
+        return int(idx[0]) if len(idx) else None
+
     def _short_regime_start(self, y_vals):
         """
         Onset index (first month of the step) of the newest regime when it is too short to fit
@@ -1044,7 +1138,7 @@ class decline_curve:
         start = max(self._first_peak_index(y[:short]), self._latest_regime_start(y))
         produced_prev = float(np.sum(y[start:short][good[start:short]]))
         t0 = float(x[start]) if t0 is None else float(t0)
-        t_after = np.arange(x[short], x[short] + DEFAULT_SOLVER_T_MAX_MONTHS, dtype=float)
+        t_after = np.arange(float(x[short]), float(x[short]) + DEFAULT_SOLVER_T_MAX_MONTHS, dtype=float)
         remaining_prev = float(np.sum(self.arps_decline(t_after, qi, di, b, t0)))
         eur_prev = produced_prev + remaining_prev
         pos = np.where(good)[0]
@@ -1078,6 +1172,7 @@ class decline_curve:
                 eur=target, t_max=DEFAULT_SOLVER_T_MAX_MONTHS,
             ).solve()
         except Exception:
+            logger.debug("Short-regime EUR solve failed", exc_info=True)
             return None
         di_new = float(di_new)
         if not np.isfinite(di_new) or di_new <= 0:
@@ -1247,10 +1342,10 @@ class decline_curve:
 
     def _monotone_two_step_core(self, s, x_vals, y_vals, mono_x, mono_y, short=None):
         """
-        Single attempt: Arps ``curve_fit`` on ``(mono_x, mono_y)`` then EUR + di solves.
+        Single attempt: Arps ``curve_fit`` on ``(mono_x, mono_y)``, then the same post-fit
+        step as the default method (L3M adjustment, or the short-regime EUR match).
         Returns ``s`` on success; raises on recoverable failure so callers can try another window.
-        ``short``: peak index of a newer regime too short to fit; its production to date is
-        taken off the EUR the tail rate must reach.
+        ``short``: peak index of a newer regime too short to fit (``_short_regime_eur_match``).
         """
         mono_x = np.asarray(mono_x, dtype=float)
         mono_y = np.asarray(mono_y, dtype=float)
@@ -1277,8 +1372,8 @@ class decline_curve:
             b_max = self.max_h_b
 
         if self._force_t0:
-            t0_min = 1
-            t0_max = 2
+            t0_min = 1.0
+            t0_max = 2.0
             di_min = 0.01
             di_max = 0.9
             weights = np.ones(len(mono_x))
@@ -1296,7 +1391,7 @@ class decline_curve:
             warnings.simplefilter("ignore")
             try:
                 popt, _ = curve_fit(
-                    self.arps_decline,
+                    self._arps_fit_model,
                     mono_x,
                     mono_y,
                     p0=[float(q_max), float(di_int), b0, float(t0_min)],
@@ -1319,59 +1414,28 @@ class decline_curve:
         if not np.isfinite(de_stage1) or de_stage1 <= 0:
             de_stage1 = float(di_int)
 
-        Solver = _decline_solver_cls()
-        eur_solver = Solver(
-            qi=qi_fit,
-            qf=None,
-            de=float(de_stage1),
-            dmin=self.MIN_DECLINE_RATE,
-            b=b_fit,
-            eur=None,
-            t_max=DEFAULT_SOLVER_T_MAX_MONTHS,
-        )
-        _, _, _, _, eur_fit, _, _ = eur_solver.solve()
-        eur_fit = float(eur_fit)
-        if not np.isfinite(eur_fit) or eur_fit <= 0:
-            cum_obs = float(
-                np.sum(np.where(np.isfinite(y_vals) & (y_vals > 0), y_vals, 0.0))
-            )
-            eur_fit = max(cum_obs * 1.05, qi_fit * 24.0, float(np.sum(mono_y)), 1.0)
-
-        if short is not None:
-            tgt = self._short_regime_target(qi_fit, de_stage1, b_fit, x_vals, y_vals, short,
-                                            float(popt[3]))
-            if tgt is not None:
-                eur_fit = tgt[2]
-
-        n_tail = max(int(self.qi_tail_points), 1)
-        pos_tail_idx = np.where(np.isfinite(y_vals) & (y_vals > 0))[0]
-        if len(pos_tail_idx) == 0:
-            raise ValueError("no positive points for qi tail")
-        tail_idx = pos_tail_idx[-n_tail:]
-        qi_tail = float(np.mean(y_vals[tail_idx]))
-        if not np.isfinite(qi_tail) or qi_tail <= 0:
-            raise ValueError("invalid qi from tail average")
-        t0_tail = float(np.mean(x_vals[tail_idx]))
-
-        di_solver = Solver(
-            qi=qi_tail,
-            qf=None,
-            de=None,
-            dmin=self.MIN_DECLINE_RATE,
-            b=b_fit,
-            eur=eur_fit,
-            t_max=DEFAULT_SOLVER_T_MAX_MONTHS,
-        )
-        _, _, _, di_new, _, _, _ = di_solver.solve()
-        di_new = float(di_new)
-        if not np.isfinite(di_new) or di_new <= 0:
-            di_new = max(
-                self.MIN_DECLINE_RATE,
-                min(abs(float(de_stage1)), float(di_max)),
-            )
-        # An EUR the tail rate cannot reach drives the solve to its lower bound;
-        # declines below terminal give the same curve, so report the terminal rate.
-        di_new = max(di_new, self.MIN_DECLINE_RATE)
+        # From the stage-1 fit on, follow the default method exactly: keep the fitted curve in
+        # typecurve mode; give a recent regime too short to fit the previous regime's EUR; and
+        # otherwise apply the L3M adjustment (IP through the last-three-month average, fitted
+        # b and t0 kept).
+        t0_fit = float(popt[3])
+        matched = None
+        if self._force_t0:
+            qi_out, di_out, t0_out = qi_fit, de_stage1, t0_fit
+        else:
+            if short is not None:
+                matched = self._short_regime_eur_match(
+                    qi_fit, de_stage1, b_fit, x_vals, y_vals, short, t0_fit
+                )
+            if matched is not None:
+                qi_out, di_out, t0_out = matched
+            else:
+                qi_out, di_out = self._adjust_default_fit_to_recent_l3m(
+                    qi_fit, de_stage1, b_fit, t0_fit, x_vals, y_vals
+                )
+                t0_out = t0_fit
+        if matched is not None:
+            self._incr_dca_path(DCA_PATH_LEGACY_SHORT_REGIME)
 
         if s["MAJOR"] == "OIL":
             minor_ratio = self._tail_phase_ratio(
@@ -1392,10 +1456,10 @@ class decline_curve:
                 s["NORMALIZED_GAS"][-self.MINOR_TAIL_MONTHS :],
             )
 
-        s["qi"] = qi_tail
-        s["di"] = di_new
+        s["qi"] = float(qi_out)
+        s["di"] = float(di_out)
         s["b"] = b_fit
-        s["t0"] = t0_tail
+        s["t0"] = float(t0_out)
         s["q0"] = y_vals[0]
         s["minor_ratio"] = minor_ratio
         s["water_ratio"] = water_ratio
@@ -1443,7 +1507,13 @@ class decline_curve:
             # After a sustained step up (restim / recovery) fit only the latest
             # regime; earlier history has a different decline and would bias it.
             short = None
-            if not self._force_t0:
+            forced = None if self._force_t0 else self._forced_window_index(s, x_vals)
+            if forced is not None:
+                # Minor phase in three-phase mode: the major phase's window start governs.
+                indexMin = forced
+                t0Min = x_vals[forced]
+                t0Max = max(t0Max, t0Min)
+            elif not self._force_t0:
                 regime = self._latest_regime_start(z)
                 if regime > indexMin:
                     indexMin = regime
@@ -1461,7 +1531,7 @@ class decline_curve:
             end = short if short is not None else len(z)
             filtered_x = np.array(x_vals[indexMin:end])
             filtered_y = np.array(y_vals[indexMin:end])
-            
+
             if self.verbose:
                 logger.info(
                     'Well %s: After peak detection — %s points (from index %s)',
@@ -1474,7 +1544,7 @@ class decline_curve:
             zero_filtered_count = len(filtered_y) - np.sum(zero_filter)
             filtered_x = filtered_x[zero_filter]
             filtered_y = filtered_y[zero_filter]
-            
+
             if self.verbose:
                 logger.info(
                     'Well %s: After zero filtering — %s points (removed %s zero/negative values)',
@@ -1482,9 +1552,9 @@ class decline_curve:
                     len(filtered_x),
                     zero_filtered_count,
                 )
-            
+
             outliered_x, outliered_y = self.outlier_detection(filtered_x,filtered_y)
-            
+
             if self.verbose:
                 outlier_filtered_count = len(filtered_x) - len(outliered_x)
                 logger.info(
@@ -1516,7 +1586,7 @@ class decline_curve:
                 # Pin decline start to the empirical peak (strictly increasing bounds for curve_fit).
                 t0Min = float(outliered_x[0])
                 t0Max = t0Min + 1e-3
-            
+
 
             if len(outliered_x) > 3:
                 if t0Min == t0Max:
@@ -1550,12 +1620,12 @@ class decline_curve:
                     di_max = di_int*2
                     weight_range = list(range(1,len(outliered_x)+1))
                     weight_range = weight_range[::-1]
-                
+
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        popt, pcov = curve_fit(
-                            self.arps_decline,
+                        popt, _pcov = curve_fit(
+                            self._arps_fit_model,
                             outliered_x,
                             outliered_y,
                             p0=[q_max, di_int, (bMin + bMax) / 2, t0Min],
@@ -1624,7 +1694,7 @@ class decline_curve:
                             note_print="DCA Error: " + str(s["UID"]),
                             backup_path_key=DCA_PATH_LEGACY_BACKUP_FIT,
                         )
-                except Exception:
+                except Exception:  # noqa: BLE001 - any fit failure falls back to the backup decline
                     return self._dca_failure_finish(
                         s,
                         x_vals,
@@ -1638,10 +1708,10 @@ class decline_curve:
                     x_vals,
                     y_vals,
                     note_log_warning=(
-                        "Well %s: INSUFFICIENT DATA AFTER FILTERING "
-                        "(original=%s, after_peak=%s, after_outlier=%s; need >3)"
-                    )
-                    % (s["UID"], len(x_vals), len(filtered_x), len(outliered_x)),
+                        f"Well {s['UID']}: INSUFFICIENT DATA AFTER FILTERING "
+                        f"(original={len(x_vals)}, after_peak={len(filtered_x)}, "
+                        f"after_outlier={len(outliered_x)}; need >3)"
+                    ),
                     note_print="Insufficient data after filtering, well: " + str(s["UID"]),
                     backup_path_key=DCA_PATH_LEGACY_BACKUP_POST,
                 )
@@ -1663,10 +1733,11 @@ class decline_curve:
 
     def _dca_params_monotone_two_step(self, s):
         """
-        Two-step decline: try Arps fit + EUR + ``di`` solve on progressively looser
-        windows (strict monotone segment, legacy-style post-peak tail with/without
-        outlier filtering, then first-positive span). Uses the same terminal backup
-        semantics as legacy via ``_dca_failure_finish`` / ``handle_dca_error``.
+        Two-step decline: Arps fit on progressively looser windows (strict monotone
+        segment, legacy-style post-peak tail with/without outlier filtering, then
+        first-positive span), then the default method's L3M adjustment (or short-regime
+        EUR match). Uses the same terminal backup semantics as legacy via
+        ``_dca_failure_finish`` / ``handle_dca_error``.
         """
         s = self._sort_well_series_by_t_index(s)
         x_vals = np.asarray(s["T_INDEX"], dtype=float)
@@ -1691,8 +1762,13 @@ class decline_curve:
 
         # After a sustained step up, choose fit windows from the latest regime only; a newer
         # step too short to fit is left out and gets that regime's EUR from its tail rate.
-        regime = self._latest_regime_start(y_vals)
-        short = self._short_regime_start(y_vals) if self.short_regime_eur_match else None
+        forced = self._forced_window_index(s, x_vals)
+        if forced is not None:
+            # Minor phase in three-phase mode: the major phase's window start governs.
+            regime, short = forced, None
+        else:
+            regime = self._latest_regime_start(y_vals)
+            short = self._short_regime_start(y_vals) if self.short_regime_eur_match else None
         if short is not None and short - regime <= 3:
             short = None
         end = short if short is not None else len(y_vals)
@@ -1704,6 +1780,7 @@ class decline_curve:
                 self._incr_dca_path(path_key)
                 return out
             except Exception:
+                logger.debug("Monotone fit window %s failed", path_key, exc_info=True)
                 continue
 
         return self._dca_failure_finish(
@@ -1814,7 +1891,8 @@ class decline_curve:
 
         # Apply DCA parameters calculation with progress tracking
         tqdm.pandas(desc="Processing wells (vectorized mode)")
-        imploded_df = imploded_df.progress_apply(self.dca_params, axis=1)
+        # progress_apply is added to pandas at runtime by tqdm.pandas().
+        imploded_df = imploded_df.progress_apply(self.dca_params, axis=1)  # pyright: ignore[reportCallIssue]
         attempted = len(imploded_df)
         successful = int(imploded_df["qi"].notna().sum())
         self._raise_if_all_dca_failed(attempted, successful)
@@ -1838,7 +1916,7 @@ class decline_curve:
         r_df:pd.DataFrame = pd.DataFrame([])
 
         for major in ['OIL','GAS']:
-            l_df = imploded_df[imploded_df['major']==major]
+            l_df = imploded_df[imploded_df['major']==major].copy()
 
             if len(l_df)>0:
                 if self.outlier_correction:
@@ -1911,7 +1989,7 @@ class decline_curve:
         for _, well_row in well_phases.iterrows():
             uid = well_row['UID']
             phases_to_analyze = []
-            
+
             if well_row['NORMALIZED_OIL'] > 0:
                 phases_to_analyze.append('OIL')
             if well_row['NORMALIZED_GAS'] > 0:
@@ -1925,6 +2003,15 @@ class decline_curve:
                 .sort_values('T_INDEX')
             )
 
+            # The major phase's fit window start (first peak / latest regime) also starts the
+            # minor phases' windows.
+            major = str(well_data['MAJOR'].iloc[0]).upper() if len(well_data) else ''
+            major_start_t = np.nan
+            if self.minor_window_from_major and major in ('OIL', 'GAS', 'WATER') \
+                    and major in phases_to_analyze:
+                z_major = well_data[f'NORMALIZED_{major}'].to_numpy(dtype=float)
+                major_start_t = float(well_data['T_INDEX'].iloc[self._window_start(z_major)])
+
             for phase in phases_to_analyze:
                 # Create a temporary dataframe for this phase-well combination
                 temp_df = well_data[[
@@ -1934,10 +2021,11 @@ class decline_curve:
                     'T_INDEX',
                     f'NORMALIZED_{phase}'
                 ]].copy()
-                
+
                 # Add a MAJOR column for this phase
                 temp_df['MAJOR'] = phase
-                
+                temp_df['WINDOW_START_T'] = major_start_t if phase != major else np.nan
+
                 # Add dummy columns for other phases (set to 0)
                 for other_phase in ['OIL', 'GAS', 'WATER']:
                     if other_phase != phase:
@@ -1953,12 +2041,13 @@ class decline_curve:
                     'T_INDEX': lambda x: x.tolist(),
                     'NORMALIZED_OIL': lambda x: x.tolist(),
                     'NORMALIZED_GAS': lambda x: x.tolist(),
-                    'NORMALIZED_WATER': lambda x: x.tolist()
+                    'NORMALIZED_WATER': lambda x: x.tolist(),
+                    'WINDOW_START_T': 'first',
                 }).reset_index()
 
                 # Apply DCA parameters calculation
                 imploded_df = imploded_df.apply(self.dca_params, axis=1)
-                
+
                 # Update progress bar
                 progress_bar.update(1)
 
@@ -1979,11 +2068,11 @@ class decline_curve:
                         'MAJOR': 'phase',
                         'LENGTH_NORM': 'h_length'
                     })
-                    
+
                     # Add phase-specific columns
                     phase_df['minor_ratio'] = 0.0  # No minor ratio in three-phase mode
                     phase_df['water_ratio'] = 0.0  # No water ratio in three-phase mode
-                    
+
                     all_results.append(phase_df)
 
         # Combine all results
@@ -2018,12 +2107,17 @@ class decline_curve:
 
         Args:
             _verbose: Log per-well filtering details and step messages.
+
+        Raises:
+            ValueError: If ``dataframe`` or a required column name is unset, or a
+                configured column is not in the data.
         """
+        self._require_data()
         self.verbose = _verbose
         if self.verbose:
             print('Generating time index.', file=self.STAT_FILE, flush=True)
-            
-        
+
+
         self.generate_t_index()
 
         if self.verbose:
@@ -2034,7 +2128,7 @@ class decline_curve:
         if self.verbose:
             print('Generating decline parameters.', file=self.STAT_FILE, flush=True)
         #self.generate_params()
-        
+
         if self.three_phase_mode:
             self.vect_generate_params_three_phase()
         else:
@@ -2043,7 +2137,7 @@ class decline_curve:
     def add_months(self, start_date, delta_period):
         end_date = start_date + relativedelta(months=delta_period)
         return end_date
-    
+
     def generate_oneline(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, _verbose=False):
         """
         Build one summary row per well in ``oneline_dataframe``.
@@ -2073,15 +2167,19 @@ class decline_curve:
         """Original oneline generation using major phase with ratios"""
         # Of note, since you often forget this, the flowstream dataframe inherits the denormalize attribute
         # So the oneline sums will always follow the denormalization settings
-        oneline_df = self._flowstream_dataframe.reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
+        oneline_df = self._require_flowstream().reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
 
+        self._dataframe = self._require_data()
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
 
         min_df = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
         min_df = min_df.rename(columns={self._uid_col:"UID",self._date_col:"MIN_DATE"})
         min_df = min_df[min_df['MIN_DATE'].notnull()]
 
-        self._params_dataframe = self._params_dataframe.merge(min_df, left_on='UID', right_on='UID')
+        # Drop dates added by an earlier call so a second oneline does not merge them twice.
+        self._params_dataframe = self._params_dataframe.drop(
+            columns=['MIN_DATE', 'T0_DATE'], errors='ignore'
+        ).merge(min_df, left_on='UID', right_on='UID')
 
         self._params_dataframe = self._params_dataframe.replace([np.inf, -np.inf], np.nan)
 
@@ -2118,12 +2216,12 @@ class decline_curve:
             flow_df['qi']*flow_df['MINOR_RATIO']*flow_df['denormalization_scalar']
         )
 
-        flow_df['IPG'] = np.where(  
+        flow_df['IPG'] = np.where(
             flow_df['MAJOR'] == "GAS",
             flow_df['qi']*flow_df['denormalization_scalar'],
             flow_df['qi']*flow_df['MINOR_RATIO']*flow_df['denormalization_scalar']
         )
-        
+
         flow_df['WATER'] = flow_df['qi']*flow_df['WATER_RATIO']
 
         flow_df['ARIES_DE'] = flow_df.apply(lambda row: (1-np.power(((row.DE*12)*row.B+1),(-1/row.B)))*100, axis=1)
@@ -2137,9 +2235,10 @@ class decline_curve:
     def _generate_oneline_three_phase(self, num_months, denormalize, _verbose):
         """Three-phase oneline generation with independent decline curves for each phase"""
         # Get flowstream totals by well
-        oneline_df = self._flowstream_dataframe.reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
+        oneline_df = self._require_flowstream().reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
 
         # Get minimum dates for each well
+        self._dataframe = self._require_data()
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
         min_df = self._dataframe[[self._uid_col,self._date_col]].groupby(by=[self._uid_col]).min().reset_index()
         min_df = min_df.rename(columns={self._uid_col:"UID",self._date_col:"MIN_DATE"})
@@ -2154,11 +2253,11 @@ class decline_curve:
 
         # Create oneline data for each well
         well_summaries = []
-        
+
         for uid in oneline_df['UID'].unique():
             well_params = params_with_dates[params_with_dates['UID'] == uid]
             well_flow = oneline_df[oneline_df['UID'] == uid].iloc[0]
-            
+
             # Initialize well summary
             well_summary = {
                 'UID': uid,
@@ -2167,20 +2266,20 @@ class decline_curve:
                 'WATER': well_flow['WATER'],
                 'T0_DATE': well_params['T0_DATE'].iloc[0] if len(well_params) > 0 else None
             }
-            
+
             # Add phase-specific parameters
             for phase in ['OIL', 'GAS', 'WATER']:
                 phase_params = well_params[well_params['phase'] == phase]
                 if len(phase_params) > 0:
                     param = phase_params.iloc[0]
                     h_length = param['h_length']
-                    
+
                     # Calculate denormalization scalar
                     if denormalize and h_length > 1:
                         denormalization_scalar = h_length / self.STANDARD_LENGTH
                     else:
                         denormalization_scalar = 1.0
-                    
+
                     # Add phase-specific parameters
                     well_summary[f'IP{phase[0]}'] = param['qi'] * denormalization_scalar  # IPO, IPG, IPW
                     well_summary[f'D{phase[0]}'] = param['di']  # DO, DG, DW
@@ -2192,9 +2291,9 @@ class decline_curve:
                     well_summary[f'D{phase[0]}'] = 0.0
                     well_summary[f'B{phase[0]}'] = 0.0
                     well_summary[f'ARIES_D{phase[0]}'] = 0.0
-            
+
             well_summaries.append(well_summary)
-        
+
         # Create the oneline dataframe
         self._oneline = pd.DataFrame(well_summaries)
 
@@ -2230,6 +2329,7 @@ class decline_curve:
 
     def _generate_flowstream_original(self, t_range, num_months, denormalize, actual_dates):
         """Original flowstream generation using major phase with ratios"""
+        self._dataframe = self._require_data()
         flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','t0','minor_ratio','water_ratio']].copy()
 
         flow_df['T_INDEX'] = flow_df.apply(lambda row: t_range, axis=1)
@@ -2241,7 +2341,7 @@ class decline_curve:
                 )
         else:
             flow_df['denormalization_scalar'] = 1.0
-        
+
         flow_df['dca_values'] = flow_df.apply(
             lambda row: np.array(self.arps_decline(t_range, row.qi, row.di, row.b, row.t0)) * row['denormalization_scalar'],
             axis=1
@@ -2257,19 +2357,14 @@ class decline_curve:
             flow_df['dca_values'] * flow_df['minor_ratio']
         )
         flow_df['WATER'] = flow_df['dca_values'] * flow_df['water_ratio']
-        
+
         self._flowstream_dataframe = flow_df[['UID','major','T_INDEX','OIL','GAS','WATER']].rename(columns={'major':'MAJOR'})
         self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID','MAJOR']).apply(pd.Series.explode).reset_index()
         self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
 
-        # Replace na in OIL, GAS, WATER with 0
-        self._flowstream_dataframe['OIL'] = self._flowstream_dataframe['OIL'].fillna(0)
-        self._flowstream_dataframe['GAS'] = self._flowstream_dataframe['GAS'].fillna(0)
-        self._flowstream_dataframe['WATER'] = self._flowstream_dataframe['WATER'].fillna(0)
-
-        self._flowstream_dataframe['OIL'] = pd.to_numeric(self._flowstream_dataframe['OIL'])
-        self._flowstream_dataframe['GAS'] = pd.to_numeric(self._flowstream_dataframe['GAS'])
-        self._flowstream_dataframe['WATER'] = pd.to_numeric(self._flowstream_dataframe['WATER'])
+        # Exploded columns are object dtype: convert to numbers, then replace NaN with 0.
+        for phase in ('OIL', 'GAS', 'WATER'):
+            self._flowstream_dataframe[phase] = pd.to_numeric(self._flowstream_dataframe[phase]).fillna(0)
 
         self._flowstream_dataframe.replace([np.inf, -np.inf], 0, inplace=True)
 
@@ -2298,14 +2393,15 @@ class decline_curve:
         if actual_dates:
             actual_df['P_DATE'] = self._dataframe[self._date_col]
             self._flowstream_dataframe['P_DATE'] = None
-            
+
         actual_df = actual_df.set_index(['UID', 'T_INDEX'])
 
     def _generate_flowstream_three_phase(self, t_range, num_months, denormalize, actual_dates):
         """Three-phase flowstream generation with independent decline curves for each phase"""
+        self._dataframe = self._require_data()
         # Create a list to store all flow data
         all_flows = []
-        
+
         for _, row in self._params_dataframe.iterrows():
             uid = row['UID']
             phase = row['phase']
@@ -2314,16 +2410,16 @@ class decline_curve:
             di = row['di']
             b = row['b']
             t0 = row['t0']
-            
+
             # Calculate denormalization scalar
             if denormalize and h_length > 1:
                 denormalization_scalar = h_length / self.STANDARD_LENGTH
             else:
                 denormalization_scalar = 1.0
-            
+
             # Calculate DCA values for this phase
             dca_values = np.array(self.arps_decline(t_range, qi, di, b, t0)) * denormalization_scalar
-            
+
             # Create flow data for this phase-well combination
             for t_idx, flow_rate in zip(t_range, dca_values):
                 flow_data = {
@@ -2333,7 +2429,7 @@ class decline_curve:
                     'GAS': 0.0,
                     'WATER': 0.0
                 }
-                
+
                 # Set the flow rate for the appropriate phase
                 if phase == 'OIL':
                     flow_data['OIL'] = flow_rate
@@ -2341,9 +2437,9 @@ class decline_curve:
                     flow_data['GAS'] = flow_rate
                 elif phase == 'WATER':
                     flow_data['WATER'] = flow_rate
-                
+
                 all_flows.append(flow_data)
-        
+
         # Create the flowstream dataframe
         if all_flows:
             self._flowstream_dataframe = pd.DataFrame(all_flows)
@@ -2398,7 +2494,7 @@ class decline_curve:
         if actual_dates:
             actual_df['P_DATE'] = self._dataframe[self._date_col]
             self._flowstream_dataframe['P_DATE'] = None
-            
+
         actual_df = actual_df.set_index(['UID', 'T_INDEX'])
 
 
@@ -2477,10 +2573,11 @@ class decline_curve:
         first producing month overlays typecurve time zero (``T_INDEX=1``).
         """
         forecast = (
-            self._flowstream_dataframe
+            self._require_flowstream()
             .reset_index()[['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER']]
             .copy()
         )
+        self._dataframe = self._require_data()
 
         if denormalize:
             actual_df = self._dataframe[
@@ -2603,7 +2700,7 @@ class decline_curve:
         Uses positive finite per-well phase volumes (flowstream life sums). Includes
         each entry in ``prob_levels`` plus ``'mean'``.
         """
-        targets = {}
+        targets: dict = {}
         if self._oneline is None or getattr(self._oneline, "empty", True):
             return targets
         if phase not in self._oneline.columns:
@@ -2744,7 +2841,7 @@ class decline_curve:
                 if err <= max(1.0, target * 1e-8):
                     return di_new
         except Exception:
-            pass
+            logger.debug("Type-curve decline match failed", exc_info=True)
         return di_guess
 
     def _attach_tc_params_eur_columns(self, param_df, num_months):
@@ -2892,11 +2989,11 @@ class decline_curve:
                 if oil_series is not None:
                     wr = float(oil_rows.iloc[0].get("water_ratio", 0.0) or 0.0)
                     if np.isfinite(wr) and wr > 0:
-                        water += n_oil * oil_series.values * wr
+                        water += n_oil * oil_series.to_numpy(dtype=float) * wr
                 if gas_series is not None:
                     wr = float(gas_rows.iloc[0].get("water_ratio", 0.0) or 0.0)
                     if np.isfinite(wr) and wr > 0:
-                        water += n_gas * gas_series.values * wr
+                        water += n_gas * gas_series.to_numpy(dtype=float) * wr
                 series_map[("WATER", prob)] = water / denom
 
         if not series_map:
@@ -2907,7 +3004,7 @@ class decline_curve:
             index=t_index,
         )
         out.index.name = "T_INDEX"
-        out.columns = pd.MultiIndex.from_tuples(out.columns, names=[None, "level_1"])
+        out.columns = pd.MultiIndex.from_tuples([tuple(c) for c in out.columns], names=[None, "level_1"])
         return out
 
     @staticmethod
@@ -2992,7 +3089,7 @@ class decline_curve:
         )
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
-        
+
         need_params = return_params or return_params_flowstream
         r_df = pd.DataFrame()
         if need_params:
@@ -3023,7 +3120,6 @@ class decline_curve:
                             prob = prow['UID']
                             di = float(prow['di'])
                             b = float(prow['b'])
-                            t0 = float(prow['t0'])
                             p_arr = np.asarray(l_df[l_df['level_1'] == prob][major].values, dtype=float)
                             t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
                             # Time-zero rate on the probability curve (not fitted Arps t0).
@@ -3107,7 +3203,7 @@ class decline_curve:
                 self.tc_params_flowstream = self._build_tc_params_flowstream(
                     r_df, num_months, three_phase_mode=False
                 )
-            
+
         return_df = return_df.pivot(
                 index=['T_INDEX'],
                 columns='level_1',
@@ -3147,7 +3243,7 @@ class decline_curve:
         )
         avg_df['level_1'] = 'mean'
         return_df = pd.concat([return_df,avg_df])
-        
+
         need_params = return_params or return_params_flowstream
         r_df = pd.DataFrame()
         if need_params:
@@ -3181,7 +3277,6 @@ class decline_curve:
                                 prob = prow['UID']
                                 di = float(prow['di'])
                                 b = float(prow['b'])
-                                t0 = float(prow['t0'])
                                 p_arr = np.asarray(l_df[l_df['level_1'] == prob][phase].values, dtype=float)
                                 t_arr = np.asarray(l_df[l_df['level_1'] == prob]['T_INDEX'].values, dtype=float)
                                 # Time-zero rate on the probability curve (not fitted Arps t0).
@@ -3262,7 +3357,7 @@ class decline_curve:
                 self.tc_params_flowstream = self._build_tc_params_flowstream(
                     r_df, num_months, three_phase_mode=True
                 )
-            
+
         return_df = return_df.pivot(
                 index=['T_INDEX'],
                 columns='level_1',
@@ -3292,10 +3387,10 @@ class decline_curve:
             'T_INDEX',
             f'NORMALIZED_{phase}'
         ]].copy()
-        
+
         # Add a MAJOR column for this phase
         temp_df['MAJOR'] = phase
-        
+
         # Add dummy columns for other phases (set to 0)
         for other_phase in ['OIL', 'GAS', 'WATER']:
             if other_phase != phase:
@@ -3313,7 +3408,7 @@ class decline_curve:
         }).reset_index()
 
         imploded_df = imploded_df.apply(self.dca_params, axis=1)
-        
+
         imploded_df = imploded_df[[
             'UID',
             'MAJOR',
@@ -3366,25 +3461,52 @@ class decline_curve:
             return oil_q * float(row.get("WATER_RATIO", 0.0))
         return 0.0
 
+    @staticmethod
+    def _export_start(l3m_start):
+        """
+        Export START: the last actual month (``L3M_START``).  The fitted curve passes through
+        the last-three-month average at the midpoint of those months, so the rate at START is
+        the curve one month past that midpoint.
+        """
+        return pd.to_datetime(l3m_start)
+
+    def _phase_rate_at_tau(self, qi, di, b, tau, l3m=None):
+        """
+        Fitted rate at elapsed months ``tau`` for one phase (``arps_decline``, terminal decline
+        included).  A phase whose last three months are all zero (``l3m`` <= 0) is shut in: 0.
+        """
+        qi, di, b, tau = float(qi), float(di), float(b), float(tau)
+        if l3m is not None and not (np.isfinite(float(l3m)) and float(l3m) > 0):
+            return 0.0
+        if not (np.isfinite(qi) and qi > 0 and np.isfinite(di) and np.isfinite(b) and np.isfinite(tau)):
+            return 0.0
+        return float(self.arps_decline(tau, qi, di, b, 0.0))
+
     def _export_rate_at_tau(self, row, tau):
-        """Forecast rate at elapsed months tau from fitted parameters."""
+        """
+        Forecast rate at elapsed months tau from fitted parameters (``arps_decline``, so
+        exponential curves and the terminal decline are honored).
+        """
         qi0 = self._phase_base_qi_from_row(row)
         de = float(row.get("DE", 0.0))
         b = float(row.get("B", 0.0))
-        q = self._arps_rate_from_tau(qi0, de, b, float(tau))
-        if np.isfinite(q) and q > 0:
-            return float(q)
-        return max(qi0, 0.0)
+        if not (np.isfinite(qi0) and qi0 > 0 and np.isfinite(de) and np.isfinite(b) and np.isfinite(float(tau))):
+            return max(qi0, 0.0) if np.isfinite(qi0) else 0.0
+        q = float(self.arps_decline(float(tau), qi0, de, b, 0.0))
+        return q if np.isfinite(q) and q >= 0 else max(qi0, 0.0)
 
     def _adjust_default_fit_to_recent_l3m(self, qi, di, b, t0, x_vals, y_vals):
         """
         Adjust default-fit ``(qi, di)`` to recent production behavior at fixed ``(b, t0)``.
 
+        The L3M actual (mean of the last three finite months, zero months included) is placed at
+        the mean time of those three months, ``t_mid``, not at the last month.
+
         Rules:
-        - L3M actual <= fitted q at last t: bulk shift (scale qi only).
-        - L3M actual > fitted q at last t and b < 0.1: bulk shift.
-        - L3M actual > fitted q at last t and b >= 0.1:
-          solve qi/di so q(last_t)=L3M actual and q(2*last_t - t0)=base q at same t.
+        - L3M actual <= fitted q at t_mid: bulk shift (scale qi only).
+        - L3M actual > fitted q at t_mid and b < 0.1: bulk shift.
+        - L3M actual > fitted q at t_mid and b >= 0.1:
+          solve qi/di so q(t_mid)=L3M actual and q(2*t_mid - t0)=base q at same t.
         """
         qi0 = float(qi)
         di0 = float(di)
@@ -3400,14 +3522,16 @@ class decline_curve:
         if qi0 <= 0 or di0 <= 0 or b0 <= 0:
             return qi0, di0
 
-        tail = y[np.isfinite(y)][-3:]
+        finite = np.isfinite(y) & np.isfinite(x)
+        tail = y[finite][-3:]
         if len(tail) == 0:
             return qi0, di0
         q_actual = float(np.mean(tail))
         if not np.isfinite(q_actual) or q_actual <= 0:
             return qi0, di0
 
-        tau1 = float(x[-1] - t0)
+        # The average of the last three months belongs at their midpoint.
+        tau1 = float(np.mean(x[finite][-3:]) - t0)
         if not np.isfinite(tau1) or tau1 <= 0:
             return qi0, di0
         q_forecast_tau1 = self._arps_rate_from_tau(qi0, di0, b0, tau1)
@@ -3466,24 +3590,25 @@ class decline_curve:
     def qi_overwrite(self):
         """
         Calculate 3-month average production rates for initial rate estimation.
-        
+
         This function calculates the average production rates over the last 3 months
         for each well, which can be used to overwrite or validate initial rates.
         Uses the production data already loaded into the decline_curve object.
-        
+
         Returns:
             DataFrame: Contains UID, L3M_OIL, L3M_GAS, L3M_WATER (mean raw volumes of
             each well's last 3 rows) and L3M_START (its latest production date)
         """
-        if self._dataframe is None:
-            raise ValueError("No production data loaded. Set dataframe first.")
-            
+        self._dataframe = self._require_data()
+
         # Sort by well and date (descending)
-        production_df = self._dataframe.sort_values(by=[self._uid_col, self._date_col], ascending=[True, False])
-        
+        production_df = self._dataframe.sort_values(
+            by=[cast(str, self._uid_col), cast(str, self._date_col)], ascending=[True, False]
+        )
+
         # Group by well and take the first 3 rows for each group
         top_three_dates = production_df.groupby(self._uid_col).head(3).reset_index()
-        
+
         # Calculate the average value for each well
         result = top_three_dates[[self._uid_col, self._oil_col, self._gas_col, self._water_col, self._date_col]].groupby(self._uid_col).agg({
             self._oil_col: 'mean',
@@ -3491,7 +3616,7 @@ class decline_curve:
             self._water_col: 'mean',
             self._date_col: 'max'
         }).reset_index()
-        
+
         result = result.rename(columns={
             self._uid_col: 'UID',
             self._oil_col: 'L3M_OIL',
@@ -3499,16 +3624,16 @@ class decline_curve:
             self._water_col: 'L3M_WATER',
             self._date_col: 'L3M_START'
         })
-        
+
         return result
 
     def aries_eco_gen(self, oneline_df=None, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
         """
         Generate ARIES-compatible economic forecast file.
-        
+
         This function creates a text file in ARIES format containing production forecasts
         for economic analysis in the ARIES software.
-        
+
         Args:
             oneline_df: Oneline results dataframe (uses self._oneline if None)
             file_path: Output file path
@@ -3520,9 +3645,9 @@ class decline_curve:
             if self._oneline.empty:
                 raise ValueError("No oneline data available. Run generate_oneline() first.")
             oneline_df = self._oneline.copy()
-        
+
         oneline_df = oneline_df.fillna(0)
-        
+
         # Ensure required columns exist and add defaults for missing ones
         # Use T0_DATE if available, otherwise T0, otherwise default
         if 'T0_DATE' in oneline_df.columns:
@@ -3543,22 +3668,24 @@ class decline_curve:
             oneline_df['L3M_OIL'] = 0.0
         if 'L3M_GAS' not in oneline_df.columns:
             oneline_df['L3M_GAS'] = 0.0
-        
-        # Calculate revised parameters
+
+        # Calculate revised parameters at START, the last actual month.
         oneline_df['T0'] = pd.to_datetime(oneline_df['T0'])
-        oneline_df['revised_dt'] = self.month_diff(oneline_df['L3M_START'], oneline_df['T0'])
+        oneline_df['L3M_START'] = pd.to_datetime(oneline_df['L3M_START'])
+        oneline_df['START'] = self._export_start(oneline_df['L3M_START'])
+        oneline_df['revised_dt'] = self.month_diff(oneline_df['START'], oneline_df['T0'])
         oneline_df['revised_ai'] = oneline_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
         oneline_df['revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['revised_ai']*12)*x['B']+1),(-1/x['B'])))*100, axis=1)
         oneline_df['forecast_major_rate'] = oneline_df.apply(
             lambda r: self._export_rate_at_tau(r, r['revised_dt']), axis=1
         )
-        
+
         # Create output directory if it doesn't exist
         import os
         output_dir = os.path.dirname(file_path)
         if output_dir:  # Only create directory if there is a path
             os.makedirs(output_dir, exist_ok=True)
-        
+
         with open(file_path, "w") as file:
             for index, row in oneline_df.iterrows():
                 # Handle both standard mode (MAJOR column) and three-phase mode (phase column)
@@ -3566,10 +3693,10 @@ class decline_curve:
                 if major_phase in ['OIL','GAS'] and row['L3M_START'].year > 2020:
                     propnum = str(row['UID']).ljust(93)
                     production = " PRODUCTION".ljust(93)
-                    start = "  START".ljust(13) + row['L3M_START'].strftime('%m/%Y')
+                    start = "  START".ljust(13) + row['START'].strftime('%m/%Y')
                     start_padding = " " * (93 - len(start) - len(scenario))
                     start_line = start+start_padding+scenario
-                    
+
                     if major_phase == 'OIL':
                         major_val = round(row['forecast_major_rate'],0)
                         major_units = "B/M"
@@ -3580,16 +3707,16 @@ class decline_curve:
                         major_units = "M/M"
                         minor = "  OIL/GAS".ljust(13) + f"{round(row['MINOR_RATIO'],3)} X B/M TO LIFE LIN TIME"
                         water = "  WTR/GAS".ljust(13) + f"{round(row['WATER_RATIO'],3)} X B/M TO LIFE LIN TIME"
-                    
+
                     # Determine major line based on conditions
                     if row['B']>.01 and row['revised_aries_de'] > dmin and major_val>0:
                         major = f"  {major_phase} ".ljust(13)+f"{major_val} X {major_units} {dmin} EXP B/{round(row['B'],2)} {round(row['revised_aries_de'],2)}"
                         major_padding = " " * (93 - len(major) - len(scenario))
                         major_line = major+major_padding+scenario
-                        major_cnt = f'  "'.ljust(13)+f"X X {major_units} 99 YRS EXP {dmin}"
+                        major_cnt = '  "'.ljust(13)+f"X X {major_units} 99 YRS EXP {dmin}"
                         major_cnt_padding = " " * (93 - len(major_cnt) - len(scenario))
                         major_cnt_line = major_cnt+major_cnt_padding+scenario
-                        
+
                     elif major_val>0 and row['revised_aries_de'] > dmin:
                         major = f"  {major_phase} ".ljust(13)+f"{major_val} X {major_units} 99 YRS EXP {round(row['revised_aries_de'],2)}"
                         major_padding = " " * (93 - len(major) - len(scenario))
@@ -3620,16 +3747,17 @@ class decline_curve:
                     file.write(major_line + "\n")
                     if major_cnt_line:
                         file.write(major_cnt_line + "\n")
+                    file.write(minor_line + "\n")
                     if write_water:
                         file.write(water_line + "\n")
 
     def aries_eco_gen_three_phase(self, oneline_df=None, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
         """
         Generate ARIES-compatible economic forecast file for three-phase mode.
-        
+
         This function creates a text file in ARIES format containing production forecasts
         for all three phases (OIL, GAS, WATER) with independent decline curves.
-        
+
         Args:
             oneline_df: Oneline results dataframe with phase-specific columns
             file_path: Output file path
@@ -3641,133 +3769,142 @@ class decline_curve:
             if self._oneline.empty:
                 raise ValueError("No oneline data available. Run generate_oneline() first.")
             oneline_df = self._oneline.copy()
-        
+
         oneline_df = oneline_df.fillna(0)
-        
+
         # Ensure required columns exist
         if 'T0_DATE' in oneline_df.columns:
             oneline_df['T0'] = oneline_df['T0_DATE']
         elif 'T0' not in oneline_df.columns:
             oneline_df['T0'] = pd.Timestamp('2020-01-01')
-        
-        # Calculate revised parameters for each phase
+
+        # Calculate revised parameters for each phase at START, the last actual month.
         oneline_df['T0'] = pd.to_datetime(oneline_df['T0'])
-        oneline_df['revised_dt'] = self.month_diff(oneline_df['L3M_START'], oneline_df['T0'])
-        
+        oneline_df['L3M_START'] = pd.to_datetime(oneline_df['L3M_START'])
+        oneline_df['START'] = self._export_start(oneline_df['L3M_START'])
+        oneline_df['revised_dt'] = self.month_diff(oneline_df['START'], oneline_df['T0'])
+        # Each phase starts at its own curve's rate at START (the curve already passes through the
+        # L3M average at the midpoint of the last three months).
+        for ph in ('OIL', 'GAS', 'WATER'):
+            oneline_df[f'{ph}_START_RATE'] = oneline_df.apply(
+                lambda x, ph=ph: self._phase_rate_at_tau(x[f'{ph}_QI'], x[f'{ph}_DI'], x[f'{ph}_B'], x['revised_dt'],
+                                                         x.get(f'L3M_{ph}'))
+                if x[f'{ph}_QI'] > 0 else 0.0, axis=1)
+
         # Calculate revised decline rates for each phase
         oneline_df['OIL_revised_ai'] = oneline_df.apply(lambda x: x['OIL_DI']/(1+x['OIL_B']*x['OIL_DI']*x['revised_dt']) if x['OIL_QI'] > 0 else 0, axis=1)
         oneline_df['OIL_revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['OIL_revised_ai']*12)*x['OIL_B']+1),(-1/x['OIL_B'])))*100 if x['OIL_QI'] > 0 else 0, axis=1)
-        
+
         oneline_df['GAS_revised_ai'] = oneline_df.apply(lambda x: x['GAS_DI']/(1+x['GAS_B']*x['GAS_DI']*x['revised_dt']) if x['GAS_QI'] > 0 else 0, axis=1)
         oneline_df['GAS_revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['GAS_revised_ai']*12)*x['GAS_B']+1),(-1/x['GAS_B'])))*100 if x['GAS_QI'] > 0 else 0, axis=1)
-        
+
         oneline_df['WATER_revised_ai'] = oneline_df.apply(lambda x: x['WATER_DI']/(1+x['WATER_B']*x['WATER_DI']*x['revised_dt']) if x['WATER_QI'] > 0 else 0, axis=1)
         oneline_df['WATER_revised_aries_de'] = oneline_df.apply(lambda x: (1-np.power(((x['WATER_revised_ai']*12)*x['WATER_B']+1),(-1/x['WATER_B'])))*100 if x['WATER_QI'] > 0 else 0, axis=1)
-        
+
         # Create output directory if it doesn't exist
         import os
         output_dir = os.path.dirname(file_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        
+
         with open(file_path, "w") as file:
             for index, row in oneline_df.iterrows():
                 # Write well header
                 propnum = str(row['UID']).ljust(93)
                 production = " PRODUCTION".ljust(93)
-                start = "  START".ljust(13) + row['L3M_START'].strftime('%m/%Y')
+                start = "  START".ljust(13) + row['START'].strftime('%m/%Y')
                 start_padding = " " * (93 - len(start) - len(scenario))
                 start_line = start + start_padding + scenario
-                
+
                 file.write(propnum + "\n")
                 file.write(production + "\n")
                 file.write(start_line + "\n")
-                
+
                 # Write OIL phase if it exists
                 if row['OIL_QI'] > 0:
-                    oil_val = round(row['L3M_OIL'], 0)
-                    
+                    oil_val = round(row['OIL_START_RATE'], 0)
+
                     # Determine oil line based on conditions (matching ratio forecast logic)
                     if row['OIL_B'] > 0.05 and round(row['OIL_revised_aries_de'], 2) > dmin and oil_val > 0:
                         oil_line = f"  OIL        {oil_val} X B/M {dmin} EXP B/{round(row['OIL_B'], 2)} {round(row['OIL_revised_aries_de'], 2)}"
                         oil_padding = " " * (93 - len(oil_line) - len(scenario))
                         file.write(oil_line + oil_padding + scenario + "\n")
-                        
+
                         # Write continuation line for oil
                         oil_cnt = f'  "          X X B/M 99 YRS EXP {dmin}'
                         oil_cnt_padding = " " * (93 - len(oil_cnt) - len(scenario))
                         file.write(oil_cnt + oil_cnt_padding + scenario + "\n")
-                        
+
                     elif oil_val > 0 and round(row['OIL_revised_aries_de'], 2) > dmin:
                         oil_line = f"  OIL        {oil_val} X B/M 99 YRS EXP {round(row['OIL_revised_aries_de'], 2)}"
                         oil_padding = " " * (93 - len(oil_line) - len(scenario))
                         file.write(oil_line + oil_padding + scenario + "\n")
-                        
+
                     elif oil_val > 0:
                         oil_line = f"  OIL        {oil_val} X B/M 99 YRS EXP {dmin}"
                         oil_padding = " " * (93 - len(oil_line) - len(scenario))
                         file.write(oil_line + oil_padding + scenario + "\n")
-                        
+
                     else:
                         oil_line = f"  OIL        {oil_val} X B/M 1 YRS FLAT 0"
                         oil_padding = " " * (93 - len(oil_line) - len(scenario))
                         file.write(oil_line + oil_padding + scenario + "\n")
-                
+
                 # Write GAS phase if it exists
                 if row['GAS_QI'] > 0:
-                    gas_val = round(row['L3M_GAS'], 0)
-                    
+                    gas_val = round(row['GAS_START_RATE'], 0)
+
                     # Determine gas line based on conditions (matching ratio forecast logic)
                     if row['GAS_B'] > 0.05 and round(row['GAS_revised_aries_de'], 2) > dmin and gas_val > 0:
                         gas_line = f"  GAS        {gas_val} X M/M {dmin} EXP B/{round(row['GAS_B'], 2)} {round(row['GAS_revised_aries_de'], 2)}"
                         gas_padding = " " * (93 - len(gas_line) - len(scenario))
                         file.write(gas_line + gas_padding + scenario + "\n")
-                        
+
                         # Write continuation line for gas
                         gas_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
                         gas_cnt_padding = " " * (93 - len(gas_cnt) - len(scenario))
                         file.write(gas_cnt + gas_cnt_padding + scenario + "\n")
-                        
+
                     elif gas_val > 0 and round(row['GAS_revised_aries_de'], 2) > dmin:
                         gas_line = f"  GAS        {gas_val} X M/M 99 YRS EXP {round(row['GAS_revised_aries_de'], 2)}"
                         gas_padding = " " * (93 - len(gas_line) - len(scenario))
                         file.write(gas_line + gas_padding + scenario + "\n")
-                        
+
                     elif gas_val > 0:
                         gas_line = f"  GAS        {gas_val} X M/M 99 YRS EXP {dmin}"
                         gas_padding = " " * (93 - len(gas_line) - len(scenario))
                         file.write(gas_line + gas_padding + scenario + "\n")
-                        
+
                     else:
                         gas_line = f"  GAS        {gas_val} X M/M 1 YRS FLAT 0"
                         gas_padding = " " * (93 - len(gas_line) - len(scenario))
                         file.write(gas_line + gas_padding + scenario + "\n")
-                
+
                 # Write WATER phase if it exists and write_water is True
                 if write_water and row['WATER_QI'] > 0:
-                    water_val = round(row['L3M_WATER'], 0)
-                    
+                    water_val = round(row['WATER_START_RATE'], 0)
+
                     # Determine water line based on conditions (matching ratio forecast logic)
                     if row['WATER_B'] > 0.05 and round(row['WATER_revised_aries_de'], 2) > dmin and water_val > 0:
                         water_line = f"  WTR        {water_val} X M/M {dmin} EXP B/{round(row['WATER_B'], 2)} {round(row['WATER_revised_aries_de'], 2)}"
                         water_padding = " " * (93 - len(water_line) - len(scenario))
                         file.write(water_line + water_padding + scenario + "\n")
-                        
+
                         # Write continuation line for water
                         water_cnt = f'  "          X X M/M 99 YRS EXP {dmin}'
                         water_cnt_padding = " " * (93 - len(water_cnt) - len(scenario))
                         file.write(water_cnt + water_cnt_padding + scenario + "\n")
-                        
+
                     elif water_val > 0 and round(row['WATER_revised_aries_de'], 2) > dmin:
                         water_line = f"  WTR        {water_val} X M/M 99 YRS EXP {round(row['WATER_revised_aries_de'], 2)}"
                         water_padding = " " * (93 - len(water_line) - len(scenario))
                         file.write(water_line + water_padding + scenario + "\n")
-                        
+
                     elif water_val > 0:
                         water_line = f"  WTR        {water_val} X M/M 99 YRS EXP {dmin}"
                         water_padding = " " * (93 - len(water_line) - len(scenario))
                         file.write(water_line + water_padding + scenario + "\n")
-                        
+
                     else:
                         water_line = f"  WTR        {water_val} X M/M 1 YRS FLAT 0"
                         water_padding = " " * (93 - len(water_line) - len(scenario))
@@ -3776,14 +3913,14 @@ class decline_curve:
     def generate_aries_export(self, file_path="outputs/eco_output.txt", scenario="RSC425", dmin=6, write_water=False):
         """
         Generate ARIES export with integrated DCA analysis.
-        
+
         This method combines DCA analysis with ARIES export generation.
         When three_phase_mode is enabled, each phase uses its own fitted decline.
         Otherwise (ratio mode) the minor phase and water follow the major phase's
         decline, scaled by MINOR_RATIO and WATER_RATIO. Runs ``run_DCA`` and
         ``generate_oneline(denormalize=True)`` first if needed. Writes the file
         (creating its directory) and returns None.
-        
+
         Args:
             file_path: Output file path
             scenario: Scenario name for ARIES
@@ -3793,48 +3930,48 @@ class decline_curve:
         # Run DCA if not already done
         if self._params_dataframe.empty:
             self.run_DCA()
-        
+
         # Generate oneline if not already done
         if self._oneline.empty:
             self.generate_oneline(denormalize=True)
-        
+
         # Calculate 3-month averages
         l3m_df = self.qi_overwrite()
-        
+
         if self.three_phase_mode:
             # Use existing three-phase analysis
             # The oneline data has separate columns for each phase: IPO/DO/BO, IPG/DG/BG, IPW/DW/BW
             # For ARIES, we need to create a single row per well with all phase data
             # and use the independent decline curves instead of ratios
-            
+
             oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
-            
+
             # Create one row per well with all phase information
             well_rows = []
             for _, row in oneline_with_l3m.iterrows():
                 well_row = row.copy()
-                
+
                 # Add phase-specific decline parameters
-                well_row['OIL_QI'] = row['IPO'] if row['IPO'] > 0 else 0
+                well_row['OIL_QI'] = max(0, row['IPO'])
                 well_row['OIL_DI'] = row['DO'] if row['IPO'] > 0 else 0
                 well_row['OIL_B'] = row['BO'] if row['IPO'] > 0 else 0
                 well_row['OIL_ARIES_DE'] = row['ARIES_DO'] if row['IPO'] > 0 else 0
-                
-                well_row['GAS_QI'] = row['IPG'] if row['IPG'] > 0 else 0
+
+                well_row['GAS_QI'] = max(0, row['IPG'])
                 well_row['GAS_DI'] = row['DG'] if row['IPG'] > 0 else 0
                 well_row['GAS_B'] = row['BG'] if row['IPG'] > 0 else 0
                 well_row['GAS_ARIES_DE'] = row['ARIES_DG'] if row['IPG'] > 0 else 0
-                
-                well_row['WATER_QI'] = row['IPW'] if row['IPW'] > 0 else 0
+
+                well_row['WATER_QI'] = max(0, row['IPW'])
                 well_row['WATER_DI'] = row['DW'] if row['IPW'] > 0 else 0
                 well_row['WATER_B'] = row['BW'] if row['IPW'] > 0 else 0
                 well_row['WATER_ARIES_DE'] = row['ARIES_DW'] if row['IPW'] > 0 else 0
-                
+
                 # Set MAJOR to OIL for compatibility (will be overridden in aries_eco_gen)
                 well_row['MAJOR'] = 'OIL'
-                
+
                 well_rows.append(well_row)
-            
+
             if well_rows:
                 well_df = pd.DataFrame(well_rows)
                 # Call aries_eco_gen with three_phase_mode flag
@@ -3847,20 +3984,20 @@ class decline_curve:
             # Use existing oneline data with ratios (ratio mode)
             # The oneline data already has MINOR_RATIO and WATER_RATIO calculated
             # We just need to use these ratios to calculate gas and water production
-            
+
             oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
-            
+
             # Create one row per well with all phase information using ratios
             well_rows = []
             for _, row in oneline_with_l3m.iterrows():
                 well_row = row.copy()
-                
+
                 # Primary phase (OIL) - use existing data
-                well_row['OIL_QI'] = row['IPO'] if row['IPO'] > 0 else 0
+                well_row['OIL_QI'] = max(0, row['IPO'])
                 well_row['OIL_DI'] = row['DE'] if row['IPO'] > 0 else 0  # Use DE for ratio mode
                 well_row['OIL_B'] = row['B'] if row['IPO'] > 0 else 0    # Use B for ratio mode
                 well_row['OIL_ARIES_DE'] = row['ARIES_DE'] if row['IPO'] > 0 else 0  # Use ARIES_DE for ratio mode
-                
+
                 # Gas phase - calculate using MINOR_RATIO
                 if row['MINOR_RATIO'] > 0 and row['IPO'] > 0:
                     well_row['GAS_QI'] = row['IPO'] * row['MINOR_RATIO']
@@ -3872,7 +4009,7 @@ class decline_curve:
                     well_row['GAS_DI'] = 0
                     well_row['GAS_B'] = 0
                     well_row['GAS_ARIES_DE'] = 0
-                
+
                 # Water phase - calculate using WATER_RATIO
                 if row['WATER_RATIO'] > 0 and row['IPO'] > 0:
                     well_row['WATER_QI'] = row['IPO'] * row['WATER_RATIO']
@@ -3884,12 +4021,12 @@ class decline_curve:
                     well_row['WATER_DI'] = 0
                     well_row['WATER_B'] = 0
                     well_row['WATER_ARIES_DE'] = 0
-                
+
                 # Set MAJOR to OIL for compatibility
                 well_row['MAJOR'] = 'OIL'
-                
+
                 well_rows.append(well_row)
-            
+
             if well_rows:
                 well_df = pd.DataFrame(well_rows)
                 # Call aries_eco_gen_three_phase to format with independent decline curves
@@ -3898,13 +4035,13 @@ class decline_curve:
                 # Fallback if no valid rows
                 logger.warning("No valid phase data found for ARIES export")
                 self.aries_eco_gen(oneline_with_l3m, file_path, scenario, dmin, write_water)
-        
+
         # Note: This function writes to file and does not return a DataFrame
 
     def generate_mosaic_export(self, file_path="outputs/mosaic_export.xlsx", reserve_category="USON ARO", dmin=8):
         """
         Generate Mosaic-compatible export with integrated DCA analysis.
-        
+
         This method creates a comprehensive export for Mosaic software including
         all phases (OIL, GAS, WATER) with proper formatting and calculations.
         When three_phase_mode is enabled, each phase uses its own fitted decline.
@@ -3912,7 +4049,7 @@ class decline_curve:
         decline, scaled by MINOR_RATIO and WATER_RATIO. Runs ``run_DCA`` and
         ``generate_oneline(denormalize=True)`` first if needed. Writes the file
         (creating its directory) and returns None.
-        
+
         Args:
             file_path: Output file path (Excel format)
             reserve_category: Reserve category for Mosaic
@@ -3921,22 +4058,22 @@ class decline_curve:
         # Run DCA if not already done
         if self._params_dataframe.empty:
             self.run_DCA()
-        
+
         # Generate oneline if not already done
         if self._oneline.empty:
             self.generate_oneline(denormalize=True)
-        
+
         # Calculate 3-month averages
         l3m_df = self.qi_overwrite()
-        
+
         if self.three_phase_mode:
             # Use existing three-phase analysis
             # The oneline data has separate columns for each phase: IPO/DO/BO, IPG/DG/BG, IPW/DW/BW
             # We need to create separate rows for each phase to match the expected format
-            
+
             # Start with the base oneline data
             base_df = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
-            
+
             # Create separate rows for each phase
             combined_rows = []
             for _, row in base_df.iterrows():
@@ -3948,7 +4085,7 @@ class decline_curve:
                     oil_row['B'] = row['BO']
                     oil_row['T0'] = row['T0_DATE']
                     combined_rows.append(oil_row)
-                
+
                 # GAS phase
                 if row['IPG'] > 0:
                     gas_row = row.copy()
@@ -3957,7 +4094,7 @@ class decline_curve:
                     gas_row['B'] = row['BG']
                     gas_row['T0'] = row['T0_DATE']
                     combined_rows.append(gas_row)
-                
+
                 # WATER phase
                 if row['IPW'] > 0:
                     water_row = row.copy()
@@ -3966,7 +4103,7 @@ class decline_curve:
                     water_row['B'] = row['BW']
                     water_row['T0'] = row['T0_DATE']
                     combined_rows.append(water_row)
-            
+
             if combined_rows:
                 combined_df = pd.DataFrame(combined_rows)
             else:
@@ -3980,9 +4117,9 @@ class decline_curve:
             # Use existing oneline data with ratios (ratio mode)
             # The oneline data already has MINOR_RATIO and WATER_RATIO calculated
             # We just need to use these ratios to calculate gas and water production
-            
+
             oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
-            
+
             # Create separate rows for each phase using ratios
             combined_rows = []
             for _, row in oneline_with_l3m.iterrows():
@@ -3995,7 +4132,7 @@ class decline_curve:
                     oil_row['T0'] = row['T0_DATE']
                     oil_row['L3M_OIL'] = row['L3M_OIL']
                     combined_rows.append(oil_row)
-                
+
                 # GAS phase - calculate using MINOR_RATIO
                 if row['MINOR_RATIO'] > 0 and row['IPO'] > 0:
                     gas_row = row.copy()
@@ -4005,7 +4142,7 @@ class decline_curve:
                     gas_row['T0'] = row['T0_DATE']
                     gas_row['L3M_GAS'] = row['L3M_OIL'] * row['MINOR_RATIO']  # Calculate gas rate using ratio
                     combined_rows.append(gas_row)
-                
+
                 # WATER phase - calculate using WATER_RATIO
                 if row['WATER_RATIO'] > 0 and row['IPO'] > 0:
                     water_row = row.copy()
@@ -4015,7 +4152,7 @@ class decline_curve:
                     water_row['T0'] = row['T0_DATE']
                     water_row['L3M_WATER'] = row['L3M_OIL'] * row['WATER_RATIO']  # Calculate water rate using ratio
                     combined_rows.append(water_row)
-            
+
             if combined_rows:
                 combined_df = pd.DataFrame(combined_rows)
             else:
@@ -4026,37 +4163,40 @@ class decline_curve:
                 combined_df['DE'] = 0.1
                 combined_df['B'] = 1.0
                 combined_df['T0'] = combined_df['T0_DATE']
-        
+
         # Calculate revised parameters
         combined_df = combined_df.fillna(0)
-        
+
         # Ensure T0 column exists and use T0_DATE if available
         if 'T0_DATE' in combined_df.columns:
             combined_df['T0'] = combined_df['T0_DATE']
         elif 'T0' not in combined_df.columns:
             combined_df['T0'] = pd.Timestamp('2020-01-01')
-        
+
         combined_df['T0'] = pd.to_datetime(combined_df['T0'])
-        combined_df['revised_dt'] = self.month_diff(combined_df['L3M_START'], combined_df['T0'])
+        combined_df['L3M_START'] = pd.to_datetime(combined_df['L3M_START'])
+        # Start at the last actual month, at the curve's rate there (one month past the L3M midpoint).
+        combined_df['START'] = self._export_start(combined_df['L3M_START'])
+        combined_df['revised_dt'] = self.month_diff(combined_df['START'], combined_df['T0'])
         combined_df['revised_ai'] = combined_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
         combined_df['revised_aries_de'] = combined_df.apply(lambda x: (1-np.power(((x['revised_ai']*12)*x['B']+1),(-1/x['B'])))*100, axis=1)
-        
+
         # Calculate used IP from fitted curve at export start date.
         combined_df['used_ip'] = combined_df.apply(
             lambda r: self._export_rate_at_tau(r, r['revised_dt']),
             axis=1,
         )
-        
+
         # Format for Mosaic
         output_df = combined_df.rename(columns={
             'UID': 'Entity Name',
             'used_ip': 'Initial Rate qi (rate/d)',
             'B': 'Exponent N, b',
             'revised_aries_de': 'Secant Effective Decline Desi (%)',
-            'L3M_START': 'Start Date T0  (y-m-d)',
+            'START': 'Start Date T0  (y-m-d)',
             'MAJOR': 'Product Type'
         })
-        
+
         # Add required columns
         add_list = [
             'UUID', 'Reserve Category', 'Use Type', 'Segment #', 'Final Rate qf (rate/d)',
@@ -4064,10 +4204,10 @@ class decline_curve:
             'Nominal Decline Di (%)', 'Tangential Effective Decline   Dei (%)',
             'Service Factor (fraction)', 'Minimum Effective Decline Dmin (%)'
         ]
-        
+
         for col in add_list:
             output_df[col] = None
-        
+
         # Set default values
         output_df['Reserve Category'] = reserve_category
         output_df['Use Type'] = 'Produced'
@@ -4076,14 +4216,14 @@ class decline_curve:
         output_df['Minimum Effective Decline Dmin (%)'] = dmin
         output_df['Product Type'] = output_df['Product Type'].str.capitalize()
         output_df['Initial Rate qi (rate/d)'] = output_df['Initial Rate qi (rate/d)'] * 12 / 365
-        
+
         # Ensure minimum decline rate
         output_df['Secant Effective Decline Desi (%)'] = np.where(
             output_df['Secant Effective Decline Desi (%)'] < dmin,
             dmin,
             output_df['Secant Effective Decline Desi (%)']
         )
-        
+
         # Select final columns
         final_columns = [
             'Entity Name', 'UUID', 'Reserve Category', 'Product Type', 'Use Type', 'Segment #',
@@ -4093,24 +4233,24 @@ class decline_curve:
             'Secant Effective Decline Desi (%)', 'Service Factor (fraction)',
             'Minimum Effective Decline Dmin (%)'
         ]
-        
+
         output_df = output_df[final_columns]
-        
+
         # Create output directory if it doesn't exist
         import os
         output_dir = os.path.dirname(file_path)
         if output_dir:  # Only create directory if there is a path
             os.makedirs(output_dir, exist_ok=True)
-        
+
         # Save to Excel
         output_df.to_excel(file_path, index=False)
-        
+
         # Note: This function writes to file and does not return a DataFrame
 
     def generate_phdwin_export(self, file_path="outputs/phdwin_export.csv", dmin=6):
         """
         Generate PhdWin-compatible export with integrated DCA analysis.
-        
+
         This method creates a comprehensive export for PhdWin software including
         all phases (OIL, GAS, WATER) with proper formatting and calculations.
         When three_phase_mode is enabled, each phase uses its own fitted decline.
@@ -4118,7 +4258,7 @@ class decline_curve:
         decline, scaled by MINOR_RATIO and WATER_RATIO. Runs ``run_DCA`` and
         ``generate_oneline(denormalize=True)`` first if needed. Writes the file
         (creating its directory) and returns None.
-        
+
         Args:
             file_path: Output file path (CSV format)
             dmin: Terminal (minimum) decline, % per year
@@ -4126,21 +4266,21 @@ class decline_curve:
         # Run DCA if not already done
         if self._params_dataframe.empty:
             self.run_DCA()
-        
+
         # Generate oneline if not already done
         if self._oneline.empty:
             self.generate_oneline(denormalize=True)
-        
+
         # Calculate 3-month averages
         l3m_df = self.qi_overwrite()
-        
+
         if self.three_phase_mode:
             # Use existing three-phase analysis
             # The oneline data has separate columns for each phase: IPO/DO/BO, IPG/DG/BG, IPW/DW/BW
-            
+
             # Start with the base oneline data
             base_df = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
-            
+
             # Create separate rows for each phase
             combined_rows = []
             for _, row in base_df.iterrows():
@@ -4153,7 +4293,7 @@ class decline_curve:
                     oil_row['B'] = row['BO']   # Use BO (B-factor Oil)
                     oil_row['T0'] = row['T0_DATE']
                     combined_rows.append(oil_row)
-                
+
                 # GAS phase - use gas production data and gas-specific decline parameters
                 if row['IPG'] > 0:
                     gas_row = row.copy()
@@ -4163,7 +4303,7 @@ class decline_curve:
                     gas_row['B'] = row['BG']   # Use BG (B-factor Gas)
                     gas_row['T0'] = row['T0_DATE']
                     combined_rows.append(gas_row)
-                
+
                 # WATER phase - use water production data and water-specific decline parameters
                 if row['IPW'] > 0:  # Check if water production exists
                     water_row = row.copy()
@@ -4173,7 +4313,7 @@ class decline_curve:
                     water_row['B'] = row['BW']   # Use BW (B-factor Water)
                     water_row['T0'] = row['T0_DATE']
                     combined_rows.append(water_row)
-            
+
             if combined_rows:
                 tc_df = pd.DataFrame(combined_rows)
             else:
@@ -4188,9 +4328,9 @@ class decline_curve:
             # Use existing oneline data with ratios (ratio mode)
             # The oneline data already has MINOR_RATIO and WATER_RATIO calculated
             # We just need to use these ratios to calculate gas and water production
-            
+
             oneline_with_l3m = self._oneline.merge(l3m_df, left_on='UID', right_on='UID', how='left')
-            
+
             # Create separate rows for each phase using ratios
             combined_rows = []
             for _, row in oneline_with_l3m.iterrows():
@@ -4203,7 +4343,7 @@ class decline_curve:
                     oil_row['T0'] = row['T0_DATE']
                     oil_row['L3M_OIL'] = row['L3M_OIL']
                     combined_rows.append(oil_row)
-                
+
                 # GAS phase - calculate using MINOR_RATIO
                 if row['MINOR_RATIO'] > 0 and row['IPO'] > 0:
                     gas_row = row.copy()
@@ -4213,7 +4353,7 @@ class decline_curve:
                     gas_row['T0'] = row['T0_DATE']
                     gas_row['L3M_GAS'] = row['L3M_OIL'] * row['MINOR_RATIO']  # Calculate gas rate using ratio
                     combined_rows.append(gas_row)
-                
+
                 # WATER phase - calculate using WATER_RATIO
                 if row['WATER_RATIO'] > 0 and row['IPO'] > 0:
                     water_row = row.copy()
@@ -4223,7 +4363,7 @@ class decline_curve:
                     water_row['T0'] = row['T0_DATE']
                     water_row['L3M_WATER'] = row['L3M_OIL'] * row['WATER_RATIO']  # Calculate water rate using ratio
                     combined_rows.append(water_row)
-            
+
             if combined_rows:
                 tc_df = pd.DataFrame(combined_rows)
             else:
@@ -4234,40 +4374,40 @@ class decline_curve:
                 tc_df['DE'] = 0.1
                 tc_df['B'] = 1.0
                 tc_df['T0'] = tc_df['T0_DATE']
-        
+
         # Calculate revised parameters
         # Set StartDate to middle of last three months (L3M_START represents the most recent date)
         # Calculate middle date by going back 1 month from L3M_START (approximating middle of 3 months)
         tc_df['middle_date'] = tc_df['L3M_START'] - pd.DateOffset(months=1)
-        
+
         # Calculate time difference from T0 to middle of last three months
         tc_df['revised_dt'] = self.month_diff(tc_df['middle_date'], tc_df['T0'])
-        
+
         # Adjust decline rate to current point in time (similar to ARIES_DE calculation)
         # This calculates the effective decline rate at the current time point
         tc_df['revised_de'] = tc_df.apply(lambda x: x['DE']/(1+x['B']*x['DE']*x['revised_dt']), axis=1)
-        
+
         # Convert to PhdWin decline rate format (percentage per year)
         tc_df['ARIES_DE'] = tc_df.apply(lambda x: 100*(1-np.exp(-x['revised_de']*12)), axis=1)
-        
+
         # Use fitted curve rate at export start date (middle of last 3 months).
         tc_df['revised_qi'] = tc_df.apply(
             lambda r: self._export_rate_at_tau(r, r['revised_dt']),
             axis=1,
         )
-        
+
         # Format for PhdWin
         output_columns = [
             'UniqueId', 'Product', 'Units', 'ProjType', 'StartDate', 'BegCum',
             'Qi', 'NFactor', 'Decl', 'DeclMin', 'EndDate', 'Qf', 'Volume',
             'EndCum', 'SolveFor'
         ]
-        
+
         output_df = tc_df.copy()
-        
+
         # Set end date (50 years forward) - match reference script
         fifty_years_forward = pd.Timestamp('2075-01-01')
-        
+
         output_df['UniqueId'] = output_df['UID']
         output_df['Product'] = output_df['MAJOR'].str.title()
         output_df['Units'] = np.where(output_df['Product'] == 'Gas', 'Mcf', 'bbl')
@@ -4276,8 +4416,8 @@ class decline_curve:
         output_df['BegCum'] = 0
         output_df['Qi'] = output_df['revised_qi']
         output_df['NFactor'] = np.where(
-            (output_df['B'] > 0.01) & (output_df['ARIES_DE'] >= dmin), 
-            output_df['B'], 
+            (output_df['B'] > 0.01) & (output_df['ARIES_DE'] >= dmin),
+            output_df['B'],
             0
         )
         output_df['Decl'] = np.where(
@@ -4299,36 +4439,36 @@ class decline_curve:
             'Qf'
         )
         output_df['EndDate'] = fifty_years_forward
-        
+
         output_df = output_df[output_columns]
-        
+
         # Create output directory if it doesn't exist
         import os
         output_dir = os.path.dirname(file_path)
         if output_dir:  # Only create directory if there is a path
             os.makedirs(output_dir, exist_ok=True)
-        
+
         # Save to CSV
         output_df.to_csv(file_path, index=False)
-        
+
         # Note: This function writes to file and does not return a DataFrame
 
     def make_ratio_dfs(self, input_df=None):
         """
         Create ratio dataframes for PhdWin-style analysis.
-        
+
         This function creates separate dataframes for different production ratios
         (GOR, yield, WOR, WGR) that can be used for specialized analysis.
-        
+
         Args:
             input_df: Input dataframe with L3M data (uses qi_overwrite result if None)
-            
+
         Returns:
             DataFrame: Combined ratio dataframes
         """
         if input_df is None:
             input_df = self.qi_overwrite()
-        
+
         # Function to calculate T0 (3 months before L3M_START)
         def calculate_t0(l3m_start):
             if pd.notnull(l3m_start):
@@ -4347,7 +4487,7 @@ class decline_curve:
 
         for key, func in ratios.items():
             new_df = input_df[["UID", "L3M_OIL", "L3M_GAS", "L3M_WATER", "L3M_START"]].copy()
-            new_df["T0"] = new_df["L3M_START"].apply(calculate_t0)
+            new_df["T0"] = new_df["L3M_START"].map(calculate_t0)
             new_df["revised_qi"] = input_df.apply(func, axis=1).fillna(0)
             new_df["MAJOR"] = key.split("_")[0].upper()
             # Add remaining blank columns
@@ -4378,5 +4518,5 @@ class decline_curve:
             'revised_dt',
             'revised_qi'
         ]]
-        
+
         return final_df

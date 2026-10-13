@@ -22,6 +22,8 @@ Reservoir engineering tools for production forecasting, decline curve analysis, 
 pip install resaid
 ```
 
+Requires Python 3.10 or newer.
+
 Database connectivity (ARIES `.mdb`/`.accdb`, PhdWin TopSpeed files) needs optional drivers:
 
 ```bash
@@ -85,6 +87,8 @@ dca.step_change_min_points = 6    # months needed after the new peak to fit it
 # with its IP from the current tail; larger steps (new completions) are left alone
 dca.short_regime_eur_match = True
 dca.short_regime_max_ratio = 1.25  # current rate vs previous regime peak: above = new completion
+# Three-phase mode: minor phases start their fit window where the major phase's does
+dca.minor_window_from_major = True
 
 # Fit decline parameters for every well
 dca.run_DCA()
@@ -143,10 +147,13 @@ other phases follow it:
 
 - `"default"`: Starts at the first production peak, or at the latest step-up regime. Removes
   zero months and statistical outliers, then runs a weighted `curve_fit` of Arps parameters.
-  Finally it rescales to match the last three months of production.
-- `"monotone_two_step"`: Fits the longest monotone decline segment. It then solves for EUR
-  and re-solves the initial decline so the curve starts from the recent producing rate.
-  If that fails, it falls back to the decline from the first production peak.
+  Finally the L3M adjustment makes the curve pass through the last-three-month average at
+  the midpoint of those three months (zero months included): a lower recent rate scales the
+  curve down, and a higher one re-solves `qi` and `di` so the curve passes through it and
+  rejoins the fitted curve later. The fitted `b` and `t0` are kept.
+- `"monotone_two_step"`: Fits the longest monotone decline segment, then applies the same
+  L3M adjustment (or short-regime EUR match) as the default method. If the segment cannot be
+  fit, it tries looser windows, ending with the decline from the first production peak.
 
 The first production peak is the highest month up to and including the first local
 maximum. A well that peaks in its first month therefore keeps its whole early decline,
@@ -157,8 +164,8 @@ treated as a workover of the previous regime when its current rate is at most
 `short_regime_max_ratio` x that regime's peak and that regime has at least
 `step_change_min_points` producing months (so a young well's ramp is not mistaken for a
 workover). Both methods then fit the previous regime on its own months and give the new
-regime that regime's EUR (its actual production to the
-step's onset plus its fitted curve from the onset on). The IP comes from the current tail
+regime that regime's EUR (its actual production to the step's onset plus its fitted curve
+from the onset on). The IP comes from the current tail
 (`qi_tail_points`), b from the previous regime, and the decline is solved to reach the EUR.
 
 If a fit fails and `backup_decline = True`, the well gets a backup decline instead:
@@ -330,6 +337,30 @@ Columns that are not mapped are ignored.
 
 ## Configuration Options
 
+Settings are attributes on the objects (`dca.min_h_b = 0.9`). Assigning a name a class does
+not define raises `AttributeError` with the closest valid names, so a misspelled or renamed
+setting cannot be silently ignored:
+
+```python
+dca.OUTLIER_CORRECTION = False
+# AttributeError: decline_curve has no attribute 'OUTLIER_CORRECTION'; setting it would
+# have no effect. Did you mean 'outlier_correction'?
+```
+
+This applies to `decline_curve`, `decline_solver`, `well_econ`, `npv_calc` and the database
+classes. Subclasses can add their own attributes in `__init__`, or set
+`_strict_attributes = False` to turn the check off.
+
+Inputs are checked before use, and a missing or misnamed input raises `ValueError` naming it:
+
+- `decline_curve.run_DCA()` (and the outputs and exports that run it) checks that `dataframe`
+  and the date, uid, oil, gas and water column names are set, and that every configured
+  column exists, listing the available columns if not.
+- `well_econ` checks `flowstreams` and its ID and `T_INDEX` columns, `discount_rate`, and any
+  header columns you configure (`wi_col`, `nri_col`, `capex_col`, `royalty_col`, ...).
+- `decline_solver.solve()` names the parameter it is missing.
+- Database reads raise `ConnectionError` with the reason each connection method failed.
+
 ### DCA Parameters
 
 - `min_h_b`, `max_h_b`: b-factor bounds for the fit (all wells; defaults 0.99 and 2.0)
@@ -417,7 +448,7 @@ solver = decline_solver(
     dmin=0.08/12,  # terminal decline, nominal per month (default MIN_DECLINE_RATE)
 )
 
-qi, t_max, qf, de, eur, warning, delta = solver.solve()
+qi, t_max, qf, de, eur, warning, delta = solver.solve()   # floats, then bool, float
 # warning is True when the solved curve misses the EUR target
 # (delta = |cumulative - eur|), e.g. because the target is unreachable.
 ```
@@ -438,11 +469,11 @@ dca.run_DCA()
 
 The `decline_curve` class writes forecasts for economic software. Each export runs
 `run_DCA()` and `generate_oneline(denormalize=True)` first if they have not been run.
-Forecasts start near the latest production, not at `T0_DATE`. The decline is advanced
-along the fitted curve to that date. ARIES and Mosaic start at the last producing month:
-ARIES uses the last-three-month average rate, and Mosaic the fitted rate. PhdWin starts
-one month earlier, at the middle of the last three months, with the fitted rate. `dmin`
-is the terminal decline as an annual percentage.
+Forecasts start near the latest production, not at `T0_DATE`. The rate and decline are
+advanced along the fitted curve to that date; the curve passes through the last-three-month
+average at the midpoint of those months. ARIES and Mosaic start at the last producing month,
+at the fitted rate there (one month past the midpoint). PhdWin starts at the middle of the last
+three months, with the fitted rate. `dmin` is the terminal decline as an annual percentage.
 
 ### ARIES Export
 
@@ -585,6 +616,22 @@ python -m pytest tests
 Some tests skip unless optional local fixtures are present (`tests/prod_df_subset.csv`,
 ARIES databases under `reference/`).
 
+Linting uses ruff's default rules with the repository's `ruff.toml` (`ruff check .`).
+
+Type checking uses basedpyright (or pyright) with the repository's `pyrightconfig.json`,
+which selects the "standard" rule set. Point your editor at the environment resaid is
+installed in, and install the pandas and SciPy type stubs matching its pandas and SciPy
+versions (the stub version follows the library version), e.g. for pandas 3.0 and SciPy 1.18:
+
+```bash
+conda install -c conda-forge "pandas-stubs=3.0" "scipy-stubs=1.18" types-python-dateutil
+```
+
+The test suite passes on pandas 2.3 and 3.0 (NumPy 2.3/2.5, SciPy 1.16/1.18, statsmodels
+0.14/0.15).
+
+The remaining errors in `resaid/` correspond to the Known Issues below.
+
 Developer scripts for manual checks against local reference data live in `scripts/`
 (run from the repository root), for example:
 
@@ -597,15 +644,37 @@ python scripts/validate_three_phase.py
 
 Release notes are in `CHANGELOG.md`.
 
-These are known in 0.4.0 and scheduled for a follow-up release:
+These are known in 0.4.1 and scheduled for a follow-up release:
 
+DCA and exports:
+- **L3M upside convergence depends on `t0`**: when the last-three-month average is above the
+  fitted curve, the L3M adjustment rejoins the fitted curve at twice the elapsed time since
+  `t0`. Equally good fits can place `t0` differently, so that rejoin point, and the forecast,
+  can shift slightly between NumPy/SciPy versions: within 0.4% EUR for the default method in
+  testing, and up to about 6% for one poorly determined phase with `monotone_two_step`.
+- **Database exports use normalized volumes**: `run_dca_analysis` builds onelines without
+  denormalizing, so for wells with a header lateral length, `export_results` writes rates
+  scaled to 5,280 ft rather than the well's actual lateral. A 10,560 ft well exports about
+  half its actual rate. This became visible in 0.4.0, when header data started reaching the
+  fit. Until fixed, call `generate_oneline(denormalize=True)` on each result before exporting.
+
+Database interface:
 - **PhdWin export via the database interface**: `export_results(export_format="phdwin")` fails
   for every well. Call `generate_phdwin_export()` on each `decline_curve` instead.
-- **Silent connection failure**: `connect()` returns `False` without saying why when pyodbc
-  or the Microsoft Access ODBC driver is missing.
+- **Nested output folders**: `export_results(output_dir=...)` cannot create a folder whose
+  parent does not exist.
+- **Unsupported export formats are not rejected**: an unknown `export_format` gives one warning
+  per well and an empty result instead of an error.
+- **PhdWin temporary files**: a failed PhdWin conversion leaves an empty temporary `.sqlite`
+  file behind.
+- **JPype side effect**: when pyodbc fails and `jpype` is installed, `connect()` starts a Java
+  VM without UCanAccess, which cannot be restarted later in the same process.
+
+Economics:
+- **IRR failures are recorded as 0**: if the IRR solve does not converge, `IRR` is reported as
+  0 rather than flagged.
 - **PAYOUT ambiguity**: `PAYOUT` is 0 both for wells that pay out in the first month and for
   wells that never pay out.
-- **`discount_rate` has no default**: leaving it unset raises a `TypeError` in cashflow generation.
 - **Price arrays**: `oil_pri`/`gas_pri` accept scalars or Python lists, but not numpy arrays.
 - **`t_start_column` timing**: with `spud_to_online` also set, one non-producing month is
   charged the fixed operating cost (`opc_t`).

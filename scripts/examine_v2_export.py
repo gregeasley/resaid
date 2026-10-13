@@ -2,7 +2,9 @@
 """Examine the V2 PhdWin export to see the actual data structure"""
 
 import sqlite3
+
 import pandas as pd
+
 
 def examine_v2_export():
     """Examine the V2 PhdWin export"""
@@ -18,7 +20,7 @@ def examine_v2_export():
         print(f"Tables in database: {[t[0] for t in tables]}")
         
         # Examine table references
-        print(f"\n=== Table References ===")
+        print("\n=== Table References ===")
         cursor.execute("SELECT * FROM table_references")
         refs = cursor.fetchall()
         print(f"Found {len(refs)} table references:")
@@ -26,14 +28,14 @@ def examine_v2_export():
             print(f"  ID: {ref[0]}, Position: {ref[1]}, Offset: 0x{ref[2]:08X}, Raw: {ref[3]}, Valid: {ref[4]}, Interpretation: {ref[5]}")
         
         # Examine database info
-        print(f"\n=== Database Info ===")
+        print("\n=== Database Info ===")
         cursor.execute("SELECT * FROM database_info")
         info = cursor.fetchall()
         for item in info:
             print(f"  {item[0]}: {item[1]}")
         
         # Examine each data table
-        print(f"\n=== Data Tables ===")
+        print("\n=== Data Tables ===")
         for table_name in [t[0] for t in tables if t[0].startswith('table_')]:
             print(f"\n--- {table_name} ---")
             try:
@@ -42,7 +44,7 @@ def examine_v2_export():
                 print(f"  Columns: {list(df.columns)}")
                 
                 # Show first few records
-                print(f"  First 3 records:")
+                print("  First 3 records:")
                 for i, row in df.head(3).iterrows():
                     print(f"    Record {i}:")
                     for col in df.columns:
@@ -65,9 +67,9 @@ def examine_v2_export():
         
         conn.close()
         
-        print(f"\n🎉 V2 PhdWin parser is fully operational!")
-        print(f"✓ Successfully parsed database structure")
-        print(f"✓ Extracted 8 tables with real data")
+        print("\n🎉 V2 PhdWin parser is fully operational!")
+        print("✓ Successfully parsed database structure")
+        print("✓ Extracted 8 tables with real data")
         print(f"✓ Exported to SQLite database: {db_path}")
         
     except Exception as e:

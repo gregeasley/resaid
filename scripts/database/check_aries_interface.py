@@ -7,7 +7,6 @@ Tests both .mdb and .accdb files to ensure proper functionality
 
 import sys
 from pathlib import Path
-import pandas as pd
 
 # Add the resaid package to the path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,12 +28,12 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
     
     try:
         # Create ARIES database interface
-        print(f"\n1. Creating ARIES database interface...")
+        print("\n1. Creating ARIES database interface...")
         aries_db = ARIESDatabase(db_path)
         print("✓ Interface created successfully")
         
         # Test connection
-        print(f"\n2. Testing database connection...")
+        print("\n2. Testing database connection...")
         if not aries_db.connect():
             print("✗ Failed to connect to database")
             return False
@@ -42,7 +41,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
         print("✓ Successfully connected to database")
         
         # Get available tables
-        print(f"\n3. Getting available tables...")
+        print("\n3. Getting available tables...")
         tables = aries_db.get_tables()
         print(f"Available tables: {tables}")
         
@@ -57,14 +56,14 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
         print("✓ All required tables found")
         
         # Test reading production data
-        print(f"\n4. Testing production data reading...")
+        print("\n4. Testing production data reading...")
         try:
             prod_data = aries_db.read_production_data()
             print(f"✓ Production data loaded: {prod_data.shape}")
             print(f"Columns: {list(prod_data.columns)}")
             
             # Show sample data
-            print(f"\nSample production data:")
+            print("\nSample production data:")
             sample_cols = ['PROPNUM', 'P_DATE', 'OIL', 'GAS', 'WATER']
             available_cols = [col for col in sample_cols if col in prod_data.columns]
             if available_cols:
@@ -77,14 +76,14 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
             return False
         
         # Test reading header data
-        print(f"\n5. Testing header data reading...")
+        print("\n5. Testing header data reading...")
         try:
             header_data = aries_db.read_header_data()
             print(f"✓ Header data loaded: {header_data.shape}")
             print(f"Columns: {list(header_data.columns)}")
             
             # Show sample data
-            print(f"\nSample header data:")
+            print("\nSample header data:")
             sample_cols = ['PROPNUM', 'LEASE', 'WELL_NO', 'FIELD', 'OPERATOR']
             available_cols = [col for col in sample_cols if col in header_data.columns]
             if available_cols:
@@ -97,7 +96,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
             return False
         
         # Test data preparation for DCA
-        print(f"\n6. Testing data preparation for DCA...")
+        print("\n6. Testing data preparation for DCA...")
         try:
             dca_data = aries_db.prepare_data_for_dca()
             print(f"✓ Data prepared for DCA: {dca_data.shape}")
@@ -118,7 +117,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
             print(f"Date range: {dca_data['DATE'].min()} to {dca_data['DATE'].max()}")
             
             # Show sample data
-            print(f"\nSample DCA data:")
+            print("\nSample DCA data:")
             print(dca_data[required_cols].head())
             
         except Exception as e:
@@ -126,7 +125,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
             return False
         
         # Test with a small subset for DCA analysis
-        print(f"\n7. Testing DCA analysis...")
+        print("\n7. Testing DCA analysis...")
         if len(unique_wells) > 0:
             # Select first well with sufficient data
             test_well = None
@@ -152,7 +151,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
                         print(f"✓ DCA analysis completed for {test_well}")
                         
                         # Test export functionality
-                        print(f"\n8. Testing export functionality...")
+                        print("\n8. Testing export functionality...")
                         output_dir = Path(f"test_outputs_{db_path.stem}")
                         output_dir.mkdir(exist_ok=True)
                         
@@ -226,7 +225,7 @@ def main():
     else:
         print("\n❌ Some database tests failed. Check the output above for details.")
     
-    print(f"\nTest outputs saved in:")
+    print("\nTest outputs saved in:")
     for db_path, _ in test_files:
         output_dir = Path(f"test_outputs_{db_path.stem}")
         if output_dir.exists():

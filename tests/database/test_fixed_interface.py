@@ -11,6 +11,7 @@ import traceback
 from pathlib import Path
 
 import pytest
+from conftest import require_access_driver
 
 from resaid.database import ARIESDatabase, DatabaseInterface
 
@@ -91,7 +92,7 @@ def run_simple_dca_check(db_path: Path) -> bool:
         print("[FAIL] Export failed")
         return False
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - CLI check reports any failure and returns False
         print(f"[FAIL] Error: {e}")
         traceback.print_exc()
         return False
@@ -104,6 +105,7 @@ def test_simple_dca():
     """Pytest entry: skips when reference database is not in the workspace."""
     if not REF_ACCDB.is_file():
         pytest.skip(f"Optional ARIES fixture not present: {REF_ACCDB}")
+    require_access_driver()
     assert run_simple_dca_check(REF_ACCDB), "Simple DCA / export check failed (see stdout)"
 
 

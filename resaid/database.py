@@ -3,20 +3,24 @@
 Database interface for RESAID to read industry standard databases
 """
 
-import pandas as pd
-import numpy as np
-from pathlib import Path
-import warnings
-from typing import Dict, List, Optional, Union, Tuple
-import subprocess
-import sqlite3
-import tempfile
+import logging
 import os
+import sqlite3
+import subprocess
+import traceback
+import warnings
+from pathlib import Path
+from typing import Any
 
+import pandas as pd
+
+from ._strict import StrictAttributes
 from .dca import decline_curve
 
+logger = logging.getLogger(__name__)
 
-class DatabaseInterface:
+
+class DatabaseInterface(StrictAttributes):
     """
     Flexible interface for reading industry standard databases and generating DCA forecasts
     
@@ -31,7 +35,7 @@ class DatabaseInterface:
     connection itself is opened by ``connect()`` or the first data call.
     """
     
-    def __init__(self, db_path: Union[str, Path]):
+    def __init__(self, db_path: str | Path):
         """
         Initialize database interface
         
@@ -43,19 +47,22 @@ class DatabaseInterface:
             raise FileNotFoundError(f"Database file not found: {self.db_path}")
         
         self.db_type = self._detect_db_type()
-        self.connection = None
-        self._production_data = None
-        self._header_data = None
+        self.connection: Any | None = None
+        # Why the last connect() attempt failed, one entry per method tried.
+        self._connect_errors: list[str] = []
+        self._temp_db_path: str | None = None
+        self._production_data: pd.DataFrame | None = None
+        self._header_data: pd.DataFrame | None = None
         
         # Column mapping configuration - maps RESAID fields to database columns
-        self.column_mapping = {}
+        self.column_mapping: dict[str, str] = {}
         
         # Table configuration - maps table types to actual table names
-        self.table_mapping = {}
+        self.table_mapping: dict[str, str] = {}
 
         # Header column mapping; ``_header_mapping_is_default`` marks a built-in default
         # (missing optional columns are then skipped instead of raising).
-        self.header_column_mapping = {}
+        self.header_column_mapping: dict[str, str] = {}
         self._header_mapping_is_default = False
         
     def _detect_db_type(self) -> str:
@@ -72,11 +79,17 @@ class DatabaseInterface:
     def _try_pyodbc_connection(self) -> bool:
         """Try to establish pyodbc connection if available"""
         try:
-            import pyodbc
+            import pyodbc  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
             conn_str = f"Driver={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={self.db_path.absolute()}"
             self.connection = pyodbc.connect(conn_str)
             return True
-        except (ImportError, Exception):
+        except ImportError:
+            self._connect_errors.append('pyodbc is not installed (pip install "resaid[database]")')
+            return False
+        except Exception as e:  # noqa: BLE001 - any driver error means not connected
+            self._connect_errors.append(
+                f"pyodbc could not open the file with the Microsoft Access ODBC driver: {e}"
+            )
             return False
     
     def _try_jpype_connection(self) -> bool:
@@ -87,7 +100,7 @@ class DatabaseInterface:
         classpath) as a side effect when jpype is installed.
         """
         try:
-            import jpype
+            import jpype  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
             if not jpype.isJVMStarted():
                 # Try to start JVM and load UCanAccess
                 jpype.startJVM()
@@ -95,14 +108,14 @@ class DatabaseInterface:
             # This would require UCanAccess JAR files
             # For now, return False
             return False
-        except Exception:
+        except Exception:  # noqa: BLE001 - JPype/JVM failures mean not connected
             return False
     
     def _try_phdwin_connection(self) -> bool:
         """Try to establish connection using pytopspeed-modernized for PhdWin files"""
         try:
-            import tempfile
             import sqlite3
+            import tempfile
             
             # Convert PhdWin file to temporary SQLite database
             with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as temp_db:
@@ -113,12 +126,12 @@ class DatabaseInterface:
             
             if file_ext == '.phz':
                 # Use PhzConverter for .phz files (zip archives)
-                from converter.phz_converter import PhzConverter
+                from converter.phz_converter import PhzConverter  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
                 converter = PhzConverter()
                 result = converter.convert_phz(str(self.db_path), temp_db_path)
             else:
                 # Use SqliteConverter for .phd, .mod, .tps files
-                from converter.sqlite_converter import SqliteConverter
+                from converter.sqlite_converter import SqliteConverter  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
                 converter = SqliteConverter()
                 result = converter.convert(str(self.db_path), temp_db_path)
             
@@ -133,9 +146,12 @@ class DatabaseInterface:
             return True
             
         except ImportError:
-            warnings.warn('pytopspeed-modernized not available. Install with: pip install "resaid[database]"')
+            message = 'pytopspeed-modernized is not installed (pip install "resaid[database]")'
+            self._connect_errors.append(message)
+            warnings.warn(message)
             return False
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - any converter failure means not connected
+            self._connect_errors.append(f"PhdWin conversion failed: {e}")
             warnings.warn(f"Failed to convert PhdWin database: {e}")
             return False
     
@@ -143,13 +159,13 @@ class DatabaseInterface:
         """
         Check whether mdbtools can read the file.
 
-        Returns True if ``mdb-tables`` succeeds, but does not set ``self.connection``,
-        so data reads still fail afterwards.
+        Returns True if ``mdb-tables`` succeeds, but does not open a connection, so
+        ``connect()`` does not count it as connected.
         """
         try:
             # Try mdbtools if available
             result = subprocess.run(['mdb-tables', str(self.db_path)], 
-                                  capture_output=True, text=True, timeout=30)
+                                  capture_output=True, text=True, timeout=30, check=False)
             if result.returncode == 0:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -158,7 +174,7 @@ class DatabaseInterface:
         try:
             # Try alternative mdb tools
             result = subprocess.run(['mdbtools', str(self.db_path)], 
-                                  capture_output=True, text=True, timeout=30)
+                                  capture_output=True, text=True, timeout=30, check=False)
             if result.returncode == 0:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -186,46 +202,59 @@ class DatabaseInterface:
             ]
         else:
             return False
-        
+
+        self._connect_errors = []
         for method in methods:
-            if method():
+            # A method can report success without opening a usable connection
+            # (e.g. the mdbtools probe); only an actual connection counts.
+            if method() and self.connection is not None:
                 return True
-        
+
         return False
+
+    def _require_connection(self) -> Any:
+        """
+        Return an open connection, connecting first if needed.
+
+        Raises:
+            ConnectionError: With the reasons each connection method failed.
+        """
+        if self.connection is None and not self.connect():
+            reasons = "; ".join(self._connect_errors) or "no connection method succeeded"
+            raise ConnectionError(f"Could not connect to {self.db_path}: {reasons}")
+        if self.connection is None:
+            raise ConnectionError(f"Could not connect to {self.db_path}")
+        return self.connection
     
-    def get_tables(self) -> List[str]:
+    def get_tables(self) -> list[str]:
         """Get list of available tables"""
-        if not self.connection:
-            if not self.connect():
-                raise ConnectionError("Could not connect to database")
-        
+        connection = self._require_connection()
+
         try:
-            cursor = self.connection.cursor()
-            if isinstance(self.connection, sqlite3.Connection):
+            cursor = connection.cursor()
+            if isinstance(connection, sqlite3.Connection):
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 return [row[0] for row in cursor.fetchall()]
             return [table.table_name for table in cursor.tables(tableType='TABLE')]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - driver-specific errors; report and return none
             warnings.warn(f"Could not get tables: {e}")
             return []
     
-    def get_table_columns(self, table_name: str) -> List[str]:
+    def get_table_columns(self, table_name: str) -> list[str]:
         """Get column names for a specific table"""
-        if not self.connection:
-            if not self.connect():
-                raise ConnectionError("Could not connect to database")
-        
+        connection = self._require_connection()
+
         try:
-            cursor = self.connection.cursor()
-            if isinstance(self.connection, sqlite3.Connection):
+            cursor = connection.cursor()
+            if isinstance(connection, sqlite3.Connection):
                 cursor.execute(f'PRAGMA table_info("{table_name}")')
                 return [row[1] for row in cursor.fetchall()]
             return [column.column_name for column in cursor.columns(table=table_name)]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - driver-specific errors; report and return none
             warnings.warn(f"Could not get columns for table {table_name}: {e}")
             return []
     
-    def set_table_mapping(self, mapping: Dict[str, str]):
+    def set_table_mapping(self, mapping: dict[str, str]):
         """
         Set table mapping for different data types
         
@@ -239,7 +268,7 @@ class DatabaseInterface:
         """
         self.table_mapping = mapping
     
-    def set_column_mapping(self, mapping: Dict[str, str]):
+    def set_column_mapping(self, mapping: dict[str, str]):
         """
         Set column mapping for database fields to RESAID fields
         
@@ -256,7 +285,7 @@ class DatabaseInterface:
         """
         self.column_mapping = mapping
     
-    def set_header_column_mapping(self, mapping: Dict[str, str]):
+    def set_header_column_mapping(self, mapping: dict[str, str]):
         """
         Set header column mapping for well-level properties
         
@@ -279,7 +308,7 @@ class DatabaseInterface:
     
     def read_table_data(self,
                         table_name: str,
-                        columns: Optional[List[str]] = None,
+                        columns: list[str] | None = None,
                         parse_dates: bool = True) -> pd.DataFrame:
         """
         Read data from a specific table
@@ -297,10 +326,8 @@ class DatabaseInterface:
         Returns:
             DataFrame with table data; column names upper-cased
         """
-        if not self.connection:
-            if not self.connect():
-                raise ConnectionError("Could not connect to database")
-        
+        connection = self._require_connection()
+
         try:
             if columns:
                 columns_str = ', '.join(f"[{col}]" for col in columns)
@@ -313,7 +340,7 @@ class DatabaseInterface:
                 warnings.filterwarnings(
                     "ignore", message="pandas only supports SQLAlchemy connectable", category=UserWarning
                 )
-                df = pd.read_sql(query, self.connection)
+                df = pd.read_sql(query, connection)
             
             # Standardize column names
             df.columns = [col.upper() for col in df.columns]
@@ -326,20 +353,20 @@ class DatabaseInterface:
             for col in date_columns:
                 try:
                     df[col] = pd.to_datetime(df[col])
-                except:
-                    pass
+                except (ValueError, TypeError, OverflowError):
+                    pass  # not a date column; leave as read
             
             return df
             
         except Exception as e:
-            raise RuntimeError(f"Could not read data from table {table_name}: {e}")
+            raise RuntimeError(f"Could not read data from table {table_name}: {e}") from e
     
     def _resolve_columns(self,
                          table_name: str,
-                         mapping: Dict[str, str],
-                         required_fields: List[str],
+                         mapping: dict[str, str],
+                         required_fields: list[str],
                          skip_missing_optional: bool = False,
-                         argument_name: str = "columns") -> Dict[str, str]:
+                         argument_name: str = "columns") -> dict[str, str]:
         """
         Match a RESAID field -> column mapping against the table's actual columns.
 
@@ -393,9 +420,9 @@ class DatabaseInterface:
 
     def prepare_data_for_dca(self,
                             production_table: str,
-                            production_columns: Dict[str, str],
-                            header_table: Optional[str] = None,
-                            header_columns: Optional[Dict[str, str]] = None,
+                            production_columns: dict[str, str],
+                            header_table: str | None = None,
+                            header_columns: dict[str, str] | None = None,
                             skip_missing_header_columns: bool = False,
                             **kwargs) -> pd.DataFrame:
         """
@@ -487,7 +514,7 @@ class DatabaseInterface:
     def run_dca_analysis(self, 
                          data: pd.DataFrame,
                          three_phase_mode: bool = True,
-                         **dca_kwargs) -> Dict[str, decline_curve]:
+                         **dca_kwargs) -> dict[str, decline_curve]:
         """
         Run DCA analysis on prepared data
         
@@ -553,18 +580,17 @@ class DatabaseInterface:
                 
                 results[well_id] = dca
                 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one well's failure must not stop the batch
                 warnings.warn(f"Failed to run DCA for well {well_id}: {e}")
-                import traceback
                 warnings.warn(f"Traceback: {traceback.format_exc()}")
                 continue
         
         return results
     
     def export_results(self, 
-                      dca_results: Dict[str, decline_curve],
+                      dca_results: dict[str, decline_curve],
                       export_format: str = 'aries',
-                      output_dir: Optional[Union[str, Path]] = None) -> Dict[str, str]:
+                      output_dir: str | Path | None = None) -> dict[str, str]:
         """
         Export DCA results in specified format
         
@@ -611,7 +637,7 @@ class DatabaseInterface:
                 
                 output_files[well_id] = str(output_file)
                 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one well's failure must not stop the batch
                 warnings.warn(f"Failed to export {export_format} for well {well_id}: {e}")
                 continue
         
@@ -622,16 +648,16 @@ class DatabaseInterface:
         if self.connection:
             try:
                 self.connection.close()
-            except:
-                pass
+            except Exception:
+                logger.debug("Error closing database connection", exc_info=True)
             self.connection = None
         
         # Clean up temporary database file if it exists
         if hasattr(self, '_temp_db_path') and self._temp_db_path:
             try:
                 os.unlink(self._temp_db_path)
-            except:
-                pass
+            except OSError:
+                logger.debug("Could not remove %s", self._temp_db_path, exc_info=True)
             self._temp_db_path = None
     
     def __enter__(self):
@@ -677,7 +703,7 @@ class _DefaultMappedDatabase(DatabaseInterface):
     then the built-in ARIES defaults.
     """
 
-    def __init__(self, db_path: Union[str, Path]):
+    def __init__(self, db_path: str | Path):
         super().__init__(db_path)
         self.set_table_mapping(dict(ARIES_DEFAULT_TABLES))
         self.set_column_mapping(dict(ARIES_DEFAULT_PRODUCTION_COLUMNS))
@@ -685,11 +711,11 @@ class _DefaultMappedDatabase(DatabaseInterface):
         self._header_mapping_is_default = True
 
     def prepare_data_for_dca(self,
-                            production_table: Optional[str] = None,
-                            production_columns: Optional[Dict[str, str]] = None,
-                            header_table: Optional[str] = None,
-                            header_columns: Optional[Dict[str, str]] = None,
-                            skip_missing_header_columns: Optional[bool] = None,
+                            production_table: str | None = None,
+                            production_columns: dict[str, str] | None = None,
+                            header_table: str | None = None,
+                            header_columns: dict[str, str] | None = None,
+                            skip_missing_header_columns: bool | None = None,
                             **kwargs) -> pd.DataFrame:
         """
         Prepare data for DCA analysis, filling unspecified tables and columns from
@@ -750,7 +776,7 @@ class ARIESDatabase(_DefaultMappedDatabase):
     ``set_table_mapping``, ``set_column_mapping`` and ``set_header_column_mapping``.
     """
 
-    def __init__(self, db_path: Union[str, Path]):
+    def __init__(self, db_path: str | Path):
         super().__init__(db_path)
         if self.db_type != 'access':
             raise ValueError("ARIES databases must be Access format (.mdb/.accdb)")
@@ -768,7 +794,7 @@ class PhdWinDatabase(_DefaultMappedDatabase):
     water columns; PhdWin integer dates must be converted beforehand.
     """
 
-    def __init__(self, db_path: Union[str, Path]):
+    def __init__(self, db_path: str | Path):
         super().__init__(db_path)
         if self.db_type != 'phdwin':
             raise ValueError("PhdWin databases must be TopSpeed format (.phd/.mod/.tps/.phz)")

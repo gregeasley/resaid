@@ -403,9 +403,7 @@ def test_tc_params_flowstream_eur_matches_curve_eur(
         peak = float(row["peak_rate"])
         if not (np.isfinite(peak) and peak > 0):
             continue
-        if three_phase_mode:
-            total = float(dca.tc_params_flowstream[(phase, prob)].sum())
-        elif phase in ("OIL", "GAS"):
+        if three_phase_mode or phase in ("OIL", "GAS"):
             total = float(dca.tc_params_flowstream[(phase, prob)].sum())
         else:
             continue

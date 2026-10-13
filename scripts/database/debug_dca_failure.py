@@ -5,7 +5,6 @@ Debug script to understand why DCA analysis is failing
 
 import sys
 from pathlib import Path
-import pandas as pd
 
 # Add the resaid package to the path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -53,28 +52,28 @@ def debug_dca_failure(db_path: Path, db_name: str):
         print(f"Data prepared: {dca_data.shape}")
         
         # Examine data quality
-        print(f"\nData quality check:")
+        print("\nData quality check:")
         print(f"Total rows: {len(dca_data)}")
         print(f"Total wells: {dca_data['WELL_ID'].nunique()}")
         
         # Check for missing values
         missing_data = dca_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].isnull().sum()
-        print(f"Missing values:")
+        print("Missing values:")
         print(missing_data)
         
         # Check data types
-        print(f"\nData types:")
+        print("\nData types:")
         print(dca_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].dtypes)
         
         # Check for zero/negative values
-        print(f"\nValue ranges:")
+        print("\nValue ranges:")
         print(f"OIL: {dca_data['OIL'].min():.2f} to {dca_data['OIL'].max():.2f}")
         print(f"GAS: {dca_data['GAS'].min():.2f} to {dca_data['GAS'].max():.2f}")
         print(f"WATER: {dca_data['WATER'].min():.2f} to {dca_data['WATER'].max():.2f}")
         
         # Check for wells with sufficient data
         well_counts = dca_data.groupby('WELL_ID').size()
-        print(f"\nWells by data point count:")
+        print("\nWells by data point count:")
         print(well_counts.value_counts().sort_index().head(10))
         
         # Find a well with good data
@@ -87,7 +86,7 @@ def debug_dca_failure(db_path: Path, db_name: str):
             print(f"Well data shape: {well_data.shape}")
             
             # Show sample data
-            print(f"Sample well data:")
+            print("Sample well data:")
             print(well_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].head(10))
             
             # Check for production trends
@@ -99,7 +98,7 @@ def debug_dca_failure(db_path: Path, db_name: str):
             print(f"Total water: {well_data['WATER'].sum():.0f}")
             
             # Try to identify the issue
-            print(f"\nTrying to identify DCA issue...")
+            print("\nTrying to identify DCA issue...")
             
             # Check if all required columns are present
             required_cols = ['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']
@@ -113,7 +112,7 @@ def debug_dca_failure(db_path: Path, db_name: str):
             gas_std = well_data['GAS'].std()
             water_std = well_data['WATER'].std()
             
-            print(f"Standard deviations:")
+            print("Standard deviations:")
             print(f"  OIL: {oil_std:.2f}")
             print(f"  GAS: {gas_std:.2f}")
             print(f"  WATER: {water_std:.2f}")
@@ -128,13 +127,13 @@ def debug_dca_failure(db_path: Path, db_name: str):
             negative_water = (well_data['WATER'] < 0).sum()
             
             if negative_oil > 0 or negative_gas > 0 or negative_water > 0:
-                print(f"✗ Negative values found:")
+                print("✗ Negative values found:")
                 print(f"  OIL: {negative_oil}")
                 print(f"  GAS: {negative_gas}")
                 print(f"  WATER: {negative_water}")
             
             # Try to run DCA manually to see the exact error
-            print(f"\nAttempting manual DCA analysis...")
+            print("\nAttempting manual DCA analysis...")
             try:
                 from resaid.dca import decline_curve
                 
@@ -145,17 +144,17 @@ def debug_dca_failure(db_path: Path, db_name: str):
                 if hasattr(dca, 'three_phase_mode'):
                     dca.three_phase_mode = True
                 
-                print(f"✓ Decline curve object created")
+                print("✓ Decline curve object created")
                 
                 # Try to run DCA
-                print(f"Running DCA...")
+                print("Running DCA...")
                 dca.run_DCA()
-                print(f"✓ DCA completed successfully")
+                print("✓ DCA completed successfully")
                 
                 # Try to generate oneline
-                print(f"Generating oneline...")
+                print("Generating oneline...")
                 dca.generate_oneline()
-                print(f"✓ Oneline generated successfully")
+                print("✓ Oneline generated successfully")
                 
             except Exception as e:
                 print(f"✗ DCA error: {e}")
@@ -166,7 +165,7 @@ def debug_dca_failure(db_path: Path, db_name: str):
         
         # Close database connection
         aries_db.close()
-        print(f"\n✓ Database connection closed")
+        print("\n✓ Database connection closed")
         
     except Exception as e:
         print(f"✗ Error debugging database: {e}")

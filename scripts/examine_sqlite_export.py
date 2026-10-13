@@ -3,6 +3,7 @@
 
 import sqlite3
 
+
 def examine_sqlite_export():
     """Examine the SQLite database export"""
     db_path = "test_phdwin_export.db"
@@ -17,7 +18,7 @@ def examine_sqlite_export():
         print(f"Tables in database: {[t[0] for t in tables]}")
         
         # Examine table references
-        print(f"\n=== Table References ===")
+        print("\n=== Table References ===")
         cursor.execute("SELECT * FROM table_references")
         refs = cursor.fetchall()
         print(f"Found {len(refs)} table references:")
@@ -25,7 +26,7 @@ def examine_sqlite_export():
             print(f"  ID: {ref[0]}, Type: {ref[1]}, Offset: 0x{ref[2]:06X}, Raw: {ref[3]}, Valid: {ref[4]}")
         
         # Examine database info
-        print(f"\n=== Database Info ===")
+        print("\n=== Database Info ===")
         cursor.execute("SELECT * FROM database_info")
         info = cursor.fetchall()
         for item in info:

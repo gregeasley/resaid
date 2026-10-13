@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-
 from aries_helpers import fit, make_production, parse_aries, revised_aries_de
 
 SCENARIO = "TEST"

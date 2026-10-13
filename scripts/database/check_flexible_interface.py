@@ -7,7 +7,6 @@ Tests both .mdb and .accdb files with flexible table and column mapping
 
 import sys
 from pathlib import Path
-import pandas as pd
 
 # Add the resaid package to the path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -71,10 +70,10 @@ def explore_database_interface(db_path: Path, db_name: str):
                     sample_data = db.read_table_data(table_name, columns=columns[:5])  # First 5 columns
                     if not sample_data.empty:
                         print(f"    Sample data: {sample_data.shape}")
-                        print(f"    First few rows:")
+                        print("    First few rows:")
                         print(sample_data.head(2))
                     else:
-                        print(f"    Table appears to be empty")
+                        print("    Table appears to be empty")
                         
                 except Exception as e:
                     print(f"    Error examining {table_name}: {e}")
@@ -131,21 +130,21 @@ def verify_flexible_mapping(db_path: Path, db_name: str):
             print(f"Using header table: {header_table}")
         
         # Test with default table and column mapping
-        print(f"\n1. Testing with default table and column mapping...")
+        print("\n1. Testing with default table and column mapping...")
         try:
             dca_data = aries_db.prepare_data_for_dca()
             print(f"✓ Data prepared with defaults: {dca_data.shape}")
             
             # Show sample data
             print(f"Sample data columns: {list(dca_data.columns[:10])}")
-            print(f"Sample data:")
+            print("Sample data:")
             print(dca_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].head())
             
         except Exception as e:
             print(f"✗ Default mapping failed: {e}")
             
             # Try to create custom mapping
-            print(f"\n2. Attempting custom table and column mapping...")
+            print("\n2. Attempting custom table and column mapping...")
             
             # Get columns from production table
             prod_columns = aries_db.get_table_columns(prod_table)
@@ -199,7 +198,7 @@ def verify_flexible_mapping(db_path: Path, db_name: str):
                     print(f"✓ Data prepared with custom mapping: {dca_data.shape}")
                     
                     # Show sample data
-                    print(f"Sample data:")
+                    print("Sample data:")
                     print(dca_data[['WELL_ID', 'DATE', 'OIL', 'GAS', 'WATER']].head())
                     
                 except Exception as e2:
@@ -211,7 +210,7 @@ def verify_flexible_mapping(db_path: Path, db_name: str):
         
         # Test DCA analysis if we have data
         if 'dca_data' in locals() and len(dca_data) > 0:
-            print(f"\n3. Testing DCA analysis...")
+            print("\n3. Testing DCA analysis...")
             unique_wells = dca_data['WELL_ID'].unique()
             print(f"Total wells: {len(unique_wells)}")
             
@@ -240,7 +239,7 @@ def verify_flexible_mapping(db_path: Path, db_name: str):
                             print(f"✓ DCA analysis completed for {test_well}")
                             
                             # Test export
-                            print(f"\n4. Testing export functionality...")
+                            print("\n4. Testing export functionality...")
                             output_dir = Path(f"test_outputs_{db_path.stem}")
                             output_dir.mkdir(exist_ok=True)
                             
@@ -266,7 +265,7 @@ def verify_flexible_mapping(db_path: Path, db_name: str):
         
         # Close database connection
         aries_db.close()
-        print(f"\n✓ Database connection closed")
+        print("\n✓ Database connection closed")
         return True
         
     except Exception as e:
@@ -323,7 +322,7 @@ def main():
     else:
         print("\n❌ Some database tests failed. Check the output above for details.")
     
-    print(f"\nTest outputs saved in:")
+    print("\nTest outputs saved in:")
     for db_path, _ in test_files:
         output_dir = Path(f"../../test_outputs_{db_path.stem}")
         if output_dir.exists():

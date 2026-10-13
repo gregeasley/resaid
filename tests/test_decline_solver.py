@@ -28,12 +28,12 @@ DMIN = 0.01 / 12
 @pytest.mark.parametrize(
     "kwargs, solved",
     [
-        (dict(qf=1000, de=0.1 / 12, eur=50000, b=1.0), ["qi"]),
-        (dict(de=0.15 / 12, eur=75000, b=0.8), ["qi"]),
-        (dict(qf=2000, de=0.2 / 12, b=0.9), ["qi", "eur"]),
-        (dict(qf=5000, de=0.05 / 12, eur=1_000_000, b=0.8), ["qi"]),
-        (dict(qi=1000, qf=1, eur=100_000, b=1.0, t_max=600), ["de"]),
-        (dict(qi=1000, qf=1, de=0.05, b=1.0), ["eur"]),
+        ({"qf": 1000, "de": 0.1 / 12, "eur": 50000, "b": 1.0}, ["qi"]),
+        ({"de": 0.15 / 12, "eur": 75000, "b": 0.8}, ["qi"]),
+        ({"qf": 2000, "de": 0.2 / 12, "b": 0.9}, ["qi", "eur"]),
+        ({"qf": 5000, "de": 0.05 / 12, "eur": 1_000_000, "b": 0.8}, ["qi"]),
+        ({"qi": 1000, "qf": 1, "eur": 100_000, "b": 1.0, "t_max": 600}, ["de"]),
+        ({"qi": 1000, "qf": 1, "de": 0.05, "b": 1.0}, ["eur"]),
     ],
 )
 def test_solves_match_eur(kwargs, solved):
@@ -41,7 +41,7 @@ def test_solves_match_eur(kwargs, solved):
     qi, t_max, qf, de, eur, warning, delta = solver.solve()
 
     assert solver.variables_to_solve == solved
-    out = dict(qi=qi, t_max=t_max, qf=qf, de=de, eur=eur)
+    out = {"qi": qi, "t_max": t_max, "qf": qf, "de": de, "eur": eur}
     for name, value in kwargs.items():
         if name in out:
             assert out[name] == pytest.approx(value), f"{name} should be unchanged"
@@ -60,7 +60,7 @@ def test_two_variable_solve_qi_de():
 
 def test_all_parameters_provided_returns_inputs():
     solver = decline_solver(qi=5000, qf=100, de=0.12 / 12, eur=100000, b=1.1, dmin=DMIN, t_max=600)
-    qi, t_max, qf, de, eur, warning, delta = solver.solve()
+    qi, t_max, qf, de, eur, warning, _delta = solver.solve()
     assert (qi, t_max, qf, de, eur) == pytest.approx((5000, 600, 100, 0.01, 100000))
     assert warning is False
 
@@ -68,7 +68,7 @@ def test_all_parameters_provided_returns_inputs():
 def test_unreachable_eur_sets_warning():
     """Max volume at de -> 0 over 600 months is ~147k; 200k cannot be matched."""
     solver = decline_solver(qi=1000, eur=200_000, b=1.0, t_max=600)
-    qi, t_max, qf, de, eur, warning, delta = solver.solve()
+    _qi, _t_max, _qf, _de, eur, warning, delta = solver.solve()
     assert warning is True
     assert delta > 0.1 * eur
 
@@ -87,7 +87,7 @@ def test_solver_main_example_converges():
 
 def test_dmin_changes_solution():
     """Regression: ``dmin`` used to be ignored when integrating the curve."""
-    common = dict(qi=1000, qf=1, eur=60_000, b=1.2, t_max=1200)
+    common = {"qi": 1000, "qf": 1, "eur": 60_000, "b": 1.2, "t_max": 1200}
     de_low = decline_solver(dmin=0.01 / 12, **common).solve()[3]
     de_high = decline_solver(dmin=0.10 / 12, **common).solve()[3]
     # A steeper terminal decline removes tail volume, so the initial decline must be

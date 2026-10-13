@@ -21,12 +21,13 @@ Features:
 """
 
 import logging
-from typing import Union
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import newton
 from tqdm import tqdm
+
+from ._strict import StrictAttributes
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 GOR_GAS_MAJOR_MSCF_PER_BBL = 3.2
 
 
-class npv_calc:
+class npv_calc(StrictAttributes):
     """
     Net Present Value and Internal Rate of Return calculator.
     
@@ -44,7 +45,7 @@ class npv_calc:
         _cashflow (np.ndarray): Array of cashflow values
     """
     
-    def __init__(self, cashflow: Union[np.ndarray, list]):
+    def __init__(self, cashflow: np.ndarray | list):
         """
         Initialize NPV calculator with cashflow array.
         
@@ -91,13 +92,13 @@ class npv_calc:
 
         try:
             result = 12 * result  # Convert monthly to annual rate
-        except Exception as e:
+        except Exception:
             logger.warning("IRR calculation failed after Newton solve; result=%r", result)
-            raise e
+            raise
 
         return result
 
-class well_econ:
+class well_econ(StrictAttributes):
     """
     Well economics analysis and cashflow modeling.
     
@@ -338,21 +339,102 @@ class well_econ:
 
         return l_capex
 
+    def _require_inputs(self) -> tuple[pd.DataFrame, float]:
+        """
+        Return ``(flowstreams, discount_rate)`` after checking the inputs are usable.
+
+        Raises ``ValueError`` naming the problem when the flowstream, its ID and
+        ``T_INDEX`` column names, or ``discount_rate`` are unset; when the flowstream
+        lacks a needed column (``OIL``, ``GAS``, ``WATER``, and ``MAJOR`` when
+        ``spud_to_online`` or ``t_start_column`` is used); or when a configured header
+        column (``wi_col``, ``nri_col``, ``capex_col``, ``royalty_col``,
+        ``owned_royalty_col``, ``t_start_column``, and ``scale_column`` when scaling)
+        is set without ``header_data`` or is missing from it.
+        """
+        flow = self._flowstreams
+        if flow is None:
+            raise ValueError(
+                "No flowstreams: set econ.flowstreams "
+                "(e.g. dca.flowstream_dataframe.reset_index())."
+            )
+        if not isinstance(flow, pd.DataFrame):
+            raise TypeError(f"flowstreams must be a pandas DataFrame, got {type(flow).__name__}")
+        unset = [
+            label for label, value in (
+                ("flowstream_uwi_col", self._flowstream_uwi_col),
+                ("flowstream_t_index", self._flowstream_t_index),
+            ) if not value
+        ]
+        if unset:
+            raise ValueError(f"Set {', '.join(unset)} (e.g. econ.flowstream_uwi_col = 'UID').")
+
+        needed = [self._flowstream_uwi_col, self._flowstream_t_index,
+                  self.OIL_COL, self.GAS_COL, self.WATER_COL]
+        if self.spud_to_online or self.t_start_column:
+            needed.append('MAJOR')
+        missing = [c for c in needed if c not in flow.columns]
+        if missing:
+            hint = ""
+            if any(c in (flow.index.names or []) for c in missing):
+                hint = " Some are in the index; pass the flowstream with .reset_index()."
+            if 'MAJOR' in missing:
+                hint += " MAJOR is required when spud_to_online or t_start_column is set."
+            raise ValueError(
+                f"flowstreams is missing column(s): {', '.join(map(str, missing))}. "
+                f"Available columns: {', '.join(map(str, flow.columns))}.{hint}"
+            )
+
+        if self.discount_rate is None:
+            raise ValueError("Set econ.discount_rate (a monthly rate, e.g. 0.10 / 12 for 10%/yr).")
+        discount_rate = float(self.discount_rate)
+
+        header_fields = {
+            "wi_col": self.wi_col,
+            "nri_col": self.nri_col,
+            "capex_col": self.capex_col,
+            "royalty_col": self.royalty_col,
+            "owned_royalty_col": self.owned_royalty_col,
+            "t_start_column": self.t_start_column,
+        }
+        if self.scale_forecast or self.scale_capex:
+            header_fields["scale_column"] = self.scale_column
+        header_fields = {k: v for k, v in header_fields.items() if v}
+        if header_fields:
+            header = self._header_data
+            if header is None:
+                raise ValueError(
+                    f"header_data is required when {', '.join(header_fields)} "
+                    f"{'is' if len(header_fields) == 1 else 'are'} set."
+                )
+            if not self._header_uwi_col:
+                raise ValueError("Set header_uwi_col to the well ID column of header_data.")
+            missing = [
+                f"{k}={v!r}" for k, v in {"header_uwi_col": self._header_uwi_col, **header_fields}.items()
+                if v not in header.columns
+            ]
+            if missing:
+                raise ValueError(
+                    f"header_data is missing column(s): {', '.join(missing)}. "
+                    f"Available columns: {', '.join(map(str, header.columns))}."
+                )
+        return flow, discount_rate
+
     def zero_below(self, df: pd.DataFrame, i_max: int, cols: list):
         """
         Zero out values in specified columns for rows where T_INDEX > i_max.
         
         Args:
             df (pd.DataFrame): Input DataFrame
-            i_max (int): Maximum T_INDEX value to keep
+            i_max (int): Maximum time index (``flowstream_t_index`` column) to keep
             cols (list): List of column names to zero out
             
         Returns:
             pd.DataFrame: Modified DataFrame
         """
+        t_col = self._flowstream_t_index or 'T_INDEX'
         for col in cols:
             df[col] = np.where(
-                df['T_INDEX'] <= i_max,
+                df[t_col] <= i_max,
                 df[col],
                 0
             )
@@ -375,7 +457,8 @@ class well_econ:
         Raises:
             ValueError: If the well is not in ``flowstreams``.
         """
-        l_flow = self._flowstreams[self._flowstreams[self._flowstream_uwi_col] == input_well].reset_index(drop=True)
+        flow, discount_rate = self._require_inputs()
+        l_flow = flow[flow[self._flowstream_uwi_col] == input_well].reset_index(drop=True)
         
         # Check if well data exists
         if l_flow.empty:
@@ -558,12 +641,12 @@ class well_econ:
             - l_flow['capex']
         )
 
-        l_flow['dcf'] = (l_flow['cf'].to_numpy() / (1 + self.discount_rate) ** np.arange(0, len(l_flow['cf'].to_numpy())))
+        l_flow['dcf'] = (l_flow['cf'].to_numpy() / (1 + discount_rate) ** np.arange(0, len(l_flow['cf'].to_numpy())))
 
         try:
             cf_idx = np.argwhere(l_flow['dcf'].to_numpy() > 0)
-        except Exception:
-            cf_idx = []
+        except (TypeError, ValueError):
+            cf_idx = np.empty((0, 1), dtype=np.intp)
 
         if len(cf_idx) > 0:
             last_cf = cf_idx[-1][0]
@@ -641,7 +724,7 @@ class well_econ:
             - l_flow['net_taxes']
             - l_flow['net_capex']
         )
-        l_flow['net_dcf'] = (l_flow['net_cf'].to_numpy() / (1+self.discount_rate)**np.arange(0, len(l_flow['cf'].to_numpy())))
+        l_flow['net_dcf'] = (l_flow['net_cf'].to_numpy() / (1+discount_rate)**np.arange(0, len(l_flow['cf'].to_numpy())))
 
         l_flow['wi_net_oil'] = l_flow[self.OIL_COL]*(l_nri+l_royalty*l_ori)
         l_flow['wi_net_gas'] = l_flow['gas_sold']*(l_nri+l_royalty*l_ori)
@@ -664,7 +747,7 @@ class well_econ:
         Returns:
             None: Sets self._indicators to a DataFrame with economic indicators
         """
-        ind_dict = {
+        ind_dict: dict = {
             'UWI': [],
             'EURO': [],
             'EURG': [],
@@ -683,7 +766,8 @@ class well_econ:
             'BREAKEVEN_PHASE': []
         }
 
-        unique_wells = self._flowstreams[self._flowstream_uwi_col].unique()
+        flow, discount_rate = self._require_inputs()
+        unique_wells = flow[self._flowstream_uwi_col].unique()
 
         iterable = tqdm(unique_wells) if self.verbose else unique_wells
 
@@ -691,7 +775,7 @@ class well_econ:
             
             l_flow = self.well_flowstream(w)
             
-            dc_rev = (l_flow['revenue'].to_numpy() / (1+self.discount_rate)**np.arange(0, len(l_flow['revenue'].to_numpy())))
+            dc_rev = (l_flow['revenue'].to_numpy() / (1+discount_rate)**np.arange(0, len(l_flow['revenue'].to_numpy())))
 
             if self.breakeven_phase is None:
                 if np.sum(l_flow[self.OIL_COL]) > 0:
@@ -735,7 +819,7 @@ class well_econ:
             try:
                 l_npv = npv_calc(l_flow['cf'].to_numpy())
                 ind_dict['IRR'].append(l_npv.get_irr())
-            except Exception:
+            except Exception:  # noqa: BLE001 - unsolvable IRR is reported as 0 (see Known Issues)
                 ind_dict['IRR'].append(0)
 
             ind_dict['ROI'].append(np.sum(l_flow['cf'])/np.sum(l_flow['capex'])+1)
@@ -754,7 +838,8 @@ class well_econ:
             pd.DataFrame: Combined cashflow data for all wells
         """
         r_df = pd.DataFrame([])
-        unique_wells = self._flowstreams[self._flowstream_uwi_col].unique()
+        flow, _ = self._require_inputs()
+        unique_wells = flow[self._flowstream_uwi_col].unique()
 
         iterable = tqdm(unique_wells) if self.verbose else unique_wells
 
