@@ -29,6 +29,11 @@ def test_run_dca_and_oneline(combined_dca_dataframe: pd.DataFrame, three_phase_m
     assert "UID" in dca._oneline.columns
 
 
+
+def _idxmax(series: pd.Series) -> float:
+    """Index label (``T_INDEX``) of the series maximum, as a float."""
+    return float(series.index.to_numpy()[np.argmax(series.to_numpy())])
+
 def test_oneline_row_count_matches_wells(combined_dca_dataframe: pd.DataFrame):
     dca = decline_curve()
     dca.three_phase_mode = True
@@ -91,8 +96,10 @@ def test_dca_succeeds_with_unsorted_input(combined_dca_dataframe: pd.DataFrame):
     assert "T0_DATE" in dca._oneline.columns
 
 
-def test_typecurve_overlays_history_without_mutating_flowstream(combined_dca_dataframe: pd.DataFrame):
-    """Typecurve uses historical overlay; _flowstream_dataframe stays forecast-only."""
+def test_typecurve_uses_history_then_projection_without_mutating_flowstream(
+    combined_dca_dataframe: pd.DataFrame,
+):
+    """Typecurve input is the flowstream: actual history, then the projection after it."""
     dca = decline_curve()
     dca.three_phase_mode = False
     dca.dataframe = combined_dca_dataframe
@@ -105,31 +112,25 @@ def test_typecurve_overlays_history_without_mutating_flowstream(combined_dca_dat
 
     dca.run_DCA()
     dca.generate_flowstream(denormalize=True)
-    flow_before = dca._flowstream_dataframe.copy()
+    flow_before = dca._require_flowstream().copy()
 
-    # Force first producing month (hist T_INDEX=0 → overlay T_INDEX=1) above forecast
-    hist_mask = (dca._dataframe[dca._uid_col] == dca._dataframe[dca._uid_col].iloc[0]) & (
-        dca._dataframe["T_INDEX"] == 0
+    # First producing month (history T_INDEX=0) is flowstream / typecurve T_INDEX=1.
+    df = dca._require_data()
+    uid = df[dca._uid_col].iloc[0]
+    first = df[(df[dca._uid_col] == uid) & (df["T_INDEX"] == 0)]
+    tc_input = dca._build_typecurve_flowstream(denormalize=True)
+    row = tc_input[(tc_input["UID"] == uid) & (tc_input["T_INDEX"] == 1)]
+    assert float(row["OIL"].iloc[0]) == pytest.approx(float(first[dca._oil_col].sum()))
+    pd.testing.assert_frame_equal(
+        tc_input.set_index(["UID", "T_INDEX"]), flow_before[["OIL", "GAS", "WATER"]]
     )
-    assert hist_mask.any(), "expected historical row at T_INDEX=0"
-    uid = dca._dataframe.loc[hist_mask, dca._uid_col].iloc[0]
-    bumped = float(dca._dataframe.loc[hist_mask, dca._oil_col].iloc[0]) + 1_000_000.0
-    dca._dataframe.loc[hist_mask, dca._oil_col] = bumped
 
-    overlay = dca._build_typecurve_flowstream(denormalize=True)
-    overlay_row = overlay[(overlay["UID"] == uid) & (overlay["T_INDEX"] == 1)]
-    assert len(overlay_row) == 1
-    assert float(overlay_row["OIL"].iloc[0]) == bumped
-
-    forecast_row = flow_before.reset_index()
-    forecast_row = forecast_row[(forecast_row["UID"] == uid) & (forecast_row["T_INDEX"] == 1)]
-    assert len(forecast_row) == 1
-    assert float(forecast_row["OIL"].iloc[0]) != bumped
-
-    assert overlay["OIL"].sum() > flow_before.reset_index()["OIL"].sum()
+    # A normalized typecurve on a denormalized flowstream uses normalized history.
+    normalized = dca._build_typecurve_flowstream(denormalize=False)
+    assert normalized["OIL"].sum() != pytest.approx(tc_input["OIL"].sum())
 
     dca.generate_typecurve(denormalize=True, return_params=True, num_months=120)
-    pd.testing.assert_frame_equal(dca._flowstream_dataframe, flow_before)
+    pd.testing.assert_frame_equal(dca._require_flowstream(), flow_before)
     assert dca._typecurve is not None
     assert not dca._typecurve.empty
     assert hasattr(dca, "tc_params")
@@ -155,18 +156,19 @@ def test_tc_params_rate_t0_is_curve_time_zero(combined_dca_dataframe: pd.DataFra
     dca.generate_flowstream(denormalize=True, num_months=120)
 
     # Late historical peak so peak_rate and rate_t0 diverge
-    uid = dca._dataframe[dca._uid_col].iloc[0]
-    late = (dca._dataframe[dca._uid_col] == uid) & (dca._dataframe["T_INDEX"] == 8)
+    df = dca._require_data()
+    uid = df[dca._uid_col].iloc[0]
+    late = (df[dca._uid_col] == uid) & (df["T_INDEX"] == 8)
     assert late.any()
-    dca._dataframe.loc[late, dca._oil_col] = (
-        dca._dataframe.loc[late, dca._oil_col].astype(float) + 50_000.0
-    )
+    df.loc[late, dca._oil_col] = df.loc[late, dca._oil_col].astype(float) + 50_000.0
+    dca.generate_flowstream(denormalize=True, num_months=120)  # history now has the late peak
 
     dca.generate_typecurve(
         denormalize=True, return_params=True, num_months=120, prob_levels=[0.1, 0.5, 0.9]
     )
 
     tc = dca.typecurve
+    assert tc is not None
     oil_params = dca.tc_params[dca.tc_params["phase"] == "OIL"]
     t_min = float(tc.index.min())
 
@@ -176,7 +178,7 @@ def test_tc_params_rate_t0_is_curve_time_zero(combined_dca_dataframe: pd.DataFra
         expected_t0 = float(series.loc[t_min])
         assert row["rate_t0"] == pytest.approx(expected_t0, rel=1e-12)
         assert row["peak_rate"] == pytest.approx(float(series.max()), rel=1e-12)
-        assert row["time_to_peak_months"] == pytest.approx(float(series.idxmax()), rel=1e-12)
+        assert row["time_to_peak_months"] == pytest.approx(_idxmax(series), rel=1e-12)
 
     # With late peak, at least one prob should have peak after time zero
     assert (oil_params["time_to_peak_months"] > t_min).any()
@@ -215,7 +217,7 @@ def test_tc_well_eur_targets_from_oneline(combined_dca_dataframe: pd.DataFrame):
     dca.generate_oneline(denormalize=True, num_months=120)
 
     targets = dca._tc_well_eur_targets("OIL", [0.1, 0.5, 0.9])
-    oil = dca._oneline["OIL"]
+    oil = dca._oneline["EUR_OIL"]
     oil = oil[np.isfinite(oil) & (oil > 0)]
     assert targets[0.5] == pytest.approx(float(oil.quantile(0.5)), rel=1e-12)
     assert targets["mean"] == pytest.approx(float(oil.mean()), rel=1e-12)
@@ -255,7 +257,7 @@ def test_tc_params_eur_matches_well_eur_quantiles(
     for phase in phases:
         phase_params = dca.tc_params[dca.tc_params["phase"] == phase]
         assert not phase_params.empty
-        well_series = pd.to_numeric(dca._oneline[phase], errors="coerce")
+        well_series = pd.to_numeric(dca._oneline[f"EUR_{phase}"], errors="coerce")
         well_series = well_series[np.isfinite(well_series) & (well_series > 0)]
         assert not well_series.empty
 
@@ -334,6 +336,7 @@ def test_tc_params_flowstream_structure_matches_typecurve(
     )
 
     tc = dca.typecurve
+    assert tc is not None
     fs = dca.tc_params_flowstream
     assert not fs.empty
     assert list(fs.index) == list(range(1, num_months + 1))
@@ -371,7 +374,7 @@ def test_tc_params_flowstream_endpoints_match_tc_params(combined_dca_dataframe: 
         series = fs[("OIL", p)].astype(float)
         assert series.loc[t_min] == pytest.approx(float(row["rate_t0"]), rel=1e-9)
         assert float(series.max()) == pytest.approx(float(row["peak_rate"]), rel=1e-9)
-        assert float(series.idxmax()) == pytest.approx(float(row["time_to_peak_months"]), rel=1e-9)
+        assert _idxmax(series) == pytest.approx(float(row["time_to_peak_months"]), rel=1e-9)
 
 
 @pytest.mark.parametrize("three_phase_mode", [True, False])

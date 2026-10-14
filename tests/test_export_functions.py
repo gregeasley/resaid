@@ -53,10 +53,14 @@ class TestExportFunctions(unittest.TestCase):
                     'OIL': oil_rate,
                     'GAS': gas_rate,
                     'WATER': water_rate,
-                    'MAJOR': 'OIL' if oil_rate > gas_rate/3.2 else 'GAS'
                 })
-        
-        self.production_df = pd.DataFrame(data)
+
+        df = pd.DataFrame(data)
+
+        # Major phase is a property of the well: from its cumulative GOR.
+        totals = df.groupby('UID')[['OIL', 'GAS']].transform('sum')
+        df['MAJOR'] = np.where(totals['GAS'] / totals['OIL'] > 3.2, 'GAS', 'OIL')
+        self.production_df = df
         
         # Initialize DCA object
         self.dca = decline_curve()

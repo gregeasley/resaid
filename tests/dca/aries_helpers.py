@@ -86,6 +86,7 @@ def parse_aries(path, scenario):
         if line.strip() == "PRODUCTION":
             continue
         assert line.endswith(scenario), f"missing scenario: {line!r}"
+        assert current is not None, f"forecast line before any well: {line!r}"
         body = line[: LINE_WIDTH - len(scenario)].rstrip()
         if m := _START.match(body):
             current["start"] = m.group(1)

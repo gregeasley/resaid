@@ -41,23 +41,21 @@ def create_test_data():
             oil_rate = max(0, np.random.normal(500, 100))
             gas_rate = max(0, np.random.normal(1000, 200))
             water_rate = max(0, np.random.normal(200, 50))
-            
-            # Determine major phase
-            if gas_rate / (oil_rate + 1e-6) > 3.2:
-                major = 'GAS'
-            else:
-                major = 'OIL'
-            
+
             data.append({
                 'UID': well,
                 'P_DATE': date,
                 'OIL': oil_rate,
                 'GAS': gas_rate,
                 'WATER': water_rate,
-                'MAJOR': major
             })
-    
-    return pd.DataFrame(data)
+
+    df = pd.DataFrame(data)
+
+    # Major phase is a property of the well: from its cumulative GOR.
+    totals = df.groupby('UID')[['OIL', 'GAS']].transform('sum')
+    df['MAJOR'] = np.where(totals['GAS'] / totals['OIL'] > 3.2, 'GAS', 'OIL')
+    return df
 
 
 def test_export_consistency():

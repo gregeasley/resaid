@@ -56,7 +56,7 @@ def test_context_manager_closes_log(in_tmp, small_df):
     with _configured(small_df) as dca:
         dca.run_DCA()
         handle = dca._stat_file
-    assert handle.closed
+    assert handle is not None and handle.closed
 
 
 def test_stat_file_none_disables_logging(in_tmp, small_df):

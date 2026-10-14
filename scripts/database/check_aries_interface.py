@@ -58,7 +58,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
         # Test reading production data
         print("\n4. Testing production data reading...")
         try:
-            prod_data = aries_db.read_production_data()
+            prod_data = aries_db.read_table_data("AC_PRODUCT")
             print(f"✓ Production data loaded: {prod_data.shape}")
             print(f"Columns: {list(prod_data.columns)}")
             
@@ -78,7 +78,7 @@ def verify_aries_database_file(db_path: Path, db_type: str) -> bool:
         # Test reading header data
         print("\n5. Testing header data reading...")
         try:
-            header_data = aries_db.read_header_data()
+            header_data = aries_db.read_table_data("AC_PROPERTY")
             print(f"✓ Header data loaded: {header_data.shape}")
             print(f"Columns: {list(header_data.columns)}")
             

@@ -66,7 +66,7 @@ def explore_accdb():
                 print(f"\nExamining table: {table_name}")
                 try:
                     # Try to get column info
-                    cursor = aries_db.connection.cursor()
+                    cursor = aries_db._require_connection().cursor()
                     columns = [column.column_name for column in cursor.columns(table=table_name)]
                     print(f"  Columns: {columns}")
                     

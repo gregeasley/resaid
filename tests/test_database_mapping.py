@@ -191,3 +191,46 @@ def test_real_aries_default_header_mapping(path):
         assert len(data) > 0
         assert {"WELL_ID", "DATE", "OIL", "GAS", "WATER", "PHASE"} <= set(data.columns)
         assert data["PHASE"].notna().any()
+
+
+# --- exports -------------------------------------------------------------------------------
+
+@pytest.fixture
+def header_results(db):
+    data = db.prepare_data_for_dca(
+        header_columns={"well_id": "PROPNUM", "phase": "MAJOR", "length": "LAT_LEN"}
+    )
+    return data, db.run_dca_analysis(data, three_phase_mode=False)
+
+
+def test_run_dca_oneline_is_in_actual_volumes(header_results):
+    # W1 has a 10,000 ft lateral: its oneline must not be scaled to 5,280 ft.
+    data, results = header_results
+    from resaid.dca import decline_curve
+
+    plain = decline_curve()
+    w1_data = data[data["WELL_ID"] == "W1"].drop(columns=["LENGTH"])
+    plain.dataframe = w1_data.assign(PHASE=w1_data["PHASE"].str.strip().str.upper())
+    plain.date_col, plain.uid_col = "DATE", "WELL_ID"
+    plain.oil_col, plain.gas_col, plain.water_col = "OIL", "GAS", "WATER"
+    plain.phase_col = "PHASE"
+    plain.run_DCA()
+    plain.generate_oneline()
+    w1 = results["W1"].oneline_dataframe
+    assert w1["IPO"].iloc[0] == pytest.approx(plain.oneline_dataframe["IPO"].iloc[0], rel=1e-6)
+
+
+@pytest.mark.parametrize("fmt, suffix", [("aries", ".txt"), ("phdwin", ".csv"), ("MOSAIC", ".xlsx")])
+def test_export_results_writes_every_well(db, header_results, tmp_path, fmt, suffix):
+    out_dir = tmp_path / "nested" / "exports"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)  # no per-well failures
+        files = db.export_results(header_results[1], export_format=fmt, output_dir=out_dir)
+    assert set(files) == set(WELLS)
+    for path in files.values():
+        assert Path(path).suffix == suffix and Path(path).stat().st_size > 0
+
+
+def test_export_results_rejects_unknown_format(db, header_results, tmp_path):
+    with pytest.raises(ValueError, match="Unsupported export format 'csv'"):
+        db.export_results(header_results[1], export_format="csv", output_dir=tmp_path)

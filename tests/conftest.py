@@ -14,8 +14,7 @@ EXAMPLE_INPUT = REPO_ROOT / "examples" / "input_data"
 def require_access_driver() -> None:
     """Skip unless pyodbc and the Microsoft Access ODBC driver are installed.
 
-    Checks the installed drivers instead of connecting, so the JPype fallback (which
-    starts a Java VM) is never tried.
+    Checks the installed drivers instead of opening a connection.
     """
     pyodbc = pytest.importorskip("pyodbc", reason="pyodbc not installed (resaid[database])")
     if not any("Microsoft Access Driver" in d for d in pyodbc.drivers()):

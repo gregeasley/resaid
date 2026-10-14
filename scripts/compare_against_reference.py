@@ -118,7 +118,9 @@ def compare_major_phase_parameters(reference_df, test_df, mode_name):
                 test_di = test_row['DE']
                 test_b = test_row['B']
                 test_aries = test_row['ARIES_DE']
-        
+        else:
+            continue  # only OIL and GAS wells are compared
+
         # Check if parameters match exactly
         qi_match = abs(ref_qi - test_qi) < 1e-10
         di_match = abs(ref_di - test_di) < 1e-10

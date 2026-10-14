@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import tempfile
 import traceback
 import warnings
 from pathlib import Path
@@ -16,6 +17,7 @@ import pandas as pd
 
 from ._strict import StrictAttributes
 from .dca import decline_curve
+from .dca.decline_curve import DCA_FIT_METHOD_DEFAULT
 
 logger = logging.getLogger(__name__)
 
@@ -92,69 +94,41 @@ class DatabaseInterface(StrictAttributes):
             )
             return False
     
-    def _try_jpype_connection(self) -> bool:
-        """
-        Placeholder for a JPype/UCanAccess connection; not implemented.
-
-        Always returns False. Note that it starts a JVM (without UCanAccess on the
-        classpath) as a side effect when jpype is installed.
-        """
-        try:
-            import jpype  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
-            if not jpype.isJVMStarted():
-                # Try to start JVM and load UCanAccess
-                jpype.startJVM()
-            
-            # This would require UCanAccess JAR files
-            # For now, return False
-            return False
-        except Exception:  # noqa: BLE001 - JPype/JVM failures mean not connected
-            return False
-    
     def _try_phdwin_connection(self) -> bool:
         """Try to establish connection using pytopspeed-modernized for PhdWin files"""
+        # Convert the PhdWin file to a temporary SQLite database, removed again on failure
+        with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as temp_db:
+            temp_db_path = temp_db.name
+
         try:
-            import sqlite3
-            import tempfile
-            
-            # Convert PhdWin file to temporary SQLite database
-            with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as temp_db:
-                temp_db_path = temp_db.name
-            
             # Use appropriate converter based on file extension
-            file_ext = self.db_path.suffix.lower()
-            
-            if file_ext == '.phz':
+            if self.db_path.suffix.lower() == '.phz':
                 # Use PhzConverter for .phz files (zip archives)
                 from converter.phz_converter import PhzConverter  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
-                converter = PhzConverter()
-                result = converter.convert_phz(str(self.db_path), temp_db_path)
+                result = PhzConverter().convert_phz(str(self.db_path), temp_db_path)
             else:
                 # Use SqliteConverter for .phd, .mod, .tps files
                 from converter.sqlite_converter import SqliteConverter  # pyright: ignore[reportMissingImports]  # optional: resaid[database]
-                converter = SqliteConverter()
-                result = converter.convert(str(self.db_path), temp_db_path)
-            
-            # Check if conversion was successful
-            if not result.get('success', False):
-                warnings.warn(f"PhdWin conversion failed: {result.get('errors', ['Unknown error'])}")
-                return False
-            
-            # Connect to the temporary SQLite database
-            self.connection = sqlite3.connect(temp_db_path)
-            self._temp_db_path = temp_db_path  # Store for cleanup
-            return True
-            
+                result = SqliteConverter().convert(str(self.db_path), temp_db_path)
+
+            if result.get('success', False):
+                self.connection = sqlite3.connect(temp_db_path)
+                self._temp_db_path = temp_db_path  # Store for cleanup
+                return True
+            message = f"PhdWin conversion failed: {result.get('errors', ['Unknown error'])}"
         except ImportError:
             message = 'pytopspeed-modernized is not installed (pip install "resaid[database]")'
-            self._connect_errors.append(message)
-            warnings.warn(message)
-            return False
         except Exception as e:  # noqa: BLE001 - any converter failure means not connected
-            self._connect_errors.append(f"PhdWin conversion failed: {e}")
-            warnings.warn(f"Failed to convert PhdWin database: {e}")
-            return False
-    
+            message = f"PhdWin conversion failed: {e}"
+
+        self._connect_errors.append(message)
+        warnings.warn(message)
+        try:
+            os.unlink(temp_db_path)
+        except OSError:
+            logger.debug("Could not remove %s", temp_db_path, exc_info=True)
+        return False
+
     def _try_external_tools(self) -> bool:
         """
         Check whether mdbtools can read the file.
@@ -193,7 +167,6 @@ class DatabaseInterface(StrictAttributes):
         if self.db_type == 'access':
             methods = [
                 self._try_pyodbc_connection,
-                self._try_jpype_connection,
                 self._try_external_tools
             ]
         elif self.db_type == 'phdwin':
@@ -423,8 +396,7 @@ class DatabaseInterface(StrictAttributes):
                             production_columns: dict[str, str],
                             header_table: str | None = None,
                             header_columns: dict[str, str] | None = None,
-                            skip_missing_header_columns: bool = False,
-                            **kwargs) -> pd.DataFrame:
+                            skip_missing_header_columns: bool = False) -> pd.DataFrame:
         """
         Prepare data for DCA analysis using flexible table and column mapping
 
@@ -443,7 +415,6 @@ class DatabaseInterface(StrictAttributes):
                 'operator' optional). Pass an empty dict to skip the header read.
             skip_missing_header_columns: Drop mapped header columns that the table
                 lacks (with a warning) instead of raising.
-            **kwargs: Accepted for compatibility; unused
 
         Returns:
             DataFrame with columns WELL_ID, DATE, OIL, GAS, WATER plus the upper-cased
@@ -521,15 +492,28 @@ class DatabaseInterface(StrictAttributes):
         Args:
             data: DataFrame with production data
             three_phase_mode: Whether to use three-phase forecasting
-            **dca_kwargs: Accepted for compatibility; currently unused
+            **dca_kwargs: ``decline_curve`` settings applied to every well, e.g.
+                ``fit_method="monotone_two_step"`` or ``detect_step_changes=False``.
+                Any name ``decline_curve`` does not define raises ``AttributeError``
+                before any well is run.
             
         Returns:
             Dictionary mapping well IDs to decline_curve objects. Each has been run
-            and has a oneline (not denormalized). Wells with fewer than 3 rows are
-            skipped with a warning.
+            and has a oneline in each well's actual volumes (denormalized from the
+            standard lateral length when a header length is present), which the
+            exports use. Wells with fewer than 3 rows are skipped with a warning.
         """
+        def new_dca() -> decline_curve:
+            settings = dict(dca_kwargs)
+            dca = decline_curve(fit_method=settings.pop('fit_method', DCA_FIT_METHOD_DEFAULT))
+            dca.three_phase_mode = three_phase_mode
+            for name, value in settings.items():
+                setattr(dca, name, value)
+            return dca
+
+        new_dca()  # check the settings once, before the per-well loop reports failures as warnings
         results = {}
-        
+
         for well_id in data['WELL_ID'].unique():
             well_data = data[data['WELL_ID'] == well_id].copy()
             
@@ -538,12 +522,7 @@ class DatabaseInterface(StrictAttributes):
                 continue
             
             try:
-                # Create decline curve object
-                dca = decline_curve()
-                
-                # Set three-phase mode if specified
-                if hasattr(dca, 'three_phase_mode'):
-                    dca.three_phase_mode = three_phase_mode
+                dca = new_dca()
                 
                 # Set data
                 dca.dataframe = well_data
@@ -576,7 +555,7 @@ class DatabaseInterface(StrictAttributes):
                 
                 # Run DCA
                 dca.run_DCA()
-                dca.generate_oneline()
+                dca.generate_oneline(denormalize=True)
                 
                 results[well_id] = dca
                 
@@ -587,62 +566,58 @@ class DatabaseInterface(StrictAttributes):
         
         return results
     
-    def export_results(self, 
+    EXPORT_FORMATS = ('aries', 'mosaic', 'phdwin')
+
+    def export_results(self,
                       dca_results: dict[str, decline_curve],
                       export_format: str = 'aries',
                       output_dir: str | Path | None = None) -> dict[str, str]:
         """
         Export DCA results in specified format
-        
+
         Args:
             dca_results: Dictionary of DCA results
-            export_format: Export format ('aries' or 'mosaic'). 'phdwin' is
-                accepted but currently fails for every well (a warning is issued
-                and the well is omitted from the result).
-            output_dir: Output directory (defaults to current directory)
-            
+            export_format: Export format: 'aries', 'mosaic' or 'phdwin'
+            output_dir: Output directory, created if needed (defaults to current directory)
+
         Returns:
-            Dictionary mapping well IDs to output file paths. Failures, including an
-            unsupported format, are reported as warnings, not raised.
+            Dictionary mapping well IDs to output file paths. A well whose export
+            fails is reported as a warning and omitted.
+
+        Raises:
+            ValueError: If ``export_format`` is not supported.
         """
-        if output_dir is None:
-            output_dir = Path.cwd()
-        else:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(exist_ok=True)
-        
+        export_format = str(export_format).strip().lower()
+        if export_format not in self.EXPORT_FORMATS:
+            raise ValueError(
+                f"Unsupported export format {export_format!r}; "
+                f"expected one of {', '.join(self.EXPORT_FORMATS)}"
+            )
+        output_dir = Path.cwd() if output_dir is None else Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         output_files = {}
-        
+
         for well_id, dca_obj in dca_results.items():
             try:
-                # Generate export based on format
                 if export_format == 'aries':
                     output_file = output_dir / f"{well_id}_aries_export.txt"
-                    # Call the existing generate_aries_export method
                     dca_obj.generate_aries_export(str(output_file))
-                    
                 elif export_format == 'phdwin':
                     output_file = output_dir / f"{well_id}_phdwin_export.csv"
-                    # Call the existing generate_phdwin_export method
-                    output_df = dca_obj.generate_phdwin_export()
-                    output_df.to_csv(output_file, index=False)
-                    
-                elif export_format == 'mosaic':
-                    output_file = output_dir / f"{well_id}_mosaic_export.xlsx"
-                    # Call the existing generate_mosaic_export method
-                    dca_obj.generate_mosaic_export(str(output_file))
-                    
+                    dca_obj.generate_phdwin_export(str(output_file))
                 else:
-                    raise ValueError(f"Unsupported export format: {export_format}")
-                
+                    output_file = output_dir / f"{well_id}_mosaic_export.xlsx"
+                    dca_obj.generate_mosaic_export(str(output_file))
+
                 output_files[well_id] = str(output_file)
-                
+
             except Exception as e:  # noqa: BLE001 - one well's failure must not stop the batch
                 warnings.warn(f"Failed to export {export_format} for well {well_id}: {e}")
                 continue
-        
+
         return output_files
-    
+
     def close(self):
         """Close database connection"""
         if self.connection:
@@ -715,8 +690,7 @@ class _DefaultMappedDatabase(DatabaseInterface):
                             production_columns: dict[str, str] | None = None,
                             header_table: str | None = None,
                             header_columns: dict[str, str] | None = None,
-                            skip_missing_header_columns: bool | None = None,
-                            **kwargs) -> pd.DataFrame:
+                            skip_missing_header_columns: bool | None = None) -> pd.DataFrame:
         """
         Prepare data for DCA analysis, filling unspecified tables and columns from
         the instance mappings.
@@ -732,7 +706,6 @@ class _DefaultMappedDatabase(DatabaseInterface):
             skip_missing_header_columns: Skip mapped header columns the table lacks
                 instead of raising. Defaults to True only while the built-in default
                 header mapping is in use, and False for a mapping you supplied.
-            **kwargs: Accepted for compatibility; unused
 
         Returns:
             DataFrame with WELL_ID, DATE, OIL, GAS, WATER and any mapped header fields
@@ -760,7 +733,6 @@ class _DefaultMappedDatabase(DatabaseInterface):
             header_table=header_table,
             header_columns=header_columns,
             skip_missing_header_columns=skip_missing_header_columns,
-            **kwargs
         )
 
 

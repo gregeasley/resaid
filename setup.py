@@ -65,7 +65,6 @@ setuptools.setup(
         # Optional database connectivity: pip install "resaid[database]"
         "database": [
             'pyodbc>=4.0.0',  # ARIES / Access (.mdb/.accdb)
-            'jpype1>=1.0.0',  # Java-based database access
             'pytopspeed-modernized>=1.1.0',  # PhdWin (TopSpeed files)
         ],
         "test": [

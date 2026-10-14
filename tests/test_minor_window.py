@@ -35,7 +35,7 @@ def _fit(gas, oil, **attrs):
     for k, v in attrs.items():
         setattr(d, k, v)
     d.run_DCA()
-    return d.params_dataframe.set_index("phase")
+    return d.params_dataframe.set_index("phase")[["qi", "di", "b", "t0"]].astype(float)
 
 
 def test_minor_phase_uses_major_window():
@@ -43,9 +43,8 @@ def test_minor_phase_uses_major_window():
     on = _fit(gas, oil)
     off = _fit(gas, oil, minor_window_from_major=False)
     # On its own, oil's step up starts its window at the spike (month 60+).
-    assert off.loc["OIL", "t0"] >= 60
+    assert off["t0"].to_dict()["OIL"] >= 60
     # With the major's window, oil is fit from the gas window start (the first peak, month 0).
-    assert on.loc["OIL", "t0"] < 60
+    assert on["t0"].to_dict()["OIL"] < 60
     # The major phase itself is unchanged.
-    assert on.loc["GAS", ["qi", "di", "b", "t0"]].tolist() == pytest.approx(
-        off.loc["GAS", ["qi", "di", "b", "t0"]].tolist())
+    assert on.loc["GAS"].to_numpy() == pytest.approx(off.loc["GAS"].to_numpy())

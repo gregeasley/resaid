@@ -101,7 +101,9 @@ def compare_major_phase_results(original_df, three_phase_df):
             three_di = three_row['DG']
             three_b = three_row['BG']
             three_aries = three_row['ARIES_DG']
-        
+        else:
+            continue  # only OIL and GAS wells are compared
+
         # Check if parameters match exactly
         qi_match = abs(orig_qi - three_qi) < 1e-10
         di_match = abs(orig_di - three_di) < 1e-10

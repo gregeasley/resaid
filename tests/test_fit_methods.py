@@ -61,8 +61,8 @@ def test_shallow_decline_fits_are_physical(fit_method):
     assert params[["qi", "di", "b"]].notna().all().all()
 
     one = dca.oneline_dataframe.set_index("UID")
-    peak = dca.dataframe.groupby("WELL_ID")["OIL"].max()
-    for uid, eur in one["OIL"].items():
+    peak = dca._require_data().groupby("WELL_ID")["OIL"].max().to_dict()
+    for uid, eur in one["EUR_OIL"].items():
         # Never more than a well holding its peak rate and declining at the
         # terminal rate (guards against runaway tails).
         assert 0 < eur <= 1.5 * peak[uid] / dca.MIN_DECLINE_RATE

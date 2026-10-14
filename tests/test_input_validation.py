@@ -86,10 +86,11 @@ def test_subclass_can_add_attributes_in_init():
 def test_subclass_can_opt_out():
     class Loose(decline_curve):
         _strict_attributes = False
+        anything: int  # annotation only: no attribute is defined
 
     c = Loose()
     c.STAT_FILE = None
-    c.anything = 1
+    c.anything = 1  # an undeclared name, on purpose
     assert c.anything == 1
 
 
@@ -157,6 +158,36 @@ def test_valid_inputs_still_run():
     assert len(d.oneline_dataframe) == 1
 
 
+def _two_wells_with_phase(w1_phase, w2_phase="GAS"):
+    """W1 and W2 with a PHASE column; ``w1_phase`` is one value or one per month."""
+    w1 = _production().assign(PHASE=pd.Series(w1_phase, index=range(24), dtype=object))
+    w2 = _production().assign(WELL="W2", PHASE=w2_phase)
+    d = _configured(pd.concat([w1, w2], ignore_index=True))
+    d.phase_col = "PHASE"
+    return d
+
+
+@pytest.mark.parametrize("w1_phase, shown", [
+    ([" oil"] * 12 + ["GAS"] * 12, "W1: GAS, OIL"),   # changes between months
+    ("WATER", "W1: WATER"),
+    (np.nan, "W1: no phase"),
+])
+def test_phase_must_be_one_oil_or_gas_value_per_well(w1_phase, shown):
+    d = _two_wells_with_phase(w1_phase)
+    with pytest.raises(ValueError, match=f"one phase, OIL or GAS.*{shown}"):
+        d.run_DCA()
+
+
+def test_phase_is_per_well():
+    # Case, spaces and blank rows do not matter: each well gets one fit for its phase.
+    d = _two_wells_with_phase(" oil ")
+    d._require_data().loc[3, "PHASE"] = np.nan
+    d.run_DCA()
+    d.generate_oneline()
+    one = d.oneline_dataframe.set_index("UID")
+    assert len(one) == 2 and one.loc["W1", "MAJOR"] == "OIL" and one.loc["W2", "MAJOR"] == "GAS"
+
+
 # --- decline_solver inputs ---------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -220,8 +251,8 @@ def test_econ_indexed_flowstream_hints_reset_index():
 
 
 def test_econ_header_column_requires_header_data():
-    e = _econ(wi_col="WI")
-    with pytest.raises(ValueError, match="header_data is required when wi_col"):
+    e = _econ(capex_col="CAPEX")
+    with pytest.raises(ValueError, match="header_data is required when capex_col"):
         e.generate_cashflow()
 
 
@@ -244,7 +275,7 @@ def test_econ_custom_time_index_name():
     cashflow = e.generate_cashflow()
     e.generate_indicators()
     assert len(cashflow) == 60
-    assert e.indicators["DCF"].iloc[0] > 0
+    assert e.indicators is not None and e.indicators["DCF"].iloc[0] > 0
 
 
 def test_econ_valid_inputs_match_default_time_index():
@@ -261,7 +292,6 @@ def unreachable_db(tmp_path, monkeypatch):
     path = tmp_path / "not_access.accdb"
     path.write_bytes(b"not an access database")
     db = ARIESDatabase(path)
-    monkeypatch.setattr(db, "_try_jpype_connection", lambda: False)
     monkeypatch.setattr(db, "_try_external_tools", lambda: False)
     return db
 
@@ -278,3 +308,9 @@ def test_probe_without_connection_is_not_success(unreachable_db, monkeypatch):
     assert unreachable_db.connect() is False
     with pytest.raises(ConnectionError):
         unreachable_db.read_table_data("AC_PRODUCT")
+
+
+def test_daily_input_is_not_supported():
+    d = decline_curve()
+    with pytest.raises(NotImplementedError, match="Daily production input"):
+        d.input_monthly = False

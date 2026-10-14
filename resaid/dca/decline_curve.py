@@ -8,7 +8,7 @@ import logging
 import time
 import warnings
 from pathlib import Path
-from typing import cast
+from typing import cast, overload
 
 import numpy as np
 import pandas as pd
@@ -231,6 +231,7 @@ class decline_curve(StrictAttributes):
         self._normalized_dataframe = pd.DataFrame()
         self._params_dataframe = pd.DataFrame([])
         self._flowstream_dataframe: pd.DataFrame | None = None
+        self._flowstream_settings: tuple[int, bool] | None = None
         self._typecurve: pd.DataFrame | None = None
         self._oneline = pd.DataFrame()
 
@@ -312,6 +313,13 @@ class decline_curve(StrictAttributes):
 
     @input_monthly.setter
     def input_monthly(self,value):
+        # Daily production is not supported yet: fits, flowstreams, exports and
+        # economics all assume monthly periods (see Future improvements in the README).
+        if not value:
+            raise NotImplementedError(
+                "Daily production input is not supported yet; resaid works on monthly data "
+                "(input_monthly must be True)."
+            )
         self._input_monthly = value
 
     @property
@@ -480,7 +488,7 @@ class decline_curve(StrictAttributes):
         # Each well's first production date, assigned in place so that running DCA again on
         # the same object neither duplicates the column nor reuses a stale one (a merge did,
         # and pandas 3 rejects the duplicate column a third run created).
-        self._dataframe['MIN_DATE'] = self._dataframe.groupby(self._uid_col)[self._date_col].transform('min')
+        self._dataframe['MIN_DATE'] = self._dataframe.groupby(cast(str, self._uid_col))[cast(str, self._date_col)].transform('min')
 
         if self._input_monthly:
             self._dataframe['T_INDEX'] = self.month_diff(
@@ -494,6 +502,39 @@ class decline_curve(StrictAttributes):
             )
 
         #return 0
+
+    def _well_phases(self) -> pd.Series:
+        """
+        Each row's major phase from ``phase_col``, which is a property of the well.
+
+        Values are matched ignoring case and surrounding spaces; blank rows take the
+        well's value. Raises ``ValueError`` naming the wells whose phase is missing,
+        not OIL or GAS, or differs between rows.
+        """
+        df = self._require_data()
+        uid = df[self._uid_col]
+        raw = df[cast(str, self._phase_col)]
+        phase = raw.where(raw.isna(), raw.astype(str).str.strip().str.upper())
+        phase = phase.replace('', np.nan)
+        per_well = phase.groupby(uid).agg(lambda v: sorted(set(v.dropna())))
+
+        problems = []
+        for well, values in per_well.items():
+            if len(values) == 0:
+                problems.append(f"{well}: no phase")
+            elif len(values) > 1:
+                problems.append(f"{well}: {', '.join(values)}")
+            elif values[0] not in ('OIL', 'GAS'):
+                problems.append(f"{well}: {values[0]}")
+        if problems:
+            shown = '; '.join(problems[:10])
+            more = f" (and {len(problems) - 10} more)" if len(problems) > 10 else ""
+            raise ValueError(
+                f"phase_col {self._phase_col!r} must give each well one phase, OIL or GAS. "
+                f"Wells with a missing, unknown or changing phase: {shown}{more}. "
+                "Set one phase per well, or leave phase_col unset to classify wells by GOR."
+            )
+        return uid.map(per_well.str[0])
 
     def assign_major(self):
         """Assign major phase (OIL or GAS) based on gas-oil ratio."""
@@ -596,7 +637,7 @@ class decline_curve(StrictAttributes):
         if self._phase_col is None:
             self.assign_major()
         else:
-            self._normalized_dataframe['MAJOR'] = self._dataframe[self._phase_col]
+            self._normalized_dataframe['MAJOR'] = self._well_phases()
 
 
         self._normalized_dataframe = self._normalized_dataframe[[
@@ -662,9 +703,11 @@ class decline_curve(StrictAttributes):
             regression = sm.formula.ols(
                 "data ~ x", data=pd.DataFrame({"data": ln_y, "x": vx})
             ).fit()
-        except Exception:
-            if self.verbose:
-                logger.warning("OLS fit failed in outlier detection.", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - reported; the fit keeps every point
+            warnings.warn(
+                f"Outlier screening failed ({exc}); the affected fit uses every point in its window.",
+                stacklevel=2,
+            )
             return input_x, input_y
 
         exog = np.asarray(regression.model.exog, dtype=float)
@@ -681,9 +724,11 @@ class decline_curve(StrictAttributes):
 
         try:
             test = regression.outlier_test()
-        except Exception:
-            if self.verbose:
-                logger.warning("Error in outlier detection outlier_test.", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - reported; the fit keeps every point
+            warnings.warn(
+                f"Outlier screening failed ({exc}); the affected fit uses every point in its window.",
+                stacklevel=2,
+            )
             return input_x, input_y
 
         if len(test) != len(orig_idx):
@@ -718,6 +763,14 @@ class decline_curve(StrictAttributes):
     def _arps_fit_model(self, x, qi, di, b, t0) -> np.ndarray:
         """``arps_decline`` as a ``curve_fit`` model: always returns an array."""
         return np.atleast_1d(np.asarray(self.arps_decline(x, qi, di, b, t0), dtype=float))
+
+    @overload
+    def arps_decline(self, x: float, qi: float, di: float, b: float, t0: float,
+                     dmin: float | None = None) -> float: ...
+
+    @overload
+    def arps_decline(self, x: np.ndarray | pd.Series | list[float], qi: float, di: float,
+                     b: float, t0: float, dmin: float | None = None) -> np.ndarray: ...
 
     def arps_decline(self, x, qi, di, b, t0, dmin=None):
         """
@@ -1171,8 +1224,12 @@ class decline_curve(StrictAttributes):
                 qi=qi_tail, qf=None, de=None, dmin=self.MIN_DECLINE_RATE, b=float(b),
                 eur=target, t_max=DEFAULT_SOLVER_T_MAX_MONTHS,
             ).solve()
-        except Exception:
-            logger.debug("Short-regime EUR solve failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - reported; falls back to the L3M adjustment
+            warnings.warn(
+                f"Short-regime EUR match could not be solved ({exc}); the affected well uses "
+                "the L3M adjustment instead.",
+                stacklevel=2,
+            )
             return None
         di_new = float(di_new)
         if not np.isfinite(di_new) or di_new <= 0:
@@ -1431,7 +1488,7 @@ class decline_curve(StrictAttributes):
                 qi_out, di_out, t0_out = matched
             else:
                 qi_out, di_out = self._adjust_default_fit_to_recent_l3m(
-                    qi_fit, de_stage1, b_fit, t0_fit, x_vals, y_vals
+                    qi_fit, de_stage1, b_fit, t0_fit, x_vals, y_vals, t_ref=t0_min
                 )
                 t0_out = t0_fit
         if matched is not None:
@@ -1676,7 +1733,8 @@ class decline_curve(StrictAttributes):
                                 self._incr_dca_path(DCA_PATH_LEGACY_SHORT_REGIME)
                             else:
                                 adj_qi, adj_di = self._adjust_default_fit_to_recent_l3m(
-                                    popt[0], popt[1], popt[2], popt[3], x_vals, y_vals
+                                    popt[0], popt[1], popt[2], popt[3], x_vals, y_vals,
+                                    t_ref=t0Min,
                                 )
                                 s['qi'] = adj_qi
                                 s['di'] = adj_di
@@ -2142,9 +2200,11 @@ class decline_curve(StrictAttributes):
         """
         Build one summary row per well in ``oneline_dataframe``.
 
-        Regenerates the flowstream (running ``run_DCA`` first if needed). ``OIL``,
-        ``GAS`` and ``WATER`` are each well's flowstream volume summed over the
-        horizon; decline parameter columns depend on ``three_phase_mode``.
+        Regenerates the flowstream (running ``run_DCA`` first if needed). Volumes per
+        phase (``OIL``, ``GAS``, ``WATER``): ``HIST_<phase>`` is actual production
+        through the last actual month, ``PROJ_<phase>`` the projection from the next
+        month to the horizon, and ``EUR_<phase>`` their sum. Decline parameter columns
+        depend on ``three_phase_mode``.
 
         Args:
             num_months: Forecast horizon in months.
@@ -2163,11 +2223,30 @@ class decline_curve(StrictAttributes):
         else:
             self._generate_oneline_original(num_months, denormalize, _verbose)
 
+    ONELINE_VOLUME_COLUMNS = tuple(
+        f"{kind}_{phase}" for kind in ("HIST", "PROJ", "EUR") for phase in ("OIL", "GAS", "WATER")
+    )
+
+    def _oneline_volumes(self):
+        """
+        Per-well volumes from the flowstream: ``HIST_*`` (actual production through the
+        last actual month), ``PROJ_*`` (projection after it) and ``EUR_*`` (their sum).
+        """
+        flow = self._require_flowstream().reset_index()
+        hist = flow['HISTORICAL'].astype(bool)
+        out = pd.DataFrame({'UID': pd.unique(flow['UID'])}).set_index('UID')
+        for phase in ('OIL', 'GAS', 'WATER'):
+            out[f'HIST_{phase}'] = flow[phase].where(hist, 0.0).groupby(flow['UID']).sum()
+            out[f'PROJ_{phase}'] = flow[phase].where(~hist, 0.0).groupby(flow['UID']).sum()
+        for phase in ('OIL', 'GAS', 'WATER'):
+            out[f'EUR_{phase}'] = out[f'HIST_{phase}'] + out[f'PROJ_{phase}']
+        return out[list(self.ONELINE_VOLUME_COLUMNS)].reset_index()
+
     def _generate_oneline_original(self, num_months, denormalize, _verbose):
         """Original oneline generation using major phase with ratios"""
         # Of note, since you often forget this, the flowstream dataframe inherits the denormalize attribute
         # So the oneline sums will always follow the denormalization settings
-        oneline_df = self._require_flowstream().reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
+        oneline_df = self._oneline_volumes()
 
         self._dataframe = self._require_data()
         self._dataframe[self._date_col] = pd.to_datetime(self._dataframe[self._date_col])
@@ -2235,7 +2314,7 @@ class decline_curve(StrictAttributes):
     def _generate_oneline_three_phase(self, num_months, denormalize, _verbose):
         """Three-phase oneline generation with independent decline curves for each phase"""
         # Get flowstream totals by well
-        oneline_df = self._require_flowstream().reset_index()[['UID','OIL',"GAS",'WATER']].groupby('UID').sum().reset_index()
+        oneline_df = self._oneline_volumes()
 
         # Get minimum dates for each well
         self._dataframe = self._require_data()
@@ -2253,6 +2332,7 @@ class decline_curve(StrictAttributes):
 
         # Create oneline data for each well
         well_summaries = []
+        majors = self._require_flowstream()['MAJOR'].groupby(level='UID').first()
 
         for uid in oneline_df['UID'].unique():
             well_params = params_with_dates[params_with_dates['UID'] == uid]
@@ -2261,9 +2341,8 @@ class decline_curve(StrictAttributes):
             # Initialize well summary
             well_summary = {
                 'UID': uid,
-                'OIL': well_flow['OIL'],
-                'GAS': well_flow['GAS'],
-                'WATER': well_flow['WATER'],
+                'MAJOR': majors.get(uid),
+                **{col: well_flow[col] for col in self.ONELINE_VOLUME_COLUMNS},
                 'T0_DATE': well_params['T0_DATE'].iloc[0] if len(well_params) > 0 else None
             }
 
@@ -2300,16 +2379,22 @@ class decline_curve(StrictAttributes):
 
     def generate_flowstream(self, num_months=DEFAULT_FORECAST_HORIZON_MONTHS, denormalize=False, actual_dates=False, _verbose=False):
         """
-        Build monthly modeled volumes per well in ``flowstream_dataframe``.
+        Build each well's monthly volumes over its life in ``flowstream_dataframe``.
 
-        Runs ``run_DCA`` first if needed. The result is indexed by ``[UID, T_INDEX]``
-        with ``T_INDEX`` from 1 to ``num_months - 1`` counted from each well's first
-        production month, and columns ``OIL``, ``GAS``, ``WATER`` (plus ``MAJOR`` in
-        ratio mode).
+        Runs ``run_DCA`` first if needed. Indexed by ``[UID, T_INDEX]``, where ``T_INDEX``
+        runs from 1 (the well's first production month) to ``num_months - 1``. Months
+        through the last actual month are historical (``HISTORICAL`` True): actual
+        production, with 0 for months missing from the data. Later months are the
+        projection: the fitted curve from the month after the last actual month on, never
+        before the curve's ``t0``. Columns ``MAJOR``, ``OIL``, ``GAS``, ``WATER``,
+        ``HISTORICAL`` (and ``P_DATE`` with ``actual_dates``). ``MAJOR`` is the fitted major
+        phase in ratio mode; in three-phase mode it is ``phase_col`` when set, otherwise
+        from the well's EUR GOR (see ``GAS_CUTOFF``).
 
         Args:
             num_months: Forecast horizon in months.
-            denormalize: Scale from the standard lateral length to each well's own.
+            denormalize: Actual volumes and each well's own lateral length; otherwise
+                volumes normalized to full months and the standard lateral length.
             actual_dates: Add a ``P_DATE`` column (populated only on history rows).
             _verbose: Passed to ``run_DCA`` if it has to run.
         """
@@ -2318,185 +2403,131 @@ class decline_curve(StrictAttributes):
         if self._params_dataframe.empty:
             self.run_DCA(_verbose=_verbose)
 
-        t_range = np.array(range(1,num_months))
+        self._flowstream_dataframe = self._build_flowstream(num_months, denormalize, actual_dates)
+        self._flowstream_settings = (num_months, bool(denormalize))
 
-        if self.three_phase_mode:
-            # Three-phase mode: each phase has its own decline curve
-            self._generate_flowstream_three_phase(t_range, num_months, denormalize, actual_dates)
-        else:
-            # Original mode: major phase with ratios
-            self._generate_flowstream_original(t_range, num_months, denormalize, actual_dates)
-
-    def _generate_flowstream_original(self, t_range, num_months, denormalize, actual_dates):
-        """Original flowstream generation using major phase with ratios"""
+    def _history_by_month(self, denormalize, actual_dates=False):
+        """
+        Actual volumes per well and ``T_INDEX`` (1 = first production month), summed per
+        month: raw volumes when ``denormalize``, else normalized ones. Infinite normalized
+        values (zero days on) count as 0.
+        """
         self._dataframe = self._require_data()
-        flow_df = self._params_dataframe[['UID','major','h_length','qi','di','b','t0','minor_ratio','water_ratio']].copy()
-
-        flow_df['T_INDEX'] = flow_df.apply(lambda row: t_range, axis=1)
         if denormalize:
-            flow_df['denormalization_scalar'] = np.where(
-                flow_df['h_length'] > 1,
-                    flow_df['h_length'] / self.STANDARD_LENGTH,
-                    1.0
-                )
+            hist = self._dataframe[
+                [self._uid_col, 'T_INDEX', self._oil_col, self._gas_col, self._water_col]
+            ].rename(columns={
+                self._uid_col: 'UID',
+                self._oil_col: 'OIL',
+                self._gas_col: 'GAS',
+                self._water_col: 'WATER',
+            })
         else:
-            flow_df['denormalization_scalar'] = 1.0
-
-        flow_df['dca_values'] = flow_df.apply(
-            lambda row: np.array(self.arps_decline(t_range, row.qi, row.di, row.b, row.t0)) * row['denormalization_scalar'],
-            axis=1
-        )
-        flow_df['OIL'] = np.where(
-            flow_df['major'] == "OIL",
-            flow_df['dca_values'],
-            flow_df['dca_values'] * flow_df['minor_ratio']
-        )
-        flow_df['GAS'] = np.where(
-            flow_df['major'] == "GAS",
-            flow_df['dca_values'],
-            flow_df['dca_values'] * flow_df['minor_ratio']
-        )
-        flow_df['WATER'] = flow_df['dca_values'] * flow_df['water_ratio']
-
-        self._flowstream_dataframe = flow_df[['UID','major','T_INDEX','OIL','GAS','WATER']].rename(columns={'major':'MAJOR'})
-        self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID','MAJOR']).apply(pd.Series.explode).reset_index()
-        self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
-
-        # Exploded columns are object dtype: convert to numbers, then replace NaN with 0.
+            hist = self._normalized_dataframe[[
+                'UID', 'T_INDEX', 'NORMALIZED_OIL', 'NORMALIZED_GAS', 'NORMALIZED_WATER',
+            ]].rename(columns={
+                'NORMALIZED_OIL': 'OIL',
+                'NORMALIZED_GAS': 'GAS',
+                'NORMALIZED_WATER': 'WATER',
+            })
+        hist = hist.copy()
         for phase in ('OIL', 'GAS', 'WATER'):
-            self._flowstream_dataframe[phase] = pd.to_numeric(self._flowstream_dataframe[phase]).fillna(0)
-
-        self._flowstream_dataframe.replace([np.inf, -np.inf], 0, inplace=True)
-
-        if denormalize:
-            actual_df = self._dataframe[[self._uid_col,'T_INDEX',self._oil_col,self._gas_col,self._water_col]]
-            actual_df = actual_df.rename(columns={
-                self._uid_col:'UID',
-                self._oil_col:'OIL',
-                self._gas_col:"GAS",
-                self._water_col:"WATER"
-            })
-        else:
-            actual_df = self._normalized_dataframe[[
-                'UID',
-                'T_INDEX',
-                'NORMALIZED_OIL',
-                'NORMALIZED_GAS',
-                'NORMALIZED_WATER'
-            ]]
-            actual_df = actual_df.rename(columns={
-                'NORMALIZED_OIL':'OIL',
-                'NORMALIZED_GAS':"GAS",
-                'NORMALIZED_WATER':'WATER'
-            })
-
+            values = pd.to_numeric(hist[phase], errors='coerce').to_numpy(dtype=float)
+            hist[phase] = np.where(np.isfinite(values), values, 0.0)
+        # Well-life month 0 is T_INDEX 1.
+        hist['T_INDEX'] = pd.to_numeric(hist['T_INDEX']).astype(int) + 1
+        agg = {'OIL': 'sum', 'GAS': 'sum', 'WATER': 'sum'}
         if actual_dates:
-            actual_df['P_DATE'] = self._dataframe[self._date_col]
-            self._flowstream_dataframe['P_DATE'] = None
+            hist['P_DATE'] = pd.to_datetime(self._dataframe[self._date_col]).to_numpy()
+            agg['P_DATE'] = 'first'
+        return hist.groupby(['UID', 'T_INDEX'], as_index=False).agg(agg)
 
-        actual_df = actual_df.set_index(['UID', 'T_INDEX'])
+    def _projection(self, t_index, qi, di, b, t0, scalar=1.0):
+        """
+        Fitted rate at flowstream ``T_INDEX`` values (curve time ``T_INDEX - 1``), 0 before
+        ``t0``: the projection does not extend back before the start of its curve.
+        """
+        x = np.asarray(t_index, dtype=float) - 1.0
+        q = np.asarray(self.arps_decline(x, qi, di, b, t0), dtype=float) * scalar
+        return np.where((x >= float(t0)) & np.isfinite(q), q, 0.0)
 
-    def _generate_flowstream_three_phase(self, t_range, num_months, denormalize, actual_dates):
-        """Three-phase flowstream generation with independent decline curves for each phase"""
-        self._dataframe = self._require_data()
-        # Create a list to store all flow data
-        all_flows = []
+    def _three_phase_majors(self, flow) -> pd.Series:
+        """
+        Each well's major phase in three-phase mode: from ``phase_col`` when set,
+        otherwise from its EUR GOR (history plus projection): GAS above ``GAS_CUTOFF``
+        or with no oil, else OIL.
+        """
+        if self._phase_col is not None:
+            return self._normalized_dataframe.groupby('UID')['MAJOR'].first()
+        eur = flow.groupby(level='UID')[['OIL', 'GAS']].sum()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            gor = eur['GAS'] / eur['OIL']
+        return pd.Series(
+            np.where((eur['OIL'] > 0) & (gor <= self.GAS_CUTOFF), 'OIL', 'GAS'), index=eur.index
+        )
 
-        for _, row in self._params_dataframe.iterrows():
-            uid = row['UID']
-            phase = row['phase']
+    def _build_flowstream(self, num_months, denormalize, actual_dates=False):
+        """Historical months followed by the projection; see ``generate_flowstream``."""
+        t_grid = np.arange(1, num_months)
+        n_t = len(t_grid)
+        hist = self._history_by_month(denormalize, actual_dates)
+        params = self._params_dataframe
+        last_actual = hist.groupby('UID')['T_INDEX'].max()
+
+        def scalar_for(row):
             h_length = row['h_length']
-            qi = row['qi']
-            di = row['di']
-            b = row['b']
-            t0 = row['t0']
+            return h_length / self.STANDARD_LENGTH if denormalize and h_length > 1 else 1.0
 
-            # Calculate denormalization scalar
-            if denormalize and h_length > 1:
-                denormalization_scalar = h_length / self.STANDARD_LENGTH
+        uids = list(pd.unique(params['UID']))
+        volumes = {ph: np.zeros((len(uids), n_t)) for ph in ('OIL', 'GAS', 'WATER')}
+        majors = {}
+        row_of = {uid: i for i, uid in enumerate(uids)}
+        for _, row in params.iterrows():
+            i = row_of[row['UID']]
+            if self.three_phase_mode:
+                if row['phase'] in volumes:
+                    volumes[row['phase']][i] = self._projection(
+                        t_grid, row['qi'], row['di'], row['b'], row['t0'], scalar_for(row)
+                    )
             else:
-                denormalization_scalar = 1.0
+                major_q = self._projection(
+                    t_grid, row['qi'], row['di'], row['b'], row['t0'], scalar_for(row)
+                )
+                minor = 'GAS' if row['major'] == 'OIL' else 'OIL'
+                volumes[row['major']][i] = major_q
+                volumes[minor][i] = major_q * np.nan_to_num(float(row['minor_ratio']))
+                volumes['WATER'][i] = major_q * np.nan_to_num(float(row['water_ratio']))
+                majors[row['UID']] = row['major']
 
-            # Calculate DCA values for this phase
-            dca_values = np.array(self.arps_decline(t_range, qi, di, b, t0)) * denormalization_scalar
-
-            # Create flow data for this phase-well combination
-            for t_idx, flow_rate in zip(t_range, dca_values):
-                flow_data = {
-                    'UID': uid,
-                    'T_INDEX': t_idx,
-                    'OIL': 0.0,
-                    'GAS': 0.0,
-                    'WATER': 0.0
-                }
-
-                # Set the flow rate for the appropriate phase
-                if phase == 'OIL':
-                    flow_data['OIL'] = flow_rate
-                elif phase == 'GAS':
-                    flow_data['GAS'] = flow_rate
-                elif phase == 'WATER':
-                    flow_data['WATER'] = flow_rate
-
-                all_flows.append(flow_data)
-
-        # Create the flowstream dataframe
-        if all_flows:
-            self._flowstream_dataframe = pd.DataFrame(all_flows)
-            # Group by UID and T_INDEX to combine the three phase entries (OIL, GAS, WATER) into single rows
-            # This ensures each (UID, T_INDEX) combination appears only once with all phases populated
-            self._flowstream_dataframe = self._flowstream_dataframe.groupby(['UID', 'T_INDEX']).agg({
-                'OIL': 'sum',
-                'GAS': 'sum',
-                'WATER': 'sum'
-            }).reset_index()
-            self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
-        else:
-            self._flowstream_dataframe = pd.DataFrame(columns=['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER'])
-            self._flowstream_dataframe = self._flowstream_dataframe.set_index(['UID', 'T_INDEX'])
-
-        # Replace na values with 0
-        self._flowstream_dataframe['OIL'] = self._flowstream_dataframe['OIL'].fillna(0)
-        self._flowstream_dataframe['GAS'] = self._flowstream_dataframe['GAS'].fillna(0)
-        self._flowstream_dataframe['WATER'] = self._flowstream_dataframe['WATER'].fillna(0)
-
-        # Convert to numeric
-        self._flowstream_dataframe['OIL'] = pd.to_numeric(self._flowstream_dataframe['OIL'])
-        self._flowstream_dataframe['GAS'] = pd.to_numeric(self._flowstream_dataframe['GAS'])
-        self._flowstream_dataframe['WATER'] = pd.to_numeric(self._flowstream_dataframe['WATER'])
-
-        # Replace infinite values
-        self._flowstream_dataframe.replace([np.inf, -np.inf], 0, inplace=True)
-
-        # Handle actual data comparison
-        if denormalize:
-            actual_df = self._dataframe[[self._uid_col,'T_INDEX',self._oil_col,self._gas_col,self._water_col]]
-            actual_df = actual_df.rename(columns={
-                self._uid_col:'UID',
-                self._oil_col:'OIL',
-                self._gas_col:"GAS",
-                self._water_col:"WATER"
-            })
-        else:
-            actual_df = self._normalized_dataframe[[
-                'UID',
-                'T_INDEX',
-                'NORMALIZED_OIL',
-                'NORMALIZED_GAS',
-                'NORMALIZED_WATER'
-            ]]
-            actual_df = actual_df.rename(columns={
-                'NORMALIZED_OIL':'OIL',
-                'NORMALIZED_GAS':"GAS",
-                'NORMALIZED_WATER':'WATER'
-            })
-
+        columns = ['MAJOR', 'OIL', 'GAS', 'WATER', 'HISTORICAL']
         if actual_dates:
-            actual_df['P_DATE'] = self._dataframe[self._date_col]
-            self._flowstream_dataframe['P_DATE'] = None
+            columns.append('P_DATE')
+        if not uids:
+            return pd.DataFrame(columns=['UID', 'T_INDEX'] + columns).set_index(['UID', 'T_INDEX'])
 
-        actual_df = actual_df.set_index(['UID', 'T_INDEX'])
+        n_hist = np.array([int(last_actual.get(uid, 0)) for uid in uids])
+        is_hist = (t_grid[None, :] <= n_hist[:, None]).ravel()
+        index = pd.MultiIndex.from_arrays(
+            [np.repeat(np.asarray(uids, dtype=object), n_t), np.tile(t_grid, len(uids))],
+            names=['UID', 'T_INDEX'],
+        )
+        flow = pd.DataFrame(index=index)
+        if not self.three_phase_mode:
+            flow['MAJOR'] = np.repeat(np.asarray([majors[uid] for uid in uids], dtype=object), n_t)
 
+        # History months: actual volumes (0 for months missing from the data); the
+        # projection fills the months after.
+        hist = hist.set_index(['UID', 'T_INDEX']).reindex(index)
+        for phase in ('OIL', 'GAS', 'WATER'):
+            actual = hist[phase].fillna(0.0).to_numpy(dtype=float)
+            flow[phase] = np.where(is_hist, actual, volumes[phase].ravel())
+        flow['HISTORICAL'] = is_hist
+        if self.three_phase_mode:
+            majors_3p = self._three_phase_majors(flow).to_dict()
+            flow['MAJOR'] = flow.index.get_level_values('UID').map(majors_3p)
+        if actual_dates:
+            flow['P_DATE'] = hist['P_DATE'].where(is_hist)
+        return flow[columns]
 
     def generate_typecurve(
         self,
@@ -2563,57 +2594,16 @@ class decline_curve(StrictAttributes):
 
     def _build_typecurve_flowstream(self, denormalize):
         """
-        Typecurve-only flowstream: historical rates overlaid on forecast.
-
-        Prefers historical OIL/GAS/WATER where present and non-NA; keeps forecast
-        elsewhere. Does not mutate ``_flowstream_dataframe``.
-
-        Historical ``T_INDEX`` from ``month_diff`` starts at 0; forecast / typecurve
-        grid starts at 1. Historical indexes are shifted by +1 before joining so
-        first producing month overlays typecurve time zero (``T_INDEX=1``).
+        Typecurve input: each well's actual history followed by its projection, on the
+        grid of the current ``flowstream_dataframe`` (``T_INDEX=1`` is the first producing
+        month). Uses that flowstream when it was built with the same ``denormalize``;
+        otherwise builds one without changing ``flowstream_dataframe``.
         """
-        forecast = (
-            self._require_flowstream()
-            .reset_index()[['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER']]
-            .copy()
-        )
-        self._dataframe = self._require_data()
-
-        if denormalize:
-            actual_df = self._dataframe[
-                [self._uid_col, 'T_INDEX', self._oil_col, self._gas_col, self._water_col]
-            ].copy()
-            actual_df = actual_df.rename(columns={
-                self._uid_col: 'UID',
-                self._oil_col: 'OIL',
-                self._gas_col: 'GAS',
-                self._water_col: 'WATER',
-            })
-        else:
-            actual_df = self._normalized_dataframe[[
-                'UID',
-                'T_INDEX',
-                'NORMALIZED_OIL',
-                'NORMALIZED_GAS',
-                'NORMALIZED_WATER',
-            ]].copy()
-            actual_df = actual_df.rename(columns={
-                'NORMALIZED_OIL': 'OIL',
-                'NORMALIZED_GAS': 'GAS',
-                'NORMALIZED_WATER': 'WATER',
-            })
-
-        # Align well-life month 0 (history) to forecast/typecurve T_INDEX=1.
-        actual_df = actual_df.copy()
-        actual_df['T_INDEX'] = actual_df['T_INDEX'] + 1
-        actual_df = actual_df.groupby(['UID', 'T_INDEX'], as_index=False)[['OIL', 'GAS', 'WATER']].sum()
-
-        forecast = forecast.set_index(['UID', 'T_INDEX'])
-        actual_df = actual_df.set_index(['UID', 'T_INDEX'])
-        # History wins on overlap; forecast fills gaps. Restrict to forecast index.
-        overlay = actual_df.reindex(forecast.index).combine_first(forecast)
-
-        return overlay.reset_index()[['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER']]
+        flow = self._require_flowstream()
+        settings = self._flowstream_settings
+        if settings is not None and settings[1] != bool(denormalize):
+            flow = self._build_flowstream(settings[0], denormalize)
+        return flow.reset_index()[['UID', 'T_INDEX', 'OIL', 'GAS', 'WATER']]
 
     @staticmethod
     def _tc_model_sum(qi, di, b, t0, t_arr):
@@ -2697,16 +2687,17 @@ class decline_curve(StrictAttributes):
         """
         Map probability labels to well-level EUR targets from ``_oneline``.
 
-        Uses positive finite per-well phase volumes (flowstream life sums). Includes
-        each entry in ``prob_levels`` plus ``'mean'``.
+        Uses positive finite per-well EURs (``EUR_<phase>``: actual history plus
+        projection). Includes each entry in ``prob_levels`` plus ``'mean'``.
         """
         targets: dict = {}
         if self._oneline is None or getattr(self._oneline, "empty", True):
             return targets
-        if phase not in self._oneline.columns:
+        column = f"EUR_{phase}"
+        if column not in self._oneline.columns:
             return targets
 
-        series = pd.to_numeric(self._oneline[phase], errors="coerce")
+        series = pd.to_numeric(self._oneline[column], errors="coerce")
         series = series[np.isfinite(series) & (series > 0)]
         if series.empty:
             return targets
@@ -2840,8 +2831,12 @@ class decline_curve(StrictAttributes):
                 err = objective(di_new)
                 if err <= max(1.0, target * 1e-8):
                     return di_new
-        except Exception:
-            logger.debug("Type-curve decline match failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - reported; keeps the fitted decline
+            warnings.warn(
+                f"Type-curve decline could not be matched to its EUR target ({exc}); "
+                "keeping the fitted decline.",
+                stacklevel=2,
+            )
         return di_guess
 
     def _attach_tc_params_eur_columns(self, param_df, num_months):
@@ -3495,7 +3490,7 @@ class decline_curve(StrictAttributes):
         q = float(self.arps_decline(float(tau), qi0, de, b, 0.0))
         return q if np.isfinite(q) and q >= 0 else max(qi0, 0.0)
 
-    def _adjust_default_fit_to_recent_l3m(self, qi, di, b, t0, x_vals, y_vals):
+    def _adjust_default_fit_to_recent_l3m(self, qi, di, b, t0, x_vals, y_vals, t_ref=None):
         """
         Adjust default-fit ``(qi, di)`` to recent production behavior at fixed ``(b, t0)``.
 
@@ -3506,7 +3501,12 @@ class decline_curve(StrictAttributes):
         - L3M actual <= fitted q at t_mid: bulk shift (scale qi only).
         - L3M actual > fitted q at t_mid and b < 0.1: bulk shift.
         - L3M actual > fitted q at t_mid and b >= 0.1:
-          solve qi/di so q(t_mid)=L3M actual and q(2*t_mid - t0)=base q at same t.
+          solve qi/di so q(t_mid)=L3M actual and q(2*t_mid - t_ref)=base q at same t, i.e. the
+          curve rejoins the fit as far after t_mid as t_mid is after ``t_ref``.
+
+        ``t_ref`` is the start of the fit window (defaults to ``t0``). Anchoring the rejoin point
+        to the data rather than the fitted ``t0`` keeps it fixed when equally good fits place
+        ``t0`` differently.
         """
         qi0 = float(qi)
         di0 = float(di)
@@ -3550,7 +3550,11 @@ class decline_curve(StrictAttributes):
             self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_LOW_B)
             return float(qi_bulk), float(di_bulk)
 
-        tau2 = 2.0 * tau1
+        t_ref = t0 if t_ref is None or not np.isfinite(t_ref) else float(t_ref)
+        t_mid = tau1 + t0
+        tau2 = 2.0 * t_mid - t_ref - t0
+        if tau2 <= tau1:  # window starts at or after the L3M midpoint
+            tau2 = 2.0 * tau1
         q_base_tau2 = self._arps_rate_from_tau(qi0, di0, b0, tau2)
         if not np.isfinite(q_base_tau2) or q_base_tau2 <= 0:
             self._incr_legacy_adjustment(DCA_LEGACY_ADJ_BULK_FALLBACK)

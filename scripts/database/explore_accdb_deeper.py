@@ -46,7 +46,7 @@ def explore_accdb_deeper():
         
         for table_name in tables:
             try:
-                cursor = aries_db.connection.cursor()
+                cursor = aries_db._require_connection().cursor()
                 # Count rows
                 count_query = f"SELECT COUNT(*) FROM {table_name}"
                 cursor.execute(count_query)
@@ -75,7 +75,7 @@ def explore_accdb_deeper():
             
             try:
                 # Get column info
-                cursor = aries_db.connection.cursor()
+                cursor = aries_db._require_connection().cursor()
                 columns = [column.column_name for column in cursor.columns(table=table_name)]
                 print(f"Columns ({len(columns)}): {columns}")
                 

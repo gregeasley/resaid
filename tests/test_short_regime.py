@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -77,6 +79,7 @@ def test_short_regime_takes_prior_regime_eur(fit_method):
     # Regime EUR (produced since the onset + remaining from the tail rate) equals the previous
     # regime's EUR: its actual production to the onset + its fitted curve from the onset on.
     onset = d._short_regime_start(y)
+    assert onset is not None
     produced = y[onset:len(y) - 2].sum() + 0.5 * y[len(y) - 2]
     remaining = _eur(d, r.qi, r.di, r.b)
     if fit_method == "default":
@@ -92,14 +95,6 @@ def _unadjusted_fit(y):
     """Previous-regime Arps fit (qi, di, b) without the L3M adjustment."""
     d = decline_curve()
     d.STAT_FILE = None
-    captured = {}
-    orig = d._adjust_default_fit_to_recent_l3m
-
-    def keep(qi, di, b, t0, x, yy):
-        captured.update(qi=qi, di=di, b=b, t0=t0)
-        return orig(qi, di, b, t0, x, yy)
-
-    d._adjust_default_fit_to_recent_l3m = keep
     df = pd.DataFrame({
         "UID": "W1",
         "DATE": [pd.Timestamp("2018-01-01") + pd.DateOffset(months=i) for i in range(len(y))],
@@ -108,8 +103,12 @@ def _unadjusted_fit(y):
     d.dataframe = df
     d.date_col, d.uid_col = "DATE", "UID"
     d.oil_col, d.gas_col, d.water_col = "OIL", "GAS", "WATER"
-    d.run_DCA()
-    return captured["qi"], captured["di"], captured["b"], captured["t0"]
+    # Spy on the L3M adjustment to capture the fit it receives.
+    with patch.object(d, "_adjust_default_fit_to_recent_l3m",
+                      wraps=d._adjust_default_fit_to_recent_l3m) as spy:
+        d.run_DCA()
+    qi, di, b, t0 = spy.call_args.args[:4]
+    return qi, di, b, t0
 
 
 def test_short_regime_match_can_be_disabled():

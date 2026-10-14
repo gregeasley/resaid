@@ -150,7 +150,8 @@ other phases follow it:
   Finally the L3M adjustment makes the curve pass through the last-three-month average at
   the midpoint of those three months (zero months included): a lower recent rate scales the
   curve down, and a higher one re-solves `qi` and `di` so the curve passes through it and
-  rejoins the fitted curve later. The fitted `b` and `t0` are kept.
+  rejoins the fitted curve as far after that midpoint as the midpoint is after the start of
+  the fit window. The fitted `b` and `t0` are kept.
 - `"monotone_two_step"`: Fits the longest monotone decline segment, then applies the same
   L3M adjustment (or short-regime EUR match) as the default method. If the segment cannot be
   fit, it tries looser windows, ending with the decline from the first production peak.
@@ -207,6 +208,9 @@ econ = well_econ(verbose=False)
 econ.flowstreams = dca.flowstream_dataframe.reset_index()
 econ.flowstream_uwi_col = 'UID'
 econ.flowstream_t_index = 'T_INDEX'
+# A decline_curve flowstream covers the whole well life (actuals, then the projection).
+# Evaluate only the projection, e.g. for remaining PDP value:
+econ.projection_only = True
 
 # Header data: one row per well
 header_data = pd.DataFrame({
@@ -221,7 +225,7 @@ econ.wi_col = 'WI'
 econ.nri_col = 'NRI'
 econ.capex_col = 'CAPEX'
 
-# Prices: scalars, or Python lists of monthly prices (last value is held)
+# Prices: scalars, or monthly prices as a list/array/Series (last value is held)
 econ.oil_pri = 70.0      # $/bbl
 econ.gas_pri = 3.0       # $/Mcf
 
@@ -265,21 +269,25 @@ econ.scale_base = 5280
 
 # CAPEX: capex_col takes priority; otherwise scale_capex uses
 # capex_val * scale_column (e.g. $/ft when scale_column is in feet);
-# otherwise capex_val is a flat amount. CAPEX is charged in the first month.
+# otherwise capex_val is a flat amount (no header_data needed). CAPEX is charged at
+# spud: the first month, or the first month after the t_start_column delay.
 econ.capex_col = None
 econ.scale_capex = True
 econ.capex_val = 1000            # $/ft of lateral
 
-# Royalty: from wi_col/nri_col (royalty = 1 - NRI/WI), a royalty_col,
-# or the scalar econ.royalty. owned_royalty_col adds an owned royalty interest
-# (used together with wi_col and nri_col).
+# Royalty: from wi_col/nri_col (royalty = 1 - NRI/WI); from wi_col, nri_col,
+# royalty_col and owned_royalty_col (an owned royalty interest) together; from
+# royalty_col alone; or the scalar econ.royalty. Combinations that would leave a
+# setting unused (e.g. wi_col without nri_col) raise a ValueError.
 econ.royalty_col = 'ROYALTY_RATE'
 econ.owned_royalty_col = 'OWNED_ROY'
 
-# Timing: months from spud to first production, and per-well start months
-# (both need a MAJOR column in the flowstream; ratio-mode flowstreams have one)
+# Timing: a per-well delay before spud (months, from header_data), then months from
+# spud to first production. Both are inserted as months with no volume or operating
+# expense, so they delay and discount the well's cashflow. Both need a MAJOR column in
+# the flowstream (decline_curve flowstreams have one).
+econ.t_start_column = 'SPUD_MONTH'   # integer month offsets in header_data
 econ.spud_to_online = 3
-econ.t_start_column = 'FIRST_PROD_MONTH'   # integer month offsets in header_data
 ```
 
 #### Economic Outputs
@@ -297,14 +305,20 @@ flowstream columns plus:
 Volumes and cashflows are zeroed after the economic limit, which is the last month with
 positive discounted cashflow.
 
+A well missing from `header_data`, or with a blank value in a configured header column,
+falls back to defaults (no scaling, start delay or header CAPEX; WI 1 and the scalar
+royalty) with a warning naming the well.
+
 **Economic Indicators** (`econ.indicators`, one row per well):
 - `UWI`: well identifier
 - `EURO`, `EURG`, `EURW`: oil, gas, and water volumes to the economic limit
 - `REVENUE`, `ROYALTY`, `OPEX`, `TAXES`, `CAPEX`, `FCF`: undiscounted totals
 - `DCF`: discounted net cashflow at `discount_rate` (the NPV)
-- `IRR`: annualized internal rate of return, as a fraction; 0 if it cannot be computed
-- `ROI`: undiscounted `FCF / CAPEX + 1`
-- `PAYOUT`: month index of the first positive cumulative cashflow; 0 also means "never pays out"
+- `IRR`: annualized internal rate of return, as a fraction; 0 when undiscounted cashflow is
+  negative, NaN when no rate can be found (e.g. no negative cashflow, so nothing is invested)
+- `ROI`: undiscounted `FCF / CAPEX + 1`; NaN without CAPEX
+- `PAYOUT`: month index (row of the cashflow, counting delay months) of the first positive
+  cumulative cashflow; NaN when the well never pays out
 - `BREAKEVEN`: breakeven price estimate ($/bbl or $/Mcf): (discounted revenue − `DCF`) / phase volume
 - `BREAKEVEN_PHASE`: `OIL` or `GAS`. It is `GAS` when the GOR exceeds 3.2 Mcf/bbl; set `econ.breakeven_phase` to override it.
 
@@ -322,7 +336,10 @@ Optional columns:
   treated as horizontal
 - **Producing days** (`dayson_col`): volumes are normalized to 30.4 days per month
   (default 30.4 when not given)
-- **Major phase** (`phase_col`): `OIL` or `GAS`, overriding the GOR classification
+- **Major phase** (`phase_col`): `OIL` or `GAS` per well, overriding the GOR
+  classification. It is a property of the well: every row of a well must give the same
+  value (case and surrounding spaces are ignored, blank rows take the well's value), or
+  `run_DCA()` raises a `ValueError` naming the wells
 
 The examples in `examples/input_data/` show the expected format:
 
@@ -383,7 +400,8 @@ Inputs are checked before use, and a missing or misnamed input raises `ValueErro
 
 ### Economic Parameters
 
-- `oil_pri`, `gas_pri`: prices (scalar or list of monthly prices)
+- `oil_pri`, `gas_pri`: prices: a scalar, or monthly prices as a list, tuple, numpy array or
+  Series (extended with the last price when shorter than the forecast)
 - `discount_rate`: monthly discount rate (required)
 - `opc_t`, `opc_oil`, `opc_gas`, `opc_water`: fixed ($/month) and variable operating costs
 - `sev_oil`, `sev_gas`: severance tax rates; `atx`: ad valorem tax rate
@@ -399,9 +417,11 @@ One row per well. The columns depend on the mode.
 | Column | Mode | Meaning |
 |---|---|---|
 | `UID` | both | Well identifier |
-| `OIL`, `GAS`, `WATER` | both | Modeled volume over the horizon: the sum of the well's flowstream (`T_INDEX` 1 to `num_months - 1`) |
+| `HIST_OIL`, `HIST_GAS`, `HIST_WATER` | both | Actual production through the last actual month |
+| `PROJ_OIL`, `PROJ_GAS`, `PROJ_WATER` | both | Projection from the month after the last actual month to the horizon (`num_months`) |
+| `EUR_OIL`, `EUR_GAS`, `EUR_WATER` | both | `HIST_*` + `PROJ_*` |
 | `T0_DATE` | both | Date of the fitted decline start |
-| `MAJOR` | ratio | Major phase (OIL/GAS) |
+| `MAJOR` | both | Major phase (OIL/GAS); in three-phase mode as in the flowstream |
 | `IPO`, `IPG` | ratio | Initial rates `qi` (monthly volume) of the oil and gas curves |
 | `DE`, `B` | ratio | Nominal monthly initial decline and b-factor of the major phase |
 | `MINOR_RATIO`, `WATER_RATIO` | ratio | Phase ratios (see Ratio Mode) |
@@ -410,15 +430,30 @@ One row per well. The columns depend on the mode.
 
 ### Flowstream Results
 
-Monthly forecasts from the start of each well's history (`T_INDEX` 1 to `num_months - 1`):
+Monthly volumes over each well's life, `T_INDEX` 1 (the first production month) to
+`num_months - 1`:
 
 - DataFrame indexed by `[UID, T_INDEX]` (use `.reset_index()` for columns)
-- Columns `OIL`, `GAS`, `WATER` (monthly volumes), plus `MAJOR` in ratio mode
+- Columns `MAJOR`, `OIL`, `GAS`, `WATER` (monthly volumes) and `HISTORICAL`, plus `P_DATE`
+  (history rows) with `actual_dates=True`. `MAJOR` is the fitted major phase in ratio
+  mode; in three-phase mode it is `phase_col` when set, otherwise GAS when the well's EUR
+  GOR (history plus projection) is above `GAS_CUTOFF` (3.2 Mcf/bbl) or it has no oil.
+- History rows (`HISTORICAL` True) are actual production through the last actual month,
+  with 0 for months missing from the data. Later rows are the projection: the fitted curve
+  from the month after the last actual month. The projection never extends before the
+  curve's `t0`, and does not replace actual months.
+- Volumes follow `denormalize`: actual volumes and each well's lateral, or volumes
+  normalized to full months and the standard lateral.
+
+The flowstream and oneline volumes start the projection at the end of history. The
+exports keep their own anchors: ARIES and Mosaic start at the last actual month, and
+PhdWin starts the curve at its `t0` (`T0_DATE`).
 
 ### Typecurve Results
 
-`generate_typecurve(num_months, denormalize, prob_levels=[0.1, 0.5, 0.9])` combines each
-well's history (where available) with its forecast. It then computes, for each month:
+`generate_typecurve(num_months, denormalize, prob_levels=[0.1, 0.5, 0.9])` uses each
+well's flowstream: its actual history, then its projection, aligned on the first production
+month (`T_INDEX` 1). It then computes, for each month:
 
 - `dca.typecurve`: indexed by `T_INDEX`, with columns `(phase, level)` for OIL/GAS/WATER at each
   quantile in `prob_levels` and `'mean'`. Levels are quantiles of the well rates, so `0.1`
@@ -426,7 +461,7 @@ well's history (where available) with its forecast. It then computes, for each m
 - With `return_params=True`: `dca.tc_params` holds Arps parameters for each phase and level
   (`rate_t0`, `peak_rate`, `time_to_peak_months`, `matched_b_factor`, nominal/tangent/secant
   declines, and `curve_eur`). The decline is tuned so `curve_eur` matches the same quantile
-  of the per-well EURs.
+  of the per-well EURs (`EUR_*` in the oneline).
 - With `return_params_flowstream=True`: `dca.tc_params_flowstream` holds the monthly rates
   rebuilt from those parameters.
 
@@ -548,7 +583,11 @@ with ARIESDatabase("path/to/database.accdb") as db:     # closes the connection 
 
 `prepare_data_for_dca` returns one row per well and month with `WELL_ID`, `DATE`, `OIL`,
 `GAS`, `WATER`, plus any header fields that were read: `PHASE`, `LENGTH`, `DAYSON`, `FIELD`, `OPERATOR`.
-`run_dca_analysis` uses `PHASE` (when it is OIL or GAS), `LENGTH` and `DAYSON` in the fit.
+`run_dca_analysis` uses `PHASE` (when it is OIL or GAS), `LENGTH` and `DAYSON` in the fit,
+and builds each well's oneline in actual volumes (scaled back from the standard lateral to the
+well's `LENGTH`), which `export_results` writes. Extra keyword arguments are `decline_curve`
+settings applied to every well, e.g. `db.run_dca_analysis(data, fit_method="monotone_two_step")`;
+a name `decline_curve` does not define raises `AttributeError` before any well is run.
 
 **Specifying tables and columns.** `AC_PROPERTY` fields are user-defined in ARIES, and other
 tables and columns may be named differently in your database. Map RESAID fields to your
@@ -586,9 +625,10 @@ dca_data = db.prepare_data_for_dca()
 - Pass `header_columns={}` to skip the header table.
 
 Other notes:
-- `export_format="phdwin"` currently fails through this interface. Call
-  `generate_phdwin_export()` on each `decline_curve` in `results` instead.
-- `export_results` writes one file per well (`{well_id}_aries_export.txt`, etc.) and returns `{well_id: path}`.
+- `export_results` takes `export_format` `"aries"`, `"mosaic"` or `"phdwin"` (any other value
+  raises `ValueError`), creates `output_dir` if needed, writes one file per well
+  (`{well_id}_aries_export.txt`, `_mosaic_export.xlsx`, `_phdwin_export.csv`) and returns
+  `{well_id: path}`. A well whose export fails is skipped with a warning.
 
 **PhdWin** (experimental): TopSpeed files (`.phd`, `.mod`, `.tps`, `.phz`) are converted
 to a temporary SQLite database with pytopspeed-modernized. The converted tables
@@ -630,7 +670,8 @@ conda install -c conda-forge "pandas-stubs=3.0" "scipy-stubs=1.18" types-python-
 The test suite passes on pandas 2.3 and 3.0 (NumPy 2.3/2.5, SciPy 1.16/1.18, statsmodels
 0.14/0.15).
 
-The remaining errors in `resaid/` correspond to the Known Issues below.
+basedpyright reports no errors in the repository (package, tests and scripts), and CI
+runs the tests on pandas 3 and on pandas 2.3.
 
 Developer scripts for manual checks against local reference data live in `scripts/`
 (run from the repository root), for example:
@@ -644,40 +685,15 @@ python scripts/validate_three_phase.py
 
 Release notes are in `CHANGELOG.md`.
 
-These are known in 0.4.1 and scheduled for a follow-up release:
+These are known and scheduled for a follow-up release:
 
-DCA and exports:
-- **L3M upside convergence depends on `t0`**: when the last-three-month average is above the
-  fitted curve, the L3M adjustment rejoins the fitted curve at twice the elapsed time since
-  `t0`. Equally good fits can place `t0` differently, so that rejoin point, and the forecast,
-  can shift slightly between NumPy/SciPy versions: within 0.4% EUR for the default method in
-  testing, and up to about 6% for one poorly determined phase with `monotone_two_step`.
-- **Database exports use normalized volumes**: `run_dca_analysis` builds onelines without
-  denormalizing, so for wells with a header lateral length, `export_results` writes rates
-  scaled to 5,280 ft rather than the well's actual lateral. A 10,560 ft well exports about
-  half its actual rate. This became visible in 0.4.0, when header data started reaching the
-  fit. Until fixed, call `generate_oneline(denormalize=True)` on each result before exporting.
+None at present.
 
-Database interface:
-- **PhdWin export via the database interface**: `export_results(export_format="phdwin")` fails
-  for every well. Call `generate_phdwin_export()` on each `decline_curve` instead.
-- **Nested output folders**: `export_results(output_dir=...)` cannot create a folder whose
-  parent does not exist.
-- **Unsupported export formats are not rejected**: an unknown `export_format` gives one warning
-  per well and an empty result instead of an error.
-- **PhdWin temporary files**: a failed PhdWin conversion leaves an empty temporary `.sqlite`
-  file behind.
-- **JPype side effect**: when pyodbc fails and `jpype` is installed, `connect()` starts a Java
-  VM without UCanAccess, which cannot be restarted later in the same process.
+### Future improvements
 
-Economics:
-- **IRR failures are recorded as 0**: if the IRR solve does not converge, `IRR` is reported as
-  0 rather than flagged.
-- **PAYOUT ambiguity**: `PAYOUT` is 0 both for wells that pay out in the first month and for
-  wells that never pay out.
-- **Price arrays**: `oil_pri`/`gas_pri` accept scalars or Python lists, but not numpy arrays.
-- **`t_start_column` timing**: with `spud_to_online` also set, one non-producing month is
-  charged the fixed operating cost (`opc_t`).
+- **Daily production**: resaid works on monthly data; fits, flowstreams, exports and
+  economics all assume monthly periods. Setting `input_monthly = False` raises
+  `NotImplementedError`.
 
 ## Contributing
 

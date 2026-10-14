@@ -1,5 +1,133 @@
 # Changelog
 
+## 0.4.2
+
+### Upgrade notes
+This release changes outputs and makes several silent behaviors errors:
+- The oneline `OIL`, `GAS` and `WATER` columns are replaced by `HIST_*`, `PROJ_*` and
+  `EUR_*` (see Fixed). Scripts that read `OIL`/`GAS`/`WATER` from `oneline_dataframe`
+  should use `EUR_*` (or `PROJ_*` for remaining volumes).
+- `flowstream_dataframe` now holds actual production for history months and gains a
+  `HISTORICAL` column. Econ run on it covers the whole well life by default; set
+  `well_econ.projection_only = True` for the projection only.
+- Type-curve parameters (`tc_params`) change, in some cases substantially: their EUR
+  targets were taken from the incorrect oneline totals.
+- `phase_col` must give each well a single OIL or GAS value; otherwise `run_DCA()` raises.
+- Econ settings that would be ignored raise `ValueError`, and missing or blank header
+  values warn (see Changed). `IRR`, `PAYOUT` and `ROI` are NaN, not 0 or infinite, when
+  they cannot be computed. CAPEX is charged at spud, after any `t_start_column` delay.
+- Database: `run_dca_analysis` exports are in actual volumes, its extra keyword
+  arguments are applied, and `prepare_data_for_dca` rejects unknown arguments.
+- `input_monthly = False` raises `NotImplementedError`.
+- Forecasts change slightly where the L3M upside adjustment applies (rejoin point).
+
+### Fixed
+- **Flowstream history and projection.** The flowstream was the fitted curve evaluated
+  from the well's first month, never actual production: over history it held the curve
+  instead of actuals, and before the curve's `t0` (late fits after a step change or late
+  peak) the curve projected backward, which grows without bound near its pole. The
+  oneline `OIL`/`GAS`/`WATER` totals were sums of this, so they were not EURs (in the
+  sample data, -20% to +160% off on the default method, and 0.9 million vs 0.33 million
+  bbl on one `monotone_two_step` well), and econ run on the flowstream included the same
+  months. The original design overlaid actuals on the curve; that step was lost in an
+  earlier refactor. Now:
+  - History months (through the last actual month) are actual production (0 for months
+    missing from the data), marked `HISTORICAL`; the projection starts the month after
+    and never extends before `t0`.
+  - `T_INDEX` 1 is the first production month and the projection at `T_INDEX` t is the
+    curve at well month t - 1, matching the history. Previously the curve at month t was
+    placed at `T_INDEX` t, so the first production month was missing.
+  - The oneline reports `HIST_*` (actual to date), `PROJ_*` (projection from the end of
+    history) and `EUR_*` (their sum) for oil, gas and water.
+  - `actual_dates=True` fills `P_DATE` on history rows (it had no effect).
+- **Major phase is per well.** `phase_col` was read row by row, and ratio mode grouped a
+  well's months by well *and* phase label, so a well whose phase label differed between
+  months was split into one fit per label, each on only the months with that label, and
+  appeared once per label in the oneline and exports. A value other than OIL/GAS dropped
+  the well silently. `run_DCA()` now takes one phase per well (ignoring case and
+  surrounding spaces; blank rows take the well's value) and raises a `ValueError` naming
+  any well whose phase is missing, not OIL or GAS, or differs between rows.
+- **Type curves.** They overlaid history on the curve but placed history one month later
+  than the curve, skipping one projected month where they met, and filled months missing
+  from the data with the backward projection. They now use the flowstream. Their EUR
+  targets (`curve_eur` in `tc_params`) were quantiles of the broken oneline totals; they
+  now use `EUR_*`. Type-curve parameters change, in some cases substantially.
+- **Database exports in actual volumes.** `run_dca_analysis` built each well's oneline in
+  volumes normalized to the 5,280 ft standard lateral, and `export_results` wrote those, so
+  a 10,560 ft well exported about half its rate. Onelines are now denormalized to each
+  well's `LENGTH`.
+- `export_results(export_format="phdwin")` failed for every well; it now writes
+  `{well_id}_phdwin_export.csv`.
+- `export_results` creates nested `output_dir` folders, and an unsupported `export_format`
+  raises `ValueError` up front instead of one warning per well and an empty result. The
+  format is matched case-insensitively.
+- A failed PhdWin conversion no longer leaves an empty temporary `.sqlite` file behind.
+- `connect()` no longer starts a Java VM. The JPype/UCanAccess connection was a placeholder
+  that never connected, and a JVM cannot be restarted in the same process; it is removed,
+  along with the unused `jpype1` dependency in the `database` extra.
+- **L3M upside rejoin point.** When the last-three-month average is above the fit, the
+  re-solved curve rejoined the fit at twice the time from the fitted `t0` to the L3M
+  midpoint, so equally good fits with different `t0` gave different forecasts. The rejoin
+  point is now measured from the start of the fit window: same distance after the midpoint
+  as the midpoint is after the window start. Unchanged when the fit puts `t0` at the window
+  start; otherwise forecasts move by under 2% for most affected wells. Accuracy against
+  synthetic truth is unchanged. Applies to both fit methods.
+- **Economics timing.**
+  - The economic limit (a row position) was compared with `T_INDEX`, which starts at 1 in
+    `decline_curve` flowstreams, so the last month before the limit was zeroed. Every run
+    lost one producing month.
+  - `t_start_column` without `spud_to_online` shifted `T_INDEX` but inserted no delay
+    months, so the start delay had no effect on cashflow or discounting. Both delays now
+    insert months with no volume.
+  - Delay months were charged the fixed operating cost (`opc_t`) in one month; they now
+    carry no operating expense. `T_INDEX` stays contiguous (it could repeat a value).
+  - CAPEX is charged at spud, the first month after the `t_start_column` delay, instead of
+    the first month of the delay.
+- `oil_pri` and `gas_pri` accept numpy arrays, tuples and Series as well as lists.
+- A flat `capex_val` was charged only to wells in `header_data`; with no header data, or
+  for a well missing from it, CAPEX was 0. It now applies to every well.
+
+### Added
+- `well_econ.projection_only` evaluates only the projection rows of a flowstream (e.g.
+  remaining PDP value).
+- Three-phase flowstreams and onelines have a `MAJOR` column: `phase_col` when set,
+  otherwise from the well's EUR GOR. Econ's `spud_to_online` and `t_start_column`, which
+  need it, now work with three-phase flowstreams.
+- `run_dca_analysis(**settings)` applies `decline_curve` settings to every well (e.g.
+  `fit_method="monotone_two_step"`); they were accepted and ignored.
+
+### Changed
+- **No silent fallbacks.**
+  - Econ: a well missing from `header_data`, or a blank header value, now warns (naming
+    the well) when it falls back to defaults. Settings that would be ignored raise a
+    `ValueError`: `scale_forecast`/`scale_capex` without `scale_column`, `scale_capex`
+    without `capex_val` or `capex_col`, `wi_col` without `nri_col` (or the reverse),
+    `owned_royalty_col` without `wi_col`/`nri_col`/`royalty_col`, and `royalty_col` with
+    `wi_col`/`nri_col` but no `owned_royalty_col`.
+  - DCA: a failed outlier screen, short-regime EUR solve or type-curve decline match now
+    warns, naming the fallback used. They were logged at debug level only.
+  - `prepare_data_for_dca` no longer accepts (and ignores) unknown keyword arguments; a
+    misspelled argument raises `TypeError`.
+  - `input_monthly = False` raises `NotImplementedError`: daily production was never
+    supported (see Future improvements in the README).
+- `ROI` is NaN instead of infinite when a well has no CAPEX.
+- `IRR` is NaN instead of 0 when it cannot be solved (e.g. no negative cashflow). If
+  Newton's method does not converge, the rate is now found by bracketing (Brent's method)
+  before giving up. `npv_calc.get_irr()` returns NaN instead of raising. It is still 0
+  when the undiscounted cashflow sum is negative.
+- `PAYOUT` is NaN instead of 0 for wells that never pay out, so 0 means only "pays out
+  in the first month".
+- `well_econ.generate_capex()` takes an optional `capex_point`.
+
+### Internal
+- No basedpyright errors anywhere in the repository: `well_econ` settings and
+  `arps_decline` (float in, float out; array in, array out) are typed, so assigning a
+  price or indexing a curve no longer shows as an error in editors; tests check optional
+  results explicitly.
+- `scripts/database/check_aries_interface.py` called reader methods that do not exist;
+  it now uses `read_table_data`.
+- CI adds a pandas 2.x job alongside pandas 3.
+
 ## 0.4.1
 
 ### Upgrade notes

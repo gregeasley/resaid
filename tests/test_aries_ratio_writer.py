@@ -31,6 +31,7 @@ def _wells(path):
         if not line.startswith(" "):
             current = wells.setdefault(line.strip(), [])
         else:
+            assert current is not None, f"forecast line before any well: {line!r}"
             current.append(line[:80].strip())
     return wells
 
