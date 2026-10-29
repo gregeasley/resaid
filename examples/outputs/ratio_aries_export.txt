@@ -1,27 +1,27 @@
 WELL_001                                                                                     
  PRODUCTION                                                                                  
   START      03/2021                                                                   RSC425
-  OIL        89.0 X B/M 6 EXP B/0.99 27.04                                             RSC425
+  OIL        90.0 X B/M 6 EXP B/0.99 26.14                                             RSC425
   "          X X B/M 99 YRS EXP 6                                                      RSC425
-  GAS        244.0 X M/M 6 EXP B/0.99 27.04                                            RSC425
+  GAS        248.0 X M/M 6 EXP B/0.99 26.14                                            RSC425
   "          X X M/M 99 YRS EXP 6                                                      RSC425
-  WTR        174.0 X M/M 6 EXP B/0.99 27.04                                            RSC425
+  WTR        177.0 X M/M 6 EXP B/0.99 26.14                                            RSC425
   "          X X M/M 99 YRS EXP 6                                                      RSC425
 WELL_002                                                                                     
  PRODUCTION                                                                                  
   START      03/2021                                                                   RSC425
-  OIL        130.0 X B/M 6 EXP B/0.99 24.02                                            RSC425
+  OIL        132.0 X B/M 6 EXP B/0.99 22.54                                            RSC425
   "          X X B/M 99 YRS EXP 6                                                      RSC425
-  GAS        521.0 X M/M 6 EXP B/0.99 24.02                                            RSC425
+  GAS        527.0 X M/M 6 EXP B/0.99 22.54                                            RSC425
   "          X X M/M 99 YRS EXP 6                                                      RSC425
-  WTR        222.0 X M/M 6 EXP B/0.99 24.02                                            RSC425
+  WTR        224.0 X M/M 6 EXP B/0.99 22.54                                            RSC425
   "          X X M/M 99 YRS EXP 6                                                      RSC425
 WELL_003                                                                                     
  PRODUCTION                                                                                  
   START      03/2021                                                                   RSC425
-  OIL        67.0 X B/M 6 EXP B/0.99 30.14                                             RSC425
+  OIL        66.0 X B/M 6 EXP B/0.99 27.66                                             RSC425
   "          X X B/M 99 YRS EXP 6                                                      RSC425
-  GAS        153.0 X M/M 6 EXP B/0.99 30.14                                            RSC425
+  GAS        151.0 X M/M 6 EXP B/0.99 27.66                                            RSC425
   "          X X M/M 99 YRS EXP 6                                                      RSC425
-  WTR        128.0 X M/M 6 EXP B/0.99 30.14                                            RSC425
+  WTR        127.0 X M/M 6 EXP B/0.99 27.66                                            RSC425
   "          X X M/M 99 YRS EXP 6                                                      RSC425

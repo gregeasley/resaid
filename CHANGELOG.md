@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.3
+
+### Upgrade notes
+- Default-method fits change for most wells: b is now selected toward `b_prior`, and `t0`
+  is the start of the fit window rather than a fitted value (see Changed). Set
+  `b_prior_tolerance = None` to keep the previous fit. `monotone_two_step` and type curves
+  are unaffected.
+- `run_DCA()` raises `ValueError` if `b_prior` is set outside `min_h_b`..`max_h_b`.
+
+### Changed
+- **b-factor selection (default fit).** The least-squares b usually sat on `min_h_b` or
+  `max_h_b`: monthly data rarely distinguish b values, and the fit's weighting decided which
+  bound. On 586 horizontal wells (bounds 0.5-1.3), 83 % of fits were at a bound; with b
+  unbounded, the best fit was below 0.1 or above 2 for 64 %. Each b on a grid is now fit (qi
+  and di on log rates, t0 at the window start), and among the b within `b_prior_tolerance`
+  (2 %) of the best fit, the one closest to `b_prior` is used. 89 % of those fits then land
+  inside the bounds, and a 12-month hindcast improves (median bias +3.3 % -> -0.3 %, 90th
+  percentile absolute error 41 % -> 33 %). Fits change for most wells; b moves toward
+  `b_prior` where the data cannot tell b values apart. This fit replaces the weighted
+  `curve_fit` of all four parameters, which remains the fallback when no b on the grid can
+  be fit; with `t0` fixed at the window start, the L3M upside rejoin point no longer depends
+  on a fitted `t0`. `monotone_two_step` and type-curve (`force_t0`) fits are unchanged.
+
+### Added
+- `decline_curve.b_prior` (default: midpoint of `min_h_b` and `max_h_b`),
+  `b_prior_tolerance` (default 0.02; `None` restores the plain least-squares b) and
+  `b_prior_step` (default 0.05). `run_DCA()` raises `ValueError` if `b_prior` is outside the
+  b bounds.
+
 ## 0.4.2
 
 ### Upgrade notes

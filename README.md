@@ -76,6 +76,8 @@ dca.dayson_col = 'DaysOn'             # optional: normalize to 30.4 producing da
 # Analysis parameters
 dca.min_h_b = 0.9
 dca.max_h_b = 1.3
+dca.b_prior = 1.1                 # b used where the data cannot tell b values apart
+                                  # (default: midpoint of min_h_b and max_h_b)
 dca.backup_decline = True
 
 # Step changes (restims, recompletions): fit only the latest regime after a
@@ -146,8 +148,11 @@ other phases follow it:
 `decline_curve(fit_method=...)` selects how each well is fit:
 
 - `"default"`: Starts at the first production peak, or at the latest step-up regime. Removes
-  zero months and statistical outliers, then runs a weighted `curve_fit` of Arps parameters.
-  Finally the L3M adjustment makes the curve pass through the last-three-month average at
+  zero months and statistical outliers, then fits the Arps curve with `t0` at the start of the
+  fit window: for each b on a grid within `min_h_b`..`max_h_b`, `qi` and `di` are fit to the
+  log rates, and among the b values that fit within `b_prior_tolerance` of the best, the one
+  closest to `b_prior` is used (see DCA Parameters). If no b can be fit this way, a weighted
+  `curve_fit` of all four parameters is used instead. Finally the L3M adjustment makes the curve pass through the last-three-month average at
   the midpoint of those three months (zero months included): a lower recent rate scales the
   curve down, and a higher one re-solves `qi` and `di` so the curve passes through it and
   rejoins the fitted curve as far after that midpoint as the midpoint is after the start of
@@ -381,6 +386,15 @@ Inputs are checked before use, and a missing or misnamed input raises `ValueErro
 ### DCA Parameters
 
 - `min_h_b`, `max_h_b`: b-factor bounds for the fit (all wells; defaults 0.99 and 2.0)
+- `b_prior`, `b_prior_tolerance`, `b_prior_step`: b-factor selection in the default fit.
+  Monthly data rarely pin b down, so the least-squares b tends to sit on a bound. Each b on a
+  `b_prior_step` grid (default 0.05) is fit (qi and di on log rates, `t0` at the window start);
+  among the b whose fit is within `b_prior_tolerance` (default 0.02, i.e. 2 %) of the best, the
+  one closest to `b_prior` is used, so b moves off `b_prior` only where the data clearly favor
+  another value. `b_prior` defaults to the midpoint of `min_h_b` and `max_h_b` (about 1.5 with
+  the default bounds) and must lie within them, or `run_DCA()` raises `ValueError`. Set
+  `b_prior_tolerance = None` for the previous behavior: a weighted least-squares fit of all
+  four parameters. `monotone_two_step` and type-curve fits do not use these settings.
 - `MIN_DECLINE_RATE`: terminal decline, nominal per month (default 8%/yr)
 - `GAS_CUTOFF`: GOR (Mcf/bbl) above which a well's major phase is GAS (default 3.2)
 - `STANDARD_LENGTH`: lateral length that horizontal wells are normalized to (default 5,280 ft)

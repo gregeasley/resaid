@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from dateutil.relativedelta import relativedelta
-from scipy.optimize import curve_fit, minimize_scalar
+from scipy.optimize import curve_fit, least_squares, minimize_scalar
 from scipy.signal import argrelextrema
 from tqdm import tqdm
 
@@ -147,6 +147,8 @@ class decline_curve(StrictAttributes):
         default_initial_decline: Initial decline for backup fits (``backup_decline``)
         default_b_factor: b-factor for backup fits (``backup_decline``)
         min_h_b, max_h_b: b-factor bounds used when fitting (all wells)
+        b_prior, b_prior_tolerance, b_prior_step: b-factor selection in the default fit
+            (see ``_b_prior_refit``)
         backup_decline: Give failed fits a backup decline instead of NaN parameters
         outlier_correction, iqr_limit: Ratio mode only; cap high minor/water ratios
             with an IQR rule
@@ -182,6 +184,14 @@ class decline_curve(StrictAttributes):
         self.iqr_limit = 1.5
         self.min_h_b = .99
         self.max_h_b = 2.0
+        # b-factor selection (default fit): monthly data rarely pins b down, so the least-squares
+        # b tends to sit on min_h_b or max_h_b.  Among the b values (``b_prior_step`` grid) whose
+        # fit is within ``b_prior_tolerance`` of the best, the one closest to ``b_prior`` is used;
+        # b departs from b_prior only where the data clearly favor another value.  b_prior None =
+        # midpoint of min_h_b and max_h_b; b_prior_tolerance None = the plain least-squares b.
+        self.b_prior = None
+        self.b_prior_tolerance = 0.02
+        self.b_prior_step = 0.05
 
         self.backup_decline = False
         self.qi_tail_points = 3
@@ -1522,6 +1532,59 @@ class decline_curve(StrictAttributes):
         s["water_ratio"] = water_ratio
         return s
 
+    def _b_prior_value(self, b_min, b_max):
+        """``b_prior`` (validated against the b bounds), or the bounds' midpoint when unset."""
+        if self.b_prior is None:
+            return (float(b_min) + float(b_max)) / 2.0
+        b = float(self.b_prior)
+        if not (np.isfinite(b) and float(b_min) - 1e-9 <= b <= float(b_max) + 1e-9):
+            raise ValueError(f"b_prior {self.b_prior!r} must lie within min_h_b..max_h_b "
+                             f"({b_min}..{b_max})")
+        return b
+
+    def _b_prior_refit(self, x, y, p0, bounds_low, bounds_high):
+        """
+        b-factor selection toward ``b_prior`` (see ``__init__``).
+
+        For each b on a ``b_prior_step`` grid over the b bounds (plus ``b_prior`` itself), fit qi
+        and di by least squares on log rates with t0 at the start of the fit window; di may range
+        from 1/20 to 20 times its initial estimate so b does not have to absorb the curvature.
+        Among the b whose sum of squared log residuals is within ``b_prior_tolerance`` (a
+        fraction) of the best, the one closest to ``b_prior`` is returned as (qi, di, b, t0).
+        Returns None when no b could be fit (the caller keeps its least-squares parameters).
+        """
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        b_min, b_max = float(bounds_low[2]), float(bounds_high[2])
+        b_ref = self._b_prior_value(b_min, b_max)
+        if b_max <= b_min or len(x) < 4 or np.any(y <= 0):
+            return None
+        t0 = float(bounds_low[3])
+        ly = np.log(y)
+        di0 = float(p0[1]) if np.isfinite(p0[1]) and p0[1] > 0 else 0.1
+        d_lo, d_hi = max(di0 / 20.0, 1e-6), max(di0 * 20.0, 2e-6)
+        q_lo, q_hi = min(float(bounds_low[0]), float(y.min())), max(float(bounds_high[0]), 1.1 * float(y.max()))
+        start = [min(max(float(p0[0]), q_lo), q_hi), min(max(di0, d_lo), d_hi)]
+        step = float(self.b_prior_step)
+        grid = np.unique(np.round(np.append(np.arange(b_min, b_max + 1e-9, step), [b_min, b_max, b_ref]), 6))
+        fits = []
+        for b in grid:
+            def resid(p, b=b):
+                q = self._arps_fit_model(x, p[0], p[1], b, t0)
+                return np.log(np.maximum(q, 1e-12)) - ly
+            try:
+                sol = least_squares(resid, start, bounds=([q_lo, d_lo], [q_hi, d_hi]))
+            except (ValueError, FloatingPointError):
+                continue
+            if np.all(np.isfinite(sol.fun)):
+                fits.append((float(np.sum(sol.fun ** 2)), float(b), sol.x))
+        if not fits:
+            return None
+        best = min(f[0] for f in fits)
+        ok = [f for f in fits if f[0] <= best * (1.0 + float(self.b_prior_tolerance)) + 1e-12]
+        _, b, (qi, di) = min(ok, key=lambda f: (abs(f[1] - b_ref), f[0]))
+        return np.array([qi, di, b, t0])
+
     def _dca_params_default(self, s):
         """
         Original per-row fit: peak/zero/outlier filtering then ``curve_fit`` on Arps.
@@ -1693,6 +1756,13 @@ class decline_curve(StrictAttributes):
                             sigma=weight_range,
                             absolute_sigma=True,
                         )
+                    if not self._force_t0 and self.b_prior_tolerance is not None:
+                        refit = self._b_prior_refit(
+                            outliered_x, outliered_y, [q_max, di_int],
+                            [q_min, di_min, bMin, t0Min], [q_max * 1.1, di_max, bMax, t0Max],
+                        )
+                        if refit is not None:
+                            popt = refit
 
                     if s["MAJOR"] == 'OIL':
                         minor_ratio = self._tail_phase_ratio(
@@ -2167,10 +2237,13 @@ class decline_curve(StrictAttributes):
             _verbose: Log per-well filtering details and step messages.
 
         Raises:
-            ValueError: If ``dataframe`` or a required column name is unset, or a
-                configured column is not in the data.
+            ValueError: If ``dataframe`` or a required column name is unset, a
+                configured column is not in the data, or ``b_prior`` is outside
+                ``min_h_b``..``max_h_b``.
         """
         self._require_data()
+        if self.b_prior_tolerance is not None:
+            self._b_prior_value(self.min_h_b, self.max_h_b)     # raises before any fit
         self.verbose = _verbose
         if self.verbose:
             print('Generating time index.', file=self.STAT_FILE, flush=True)
